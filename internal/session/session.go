@@ -84,10 +84,17 @@ type Session struct {
 	terminateOnce sync.Once
 	deadOnce      sync.Once
 	exitOnce      sync.Once
-	execSession   *sshclient.ExecSession
-	buf           *buffer.Buffer
-	readerID      int
-	msgMgr        *message.Manager
+	// execSession is the SSH transport, and is nil for any session that does not
+	// use SSH (serial). It stays concrete because the SSH-only capabilities
+	// (SSHClient, forwards, SFTP) hang off it.
+	execSession *sshclient.ExecSession
+	// transport is the lifecycle view of the same object for SSH sessions, and
+	// the serial channel for serial ones. Termination and finalization go through
+	// it so they never need to know which transport they are dealing with.
+	transport transport
+	buf       *buffer.Buffer
+	readerID  int
+	msgMgr    *message.Manager
 	// scope owns the session's lifecycle resources (forwards, notification rules,
 	// minted credentials, readers). Subsystems attach themselves at creation;
 	// Release() in finalize cascades the teardown in LIFO order.
@@ -199,6 +206,15 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	buf := buffer.New(1024 * 1024)
 	rid, _ := buf.NewReader()
 
+	// Lifecycle view of the transport. Guarded rather than a bare assignment:
+	// converting a nil *sshclient.ExecSession into the transport interface would
+	// produce a non-nil interface holding a nil pointer, which every
+	// "transport != nil" check downstream would then get wrong.
+	var sessionTransport transport
+	if execSession != nil {
+		sessionTransport = execSession
+	}
+
 	// Determine the target shell family so press_enter sends the right line
 	// ending. For internal sessions the target is the local host, so we probe
 	// it via the shell detector. For remote sessions the target OS is unknown
@@ -241,6 +257,7 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		enterCRLF:      enterCRLF,
 		defaultShell:   cfg.DefaultShell,
 		execSession:    execSession,
+		transport:      sessionTransport,
 		buf:            buf,
 		readerID:       rid,
 		msgMgr:         msgMgr,
@@ -482,29 +499,39 @@ func (s *Session) BufferLen() int64 {
 func (s *Session) Terminate(force bool, gracePeriod time.Duration) {
 	s.terminateOnce.Do(func() {
 		s.beginClosing()
-		es := s.execSession
-		if es == nil {
+		tr := s.transport
+		if tr == nil {
 			// Restored (restart) placeholder with no live transport.
 			s.markDead()
 			return
 		}
 		if !force {
-			es.Signal(ssh.SIGTERM)
-			select {
-			case <-es.Done():
-				s.markDead()
-				return
-			case <-time.After(gracePeriod):
+			// Asking a process to stop is SSH-only. A transport that cannot be
+			// signalled (serial) has no polite path, so fall through to the close
+			// below instead of waiting out a grace period for an answer that can
+			// never come.
+			if sg, ok := tr.(signaler); ok {
+				_ = sg.Signal(ssh.SIGTERM)
+				select {
+				case <-tr.Done():
+					s.markDead()
+					return
+				case <-time.After(gracePeriod):
+				}
 			}
 		}
 
 		// Close the session's own transport, not sibling session channels.
-		// For remote sessions the shared SSH client is left for Disconnect(); for
-		// internal loopback there's no multiplexing so close everything here.
-		if s.SSHEndpoint == "internal" {
-			es.Close()
+		//
+		// Which of the two closes to use used to be decided by SSHEndpoint ==
+		// "internal"; that was a string standing in for the transport's shape, and
+		// it happened to give the right answer for a transport that had no
+		// multiplexing at all. Ask the transport instead: only SSH multiplexes a
+		// shared client that must outlive this session.
+		if _, multiplexed := tr.(*sshclient.ExecSession); multiplexed && s.SSHEndpoint != "internal" {
+			_ = tr.CloseSessionOnly()
 		} else {
-			es.CloseSessionOnly()
+			_ = tr.Close()
 		}
 		s.markDead()
 	})
@@ -572,8 +599,8 @@ func (s *Session) finalize() {
 		if s.buf != nil {
 			s.buf.Close()
 		}
-		if s.execSession != nil {
-			_ = s.execSession.Close()
+		if s.transport != nil {
+			_ = s.transport.Close()
 		}
 		// Wait for exit watchers to finish their post-transport writes (final
 		// system message + persist) before releasing the session, so a caller
@@ -639,8 +666,8 @@ func (s *Session) TerminateShellOnly() {
 // preserving the object, buffers, and history for read-only viewing.
 func (s *Session) Disconnect() {
 	s.beginClosing()
-	if s.execSession != nil {
-		s.execSession.Close()
+	if s.transport != nil {
+		_ = s.transport.Close()
 	}
 	s.markDead()
 }
@@ -778,10 +805,15 @@ func (s *Session) IsBufferClosed() bool {
 // stand in for one; nothing ever did that, and widening it back would reopen a
 // second write path around the approval gate.
 type ChildShell struct {
-	ID          string
-	Name        string
-	parent      *Session // nil if not yet attached to a session
-	execSession *sshclient.ExecSession
+	ID     string
+	Name   string
+	parent *Session // nil if not yet attached to a session
+	// execSession is the channel's byte-stream transport. It is an interface, not
+	// a concrete *sshclient.ExecSession, so a serial channel can back a shell
+	// without a second code path: everything below only needs a stream and a
+	// done signal. SSH-specific needs are probed (ptyResizer) or reached through
+	// the parent Session (SSHClient).
+	execSession shellChannel
 	buf         *buffer.Buffer
 	done        chan struct{}
 	closeOnce   sync.Once
@@ -1025,7 +1057,14 @@ func (cs *ChildShell) ResizePty(rows, cols int) error {
 	if cs.Status != api.SessionRunning {
 		return fmt.Errorf("process not running")
 	}
-	if err := cs.execSession.ResizePty(rows, cols); err != nil {
+	// Resizing is an optional capability, not part of the channel interface: a
+	// serial channel has no terminal to resize and must say so rather than accept
+	// a window-change it cannot honour.
+	resizer, ok := cs.execSession.(ptyResizer)
+	if !ok {
+		return ErrUnsupported
+	}
+	if err := resizer.ResizePty(rows, cols); err != nil {
 		return err
 	}
 	cs.Rows = rows
@@ -1282,8 +1321,8 @@ func (s *Session) removeChildShell(id string) {
 
 // startChildReaders starts the stdout/stderr pipe goroutines and exit watcher for a child shell.
 func (cs *ChildShell) startReaders() {
-	cs.pipeToBuffer(cs.execSession.Stdout)
-	cs.pipeToBuffer(cs.execSession.Stderr)
+	cs.pipeToBuffer(cs.execSession.StdoutReader())
+	cs.pipeToBuffer(cs.execSession.StderrReader())
 
 	if p := cs.parent; p != nil {
 		p.watchWG.Add(1)

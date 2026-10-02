@@ -30,6 +30,10 @@ type ExecSession struct {
 	stdinMu sync.Mutex
 }
 
+// The interface assertions for the session package's channel/transport seams
+// live in internal/session/channel.go, next to the interface declarations, so a
+// change there fails the build at the definition rather than here.
+
 func closeIfCloser(r io.Reader) {
 	if c, ok := r.(io.Closer); ok {
 		c.Close()
@@ -279,6 +283,14 @@ func (es *ExecSession) CloseReaders() {
 func (es *ExecSession) Done() <-chan struct{} {
 	return es.done
 }
+
+// StdoutReader returns the session's stdout stream. Exposed so a second
+// transport (serial) can satisfy the same channel interface without the caller
+// reading the exported struct field directly.
+func (es *ExecSession) StdoutReader() io.Reader { return es.Stdout }
+
+// StderrReader returns the session's stderr stream. See StdoutReader.
+func (es *ExecSession) StderrReader() io.Reader { return es.Stderr }
 
 // ExitCode returns the process exit code after Done is closed.
 func (es *ExecSession) ExitCode() int {
