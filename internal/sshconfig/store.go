@@ -21,6 +21,12 @@ type Store struct {
 	dataDir  string
 	mu       sync.Mutex
 	onChange atomic.Value // func(), set via SetOnChange, called after Save/Delete/Rename
+
+	// nameChecker rejects a name already used by another profile directory
+	// (serial_configs). It is injected rather than imported: the ssh store has
+	// no business knowing serial profiles exist, and the wiring point that does
+	// know about both is internal/connections.
+	nameChecker atomic.Value // func(string) error
 }
 
 // SetOnChange registers a callback fired after Save, Delete, or Rename succeeds.
@@ -33,6 +39,23 @@ func (s *Store) notifyChange() {
 	if fn != nil {
 		fn()
 	}
+}
+
+// SetNameChecker registers a hook that rejects a name already in use elsewhere.
+//
+// A name present in both ssh_configs/ and serial_configs/ is ambiguous: every
+// caller that resolves a bare name would have to guess which was meant. The
+// check runs on Save and Rename so the ambiguity cannot be created.
+func (s *Store) SetNameChecker(fn func(string) error) {
+	s.nameChecker.Store(fn)
+}
+
+func (s *Store) checkName(name string) error {
+	fn, _ := s.nameChecker.Load().(func(string) error)
+	if fn == nil {
+		return nil
+	}
+	return fn(name)
 }
 
 // NewStore returns a Store rooted at dataDir (always absolute path when Abs succeeds).
@@ -207,6 +230,9 @@ func (s *Store) Save(name string, data []byte) error {
 	if err := ValidateName(name); err != nil {
 		return err
 	}
+	if err := s.checkName(name); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := filepath.Join(s.root(), name, "config.toml")
@@ -271,6 +297,9 @@ func (s *Store) Rename(oldName, newName string) error {
 	}
 	newPath, err := s.configPath(newName)
 	if err != nil {
+		return err
+	}
+	if err := s.checkName(newName); err != nil {
 		return err
 	}
 
