@@ -256,13 +256,35 @@ func (h *Handler) resolver() *connections.Resolver {
 // has a single tile shape that picks its editor off `kind`, so serial profiles
 // are appended to the ssh ones rather than given a parallel endpoint the UI
 // would have to merge anyway (design §8).
+//
+// The list itself comes from connectionSummaries, which the WebSocket's
+// sessions frame builds from too: two builders is how the serial cards came to
+// be repainted away by a frame that had never heard of serial.
 func (h *Handler) handleListConnections(w http.ResponseWriter, r *http.Request) {
-	var list []connectionSummary
+	list, err := h.connectionSummaries()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"connections": list})
+}
+
+// connectionSummaries builds the entry-grid list for both profile kinds.
+//
+// It is the single source for GET /api/connections and for the `connections`
+// array inside the WebSocket sessions frame, so a change to which kinds exist
+// cannot land on one surface and miss the other. An error is returned rather
+// than swallowed: the HTTP route reports it, and the WebSocket drops the key
+// instead of painting a list that is missing whatever failed to load.
+//
+// The result is never nil — an empty grid is the truthful rendering of an
+// empty list, while null would skip the repaint entirely.
+func (h *Handler) connectionSummaries() ([]connectionSummary, error) {
+	list := []connectionSummary{}
 	if h.SSH != nil {
 		names, err := h.SSH.List()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, err
 		}
 		for _, n := range names {
 			ent, err := h.SSH.Load(n)
@@ -278,8 +300,7 @@ func (h *Handler) handleListConnections(w http.ResponseWriter, r *http.Request) 
 	if h.Serial != nil {
 		names, err := h.Serial.List()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, err
 		}
 		for _, n := range names {
 			ent, err := h.Serial.Load(n)
@@ -289,10 +310,7 @@ func (h *Handler) handleListConnections(w http.ResponseWriter, r *http.Request) 
 			list = append(list, summarizeSerialConnection(n, ent))
 		}
 	}
-	if list == nil {
-		list = []connectionSummary{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"connections": list})
+	return list, nil
 }
 
 // summarizeSerialConnection projects a serial profile onto the shared tile

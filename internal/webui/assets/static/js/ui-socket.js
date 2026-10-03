@@ -133,7 +133,14 @@ function connectUIWebSocket() {
         // The session registry retains DEAD entries, so the same snapshot
         // reconciles running and read-only windows without an archive cache.
         applySessionsSnapshot(j.sessions || []);
-        if (j.connections) renderConnGrid(j.connections, '');
+        if (j.connections) {
+          /* The snapshot the language switch repaints from is refreshed with
+             the list just drawn, not left on whatever loadConnections last
+             fetched: two sources for one grid is how a repaint could show a
+             different set of profiles than the one on screen. */
+          window._lastConnections = j.connections;
+          renderConnGrid(j.connections, '');
+        }
         // Notification rules share this wake signal (notify.Manager onChange →
         // sessionHub.broadcast), so keep the rule panels in sync too.
         loadNotifications();

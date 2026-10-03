@@ -112,25 +112,18 @@ func (c *uiWS) sessionLoop() {
 	}
 }
 
+// enqueueSessions pushes the session snapshot. It carries the entry grid too,
+// because a profile saved in one tab has to appear in the others without a
+// page reload — but the list comes from the same builder GET /api/connections
+// uses, so serial profiles ride along instead of being erased by the frame
+// that was meant to announce them.
+//
+// On a load error the key is left out rather than set to an empty list: a
+// transient failure must not repaint the grid as if every profile were gone.
 func (c *uiWS) enqueueSessions() {
-	list := c.h.Sessions.ListAll()
-	payload := map[string]any{"type": "sessions", "sessions": list}
-	if c.h.SSH != nil {
-		names, err := c.h.SSH.List()
-		if err == nil {
-			var conns []connectionSummary
-			for _, n := range names {
-				ent, err := c.h.SSH.Load(n)
-				if err != nil {
-					continue
-				}
-				if c.h.NoInternal && ent.Kind == "internal" {
-					continue
-				}
-				conns = append(conns, summarizeConnection(n, ent))
-			}
-			payload["connections"] = conns
-		}
+	payload := map[string]any{"type": "sessions", "sessions": c.h.Sessions.ListAll()}
+	if conns, err := c.h.connectionSummaries(); err == nil {
+		payload["connections"] = conns
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
