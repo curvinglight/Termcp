@@ -21,6 +21,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/buffer"
 	"github.com/open-mcp-ai/termcp/internal/clock"
 	"github.com/open-mcp-ai/termcp/internal/message"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/shell"
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
 	"github.com/open-mcp-ai/termcp/internal/sshserver"
@@ -52,6 +53,24 @@ type RemoteSSH struct {
 	Jump               *RemoteSSH
 }
 
+// SerialConfig describes a local serial device to open.
+//
+// It is deliberately not sshconfig-shaped: there is no host, no credential and
+// no shell to resolve. The profile name is carried so the session and its
+// diagnostics can say which profile it came from, and so the device claim can be
+// attributed.
+type SerialConfig struct {
+	// ProfileName is the profile this session was created from.
+	ProfileName string
+	// Device is the path the profile named, kept as written because the
+	// existence check probes this path rather than the resolved one.
+	Device string
+	// Baud is recorded for session_info; the port layer applies it.
+	Baud int
+	// Entry is the validated profile, projected onto a port config at open time.
+	Entry *serial.Entry
+}
+
 // Config holds parameters for creating a new Session.
 type Config struct {
 	Command string
@@ -63,6 +82,10 @@ type Config struct {
 	Rows   int
 	Cols   int
 	Remote *RemoteSSH
+	// Serial, when set, opens a local serial device instead of an SSH
+	// connection. It is mutually exclusive with Remote: a serial session has no
+	// host to dial and no credentials.
+	Serial *SerialConfig
 	// DefaultShell is the profile's default_shell, kept so shells opened later on
 	// this connection resolve their shell the same way the first one did: the
 	// caller's command, then this, then the server's own login shell.
@@ -92,9 +115,14 @@ type Session struct {
 	// the serial channel for serial ones. Termination and finalization go through
 	// it so they never need to know which transport they are dealing with.
 	transport transport
-	buf       *buffer.Buffer
-	readerID  int
-	msgMgr    *message.Manager
+	// serialChannel is the serial transport, and is nil for an SSH session. It is
+	// kept alongside transport because session_info and the device-claim release
+	// need the serial-specific detail that the interface deliberately does not
+	// carry.
+	serialChannel *serial.Channel
+	buf           *buffer.Buffer
+	readerID      int
+	msgMgr        *message.Manager
 	// scope owns the session's lifecycle resources (forwards, notification rules,
 	// minted credentials, readers). Subsystems attach themselves at creation;
 	// Release() in finalize cascades the teardown in LIFO order.
@@ -148,8 +176,42 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 
 	var execSession *sshclient.ExecSession
 	var sshEndpointPublic string // "internal" | "remote" for MCP / JSON (no host or credentials)
+	var serialChannel *serial.Channel
+	var sessionKind api.SessionKind
+	// serialTxEOL is the profile's Enter byte sequence, empty for SSH sessions.
+	var serialTxEOL string
+	// releaseDevice releases the serial device claim; nil for SSH sessions.
+	var releaseDevice func()
 
-	if isRemote(cfg) {
+	if cfg.Serial != nil {
+		// A serial session is a local device, not a connection to a host.
+		if cfg.Serial.Entry == nil {
+			return nil, errors.New("serial session requires a profile")
+		}
+		if isRemote(cfg) {
+			return nil, errors.New("a session cannot be both serial and remote")
+		}
+
+		// Claim the device before opening it. Two profiles can name one port
+		// through different paths, so the claim and the open have to be one
+		// step; the OS exclusivity is a second line of defence, not the first.
+		release, aerr := serial.Acquire(cfg.Serial.Device, cfg.Serial.ProfileName)
+		if aerr != nil {
+			return nil, aerr
+		}
+
+		ch, oerr := serial.Open(cfg.Serial.Entry, cfg.Serial.ProfileName, 0)
+		if oerr != nil {
+			// The device was claimed but never opened: hand the claim back, or
+			// the port would stay reserved for a session that never existed.
+			release()
+			return nil, oerr
+		}
+		serialChannel = ch
+		releaseDevice = release
+		sessionKind = api.KindSerial
+		serialTxEOL = cfg.Serial.Entry.TxEOL
+	} else if isRemote(cfg) {
 		r := cfg.Remote
 		port := r.Port
 		if port == 0 {
@@ -159,6 +221,7 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 			return nil, fmt.Errorf("ssh_port must be between 1 and 65535, got %d", port)
 		}
 		sshEndpointPublic = "remote"
+		sessionKind = api.KindRemote
 
 		var err error
 		if r.Jump != nil {
@@ -194,6 +257,7 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 			return nil, err
 		}
 		sshEndpointPublic = "internal"
+		sessionKind = api.KindInternal
 		execSession, err = sshclient.StartWithConn(conn, minted, cfg.Command, cfg.Args, usePty, cfg.Rows, cfg.Cols)
 		if err != nil {
 			// A failed handshake consumes nothing, so the one-time credential is
@@ -206,19 +270,32 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	buf := buffer.New(1024 * 1024)
 	rid, _ := buf.NewReader()
 
-	// Lifecycle view of the transport. Guarded rather than a bare assignment:
-	// converting a nil *sshclient.ExecSession into the transport interface would
-	// produce a non-nil interface holding a nil pointer, which every
-	// "transport != nil" check downstream would then get wrong.
+	// The two transports a session can have. Both are guarded rather than
+	// assigned directly: converting a nil pointer into an interface produces a
+	// non-nil interface holding a nil pointer, which every "transport != nil"
+	// check downstream would then get wrong.
 	var sessionTransport transport
-	if execSession != nil {
+	var channel shellChannel
+	switch {
+	case execSession != nil:
 		sessionTransport = execSession
+		channel = execSession
+	case serialChannel != nil:
+		// A serial channel is both the shell's stream and the session's
+		// transport: there is one device, not a connection carrying channels.
+		sessionTransport = serialChannel
+		channel = serialChannel
 	}
 
 	// Determine the target shell family so press_enter sends the right line
 	// ending. For internal sessions the target is the local host, so we probe
 	// it via the shell detector. For remote sessions the target OS is unknown
 	// without an extra round-trip; unix (\n) is the safe default for SSH targets.
+	//
+	// A serial device is neither: it has no shell family, so the inference is
+	// skipped and the line ending comes from the profile's tx_eol. Leaving
+	// enterCRLF false is what makes the serial path a single conversion rather
+	// than two (see replaceEnter).
 	enterCRLF := false
 	if sshEndpointPublic == "internal" {
 		if _, family, _ := shell.NewDetector().Detect(); family != "unix" {
@@ -227,10 +304,11 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	}
 
 	// First shell is a peer in shells map; its id is never equal to session id.
+	// For a serial session this is the only shell it will ever have.
 	root := &ChildShell{
 		ID:          shellID,
 		Name:        name,
-		execSession: execSession,
+		execSession: channel,
 		buf:         buf,
 		done:        make(chan struct{}),
 		Status:      api.SessionRunning,
@@ -239,6 +317,8 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		CreatedAt:   clock.Now(),
 		enterCRLF:   enterCRLF,
 		mode:        cfg.Mode,
+		serial:      serialChannel != nil,
+		txEOL:       serialTxEOL,
 	}
 
 	s := &Session{
@@ -253,11 +333,13 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 			Rows:        cfg.Rows,
 			Cols:        cfg.Cols,
 			SSHEndpoint: sshEndpointPublic,
+			Kind:        sessionKind,
 		},
 		enterCRLF:      enterCRLF,
 		defaultShell:   cfg.DefaultShell,
 		execSession:    execSession,
 		transport:      sessionTransport,
+		serialChannel:  serialChannel,
 		buf:            buf,
 		readerID:       rid,
 		msgMgr:         msgMgr,
@@ -274,6 +356,12 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	// through the same cascade that closes forwards and notification rules.
 	if msgMgr != nil {
 		s.AttachCleanup(func() { msgMgr.ForgetSession(sessionID) })
+	}
+	// The device claim is a session-scoped resource too. Routing it through the
+	// scope means finalize always frees the port, rather than depending on every
+	// caller remembering to release it.
+	if releaseDevice != nil {
+		s.AttachCleanup(releaseDevice)
 	}
 	// Attach the root to the session BEFORE starting its readers so the output
 	// pipe and exit watcher see a live parent + message manager from the first
@@ -770,8 +858,13 @@ func (s *Session) UnregisterReader(id int) {
 }
 
 // HasMoreOutput returns whether the given reader has unread data.
-// SSHClient returns the underlying SSH client. All sessions (including internal/loopback)
-// use SSH transport, so this never returns nil for a running session.
+// SSHClient returns the underlying SSH client, or nil when this session has no
+// SSH transport.
+//
+// It used to be documented as never returning nil, which was true only while
+// every session was SSH. A serial session has no client, and the SSH-only
+// features built on this (forwards, SFTP) must check rather than assume:
+// SupportsSSH answers that question directly.
 func (s *Session) SSHClient() *ssh.Client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -779,6 +872,49 @@ func (s *Session) SSHClient() *ssh.Client {
 		return nil
 	}
 	return s.execSession.SSHClient()
+}
+
+// SupportsSSH reports whether the SSH-only features (forwards, SFTP) are
+// available on this session.
+//
+// It exists so the callers that used to infer availability from "SSHClient()
+// returned nil" can ask a question with a name. Relying on the nil produced
+// misleading errors: a serial session requesting a forward was told the session
+// "may not be ready" rather than that the transport has no forwards.
+func (s *Session) SupportsSSH() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.execSession != nil
+}
+
+// SerialInfo reports the device details of a serial session, or nil for any
+// other kind. It feeds session_info, which otherwise has nothing to say about a
+// connection with no host.
+func (s *Session) SerialInfo() *SerialInfo {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	ch := s.serialChannel
+	s.mu.RUnlock()
+	if ch == nil {
+		return nil
+	}
+	return &SerialInfo{
+		Profile: ch.ProfileName(),
+		Device:  ch.Device(),
+		Baud:    ch.Baud(),
+	}
+}
+
+// SerialInfo describes a serial session's device for display.
+type SerialInfo struct {
+	Profile string `json:"profile,omitempty"`
+	Device  string `json:"device"`
+	Baud    int    `json:"baud"`
 }
 
 func (s *Session) HasMoreOutput(readerID int) bool {
@@ -836,6 +972,14 @@ type ChildShell struct {
 	// deliberateClose is set by TerminateShell/CloseChildShell so the exit
 	// watcher does not treat an intentional channel close as SSH disconnect.
 	deliberateClose bool
+	// serial marks a shell backed by a serial device rather than an SSH channel.
+	// It drives the differences that cannot be inferred from the transport:
+	// there is only ever one shell, enter goes through tx_eol, and a resize has
+	// no terminal to act on.
+	serial bool
+	// txEOL is the serial profile's Enter byte sequence. Empty for SSH shells,
+	// which decide their ending from the target shell family instead.
+	txEOL string
 	// closed marks a shell the user explicitly closed (CloseChildShell). A
 	// closed shell is a DELETE, not a DEAD transition: it is removed from the
 	// live map AND the per-shell history snapshot. Atomic so the exit watcher
@@ -917,6 +1061,12 @@ func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src In
 		toWrite = appendEnter(data, cs.enterCRLF)
 	} else {
 		toWrite = data
+	}
+	// A serial device has no shell family, so the line ending is the profile's
+	// decision rather than the one appendEnter inferred. Replacing here (rather
+	// than converting the result) is what keeps it a single conversion.
+	if cs.serial {
+		toWrite = cs.applyTxEOL(toWrite, pressEnter)
 	}
 	// Whether this input submits the line. Reported rather than inferred from the
 	// output: the terminal's byte stream does not delimit lines (a redraw emits a
@@ -1010,6 +1160,45 @@ func (cs *ChildShell) PressKey(key string, repeat int) error {
 	return cs.PressKeyFrom(key, repeat, InputFromAPI)
 }
 
+// Controller returns the serial modem-line operations, or nil when this shell
+// is not backed by a serial device.
+//
+// It is the only way the MCP layer reaches DTR/RTS/Break/Flush, so an SSH shell
+// reports nil and serial_ctl refuses it rather than the methods having to exist
+// (and do nothing) on every transport.
+func (cs *ChildShell) Controller() SerialController {
+	if !cs.serial {
+		return nil
+	}
+	ctrl, ok := cs.execSession.(serialController)
+	if !ok {
+		return nil
+	}
+	return ctrl
+}
+
+// SerialController is the serial-only capability set exposed to callers that
+// must not import the transport implementation.
+type SerialController interface {
+	SetDTR(on bool) error
+	SetRTS(on bool) error
+	Break(d time.Duration) error
+	FlushInput() error
+	FlushOutput() error
+	ModemStatus() (CTS, DSR, RI, DCD bool, err error)
+}
+
+// serialTxEOL is the configured line ending for a serial shell, set at creation
+// from the profile. It is empty for SSH shells, which never use it.
+func (cs *ChildShell) applyTxEOL(data []byte, pressEnter bool) []byte {
+	if !pressEnter {
+		// shell_input without Enter sends text exactly as given: only the Enter
+		// key is a line-ending decision.
+		return data
+	}
+	return serial.ReplaceEnter(data, cs.txEOL)
+}
+
 // PressKeyFrom writes a named key sequence and records it with the status of the
 // given source.
 func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) error {
@@ -1030,6 +1219,12 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 		return fmt.Errorf("process has %s, cannot send input", cs.Status)
 	}
 	payload := bytes.Repeat(seq, repeat)
+	// The second Enter path. shell_input with press_enter and shell_key("enter")
+	// both end up here with a line ending in hand, and both must send the same
+	// bytes, so the serial substitution is applied to both.
+	if cs.serial && key == "enter" {
+		payload = cs.applyTxEOL(payload, true)
+	}
 	// A named key submits a line too (enter, and the ctrl sequences a line editor
 	// treats as one), so the signal comes from the bytes actually sent rather than
 	// from the key's name: the name is a label, the sequence is what the terminal
@@ -1051,6 +1246,14 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 func (cs *ChildShell) ResizePty(rows, cols int) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+	// A serial device has no terminal emulator on the other end: there is no
+	// window size to report and nothing that would act on one. Rejected by name
+	// so the caller can say why, rather than falling through to the pipe-mode
+	// message below, which is about a shell that never had a TTY either but for
+	// a different reason.
+	if cs.serial {
+		return fmt.Errorf("%w: a serial device has no terminal to resize", ErrUnsupported)
+	}
 	if cs.mode != api.ModePTY {
 		return fmt.Errorf("PTY resize only available in pty mode (shell mode %q)", cs.mode)
 	}
@@ -1373,11 +1576,18 @@ func (cs *ChildShell) startReaders() {
 			}
 			reparent.notifyChildChange()
 		}
-		// If the shell ended due to SSH disconnect (not deliberate close and not
-		// clean process exit), tear down the session. exitOnce ensures once.
+		// If the shell ended due to transport loss (not a deliberate close and
+		// not a clean process exit), tear down the session. exitOnce ensures once.
+		//
+		// The wording follows the transport: telling someone their network
+		// dropped when the USB cable came out sends them to the wrong problem.
 		if reparent != nil && !deliberate && cs.execSession.Aborted() {
 			slog.Debug("session DEAD via transport abort", "session_id", reparent.ID, "child_shell_id", cs.ID)
-			reparent.markDeadWithMessage("❌ SSH connection lost — network disconnected")
+			msg := "❌ SSH connection lost — network disconnected"
+			if cs.serial {
+				msg = "❌ Serial device lost — cable unplugged or device powered off"
+			}
+			reparent.markDeadWithMessage(msg)
 		}
 		// A shell ending — cleanly or not — never ends the container. The session
 		// owns the SSH transport, and that transport is what carries forwards, SFTP
@@ -1395,9 +1605,18 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 
 	s.mu.RLock()
 	running := s.Status == api.SessionRunning
+	kind := s.Kind
 	s.mu.RUnlock()
 	if s.closing || !running {
 		return nil, fmt.Errorf("session has exited")
+	}
+
+	// A serial session has one device and therefore one channel. The check is
+	// explicit rather than left to SSHClient() returning nil: relying on the nil
+	// would report the loopback message below, and would silently stop working
+	// if SSHClient ever gained a non-nil result for other transports.
+	if kind == api.KindSerial {
+		return nil, ErrSerialSingleChannel
 	}
 
 	sshClient := s.SSHClient()

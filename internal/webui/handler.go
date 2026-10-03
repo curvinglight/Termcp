@@ -982,6 +982,11 @@ func (h *Handler) handleCreateForward(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "session is closed; forwards need a live connection"})
 		return
 	}
+	if !sess.SupportsSSH() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf(
+			"session is a %s session; port forwarding needs an SSH connection", sess.Kind)})
+		return
+	}
 	sshClient := sess.SSHClient()
 	if sshClient == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "session has no SSH client — may not be ready"})
@@ -1061,6 +1066,10 @@ func (h *Handler) resolveFileSession(sessionID string, w http.ResponseWriter) (*
 	// output readable via output-range but has no transport left to SFTP over.
 	if sess.Info().Status != api.SessionRunning {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "session is closed; file operations need a live connection (read output via /output-range)"})
+		return nil, nil, false
+	}
+	if sess.Kind == api.KindSerial {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "session is a serial session; file transfer needs an SSH connection"})
 		return nil, nil, false
 	}
 	sshClient := sess.SSHClient()

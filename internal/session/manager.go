@@ -200,9 +200,14 @@ func (m *Manager) Create(cfg Config) (*Session, error) {
 		if cfg.Name != "" {
 			attrs = append(attrs, "name", cfg.Name)
 		}
-		if isRemote(cfg) {
+		switch {
+		case isRemote(cfg):
 			attrs = append(attrs, "remote_addr", remoteDialAddr(cfg.Remote), "dial_timeout_s", cfg.Remote.DialTimeoutSeconds)
-		} else {
+		case cfg.Serial != nil:
+			// A failed serial open used to be logged as "endpoint=internal",
+			// which points at the wrong thing: nothing internal was involved.
+			attrs = append(attrs, "serial_device", cfg.Serial.Device, "serial_profile", cfg.Serial.ProfileName)
+		default:
 			attrs = append(attrs, "endpoint", "internal")
 		}
 		slog.Error("session create failed", attrs...)

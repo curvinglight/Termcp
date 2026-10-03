@@ -11,9 +11,11 @@ import (
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/open-mcp-ai/termcp/internal/connections"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/notify"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
@@ -38,20 +40,23 @@ const mcpServerInstructions = `termcp agent rules:
 
 // Server wraps the MCP SSE server, streamable HTTP handler, and tool handlers.
 type Server struct {
-	mcpServer       *mcpserver.MCPServer
-	sseServer       *mcpserver.SSEServer
-	streamServer    *mcpserver.StreamableHTTPServer
-	sessMgr         *session.Manager
-	msgMgr          *message.Manager
-	sshConfigs      *sshconfig.Store
-	forwardMgr      *forward.ForwardManager
-	notifyMgr       *notify.Manager
-	baseURL         string                // http://host:port, set from Start()
-	docsFS          fs.FS                 // embedded agent docs, set via SetDocsFS
-	NoInternal      bool                  // when true, hide and refuse the built-in loopback profile
-	sshConfigWrites bool                  // expose write actions on the unified ssh_config tool
-	deferTools      bool                  // opt-in: tag low-frequency tools defer_loading (default: list every tool eagerly)
-	sseOpts         []mcpserver.SSEOption // forwarded to the mcp-go SSE transport
+	mcpServer          *mcpserver.MCPServer
+	sseServer          *mcpserver.SSEServer
+	streamServer       *mcpserver.StreamableHTTPServer
+	sessMgr            *session.Manager
+	msgMgr             *message.Manager
+	sshConfigs         *sshconfig.Store
+	serialConfigs      *serial.Store
+	forwardMgr         *forward.ForwardManager
+	notifyMgr          *notify.Manager
+	baseURL            string                // http://host:port, set from Start()
+	docsFS             fs.FS                 // embedded agent docs, set via SetDocsFS
+	NoInternal         bool                  // when true, hide and refuse the built-in loopback profile
+	NoSerial           bool                  // when true, hide and refuse serial tools and profiles
+	sshConfigWrites    bool                  // expose write actions on the unified ssh_config tool
+	serialConfigWrites bool                  // expose write actions on the serial_config tool
+	deferTools         bool                  // opt-in: tag low-frequency tools defer_loading (default: list every tool eagerly)
+	sseOpts            []mcpserver.SSEOption // forwarded to the mcp-go SSE transport
 
 	// uiNotify delivers a user-facing notification to the Web UI (the notify_user
 	// tool). Set by main to webui.Handler.BroadcastUINotify so this package stays
@@ -67,6 +72,33 @@ type Option func(*Server)
 // to, so the SSE and streamable-HTTP handlers share termcp's listener.
 func WithHTTPServer(h *http.Server) Option {
 	return func(s *Server) { s.sseOpts = append(s.sseOpts, mcpserver.WithHTTPServer(h)) }
+}
+
+// WithSerialStore enables serial profiles on this server.
+//
+// Passing nil (or not using this option) leaves serial support off, which is
+// what --no-serial does: the serial tools are not registered. Keeping it an
+// option rather than a New parameter means the many callers that have no serial
+// store do not have to name one.
+func WithSerialStore(store *serial.Store) Option {
+	return func(s *Server) { s.SetSerialStore(store) }
+}
+
+// SetSerialStore installs the serial profile store and wires the cross-directory
+// name checks against the ssh store.
+//
+// It is called before the tools are registered, because registration reads this
+// field to decide whether the serial tools exist at all.
+func (s *Server) SetSerialStore(store *serial.Store) {
+	s.serialConfigs = store
+	connections.Wire(s.sshConfigs, s.serialConfigs)
+}
+
+// RegisterSerialConfigWriteTools allows serial_config to create, change and
+// delete profiles. It mirrors RegisterSSHConfigWriteTools: reading profiles is
+// always allowed, changing them is opt-in.
+func (s *Server) RegisterSerialConfigWriteTools() {
+	s.serialConfigWrites = true
 }
 
 // originKey carries the request's origin ("scheme://host") from the transport's
@@ -233,6 +265,10 @@ func New(sessMgr *session.Manager, msgMgr *message.Manager, sshConfigs *sshconfi
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Install the mutual cross-directory name checks once both stores are known.
+	// Doing it here rather than at construction keeps New's signature unchanged
+	// for callers that pass no serial store.
+	connections.Wire(s.sshConfigs, s.serialConfigs)
 
 	mcpServer := mcpserver.NewMCPServer("termcp", version,
 		mcpserver.WithInstructions(mcpServerInstructions),
@@ -378,6 +414,12 @@ func New(sessMgr *session.Manager, msgMgr *message.Manager, sshConfigs *sshconfi
 		mcpgo.WithDescription("SSH connection profiles: action=list returns usable profile names for session_start (never secrets or hostnames)."),
 		mcpgo.WithString("action", mcpgo.Required(), mcpgo.Enum("list")),
 	), withLogging("ssh_config", s.handleSSHConfigOps))
+
+	// Serial tools are advertised only when a serial store is configured, so an
+	// instance started with --no-serial does not offer tools that would refuse.
+	if s.serialConfigs != nil {
+		s.registerSerialTools(mcpServer)
+	}
 
 	mcpServer.AddTool(s.newTool("message",
 		mcpgo.WithDescription("A session's transcript index: action=list returns the spans of the shell's byte log (status, time, start, end) in order. The bytes themselves are read with shell_output(offset=start, max_bytes=end-start)."),

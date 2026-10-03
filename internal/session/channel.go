@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"io"
+	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
 	"golang.org/x/crypto/ssh"
@@ -12,6 +13,11 @@ import (
 // capability. Callers branch on it with errors.Is; the MCP layer maps it to a
 // transport-specific error code rather than surfacing this text.
 var ErrUnsupported = errors.New("operation not supported by this channel")
+
+// ErrSerialSingleChannel reports an attempt to open a second shell channel on a
+// serial session. A serial device carries one stream, so there is no second
+// channel to open.
+var ErrSerialSingleChannel = errors.New("a serial session has a single shell channel")
 
 // shellChannel is the byte-stream seam between a ChildShell and whatever carries
 // its bytes.
@@ -97,6 +103,21 @@ type transport interface {
 // to stop.
 type signaler interface {
 	Signal(sig ssh.Signal) error
+}
+
+// serialController is an optional capability: the modem-line and buffer
+// operations a serial device offers.
+//
+// Like ptyResizer and signaler, it is probed rather than declared on the
+// channel interface, so an SSH channel never has to implement methods that mean
+// nothing for it. serial_ctl reaches it through ChildShell.Controller.
+type serialController interface {
+	SetDTR(on bool) error
+	SetRTS(on bool) error
+	Break(d time.Duration) error
+	FlushInput() error
+	FlushOutput() error
+	ModemStatus() (CTS, DSR, RI, DCD bool, err error)
 }
 
 // The SSH transport satisfies every seam. These assertions live in the session

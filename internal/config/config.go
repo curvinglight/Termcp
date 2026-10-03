@@ -28,17 +28,19 @@ const EnvDisableAuth = "TERMCP_DISABLE_AUTH_TOKEN"
 
 // Config holds all runtime configuration for the server.
 type Config struct {
-	Host                string // HTTP server bind address (default: "127.0.0.1" = loopback; use 0.0.0.0 for all interfaces)
-	Port                int    // HTTP server port, must be 1-65535 (default: 18765)
-	DataDir             string // persistent storage directory; empty means default ($TERMCP_DATA_DIR or ~/.termcp)
-	AssetsDir           string // external static assets directory; files there override the embedded UI/docs (default: $TERMCP_ASSETS_DIR or ~/.termcp/assets)
-	LogLevel            string // log verbosity: debug|info|warn|error (default: "info")
-	NoInternal          bool   // disable the built-in loopback SSH profile
-	MCPManageSSHConfigs bool   // enable MCP tools for creating/editing/deleting SSH configs (default: false)
-	AuthToken           string // plaintext HTTP auth token ($TERMCP_AUTH_TOKEN); mutually exclusive with AuthHash
-	AuthHash            string // salted SHA-256 token hash ($TERMCP_AUTH_HASH); generate with `termcp --gen-auth-hash`
-	DisableAuth         bool   // force HTTP authentication off (--disable-auth / $TERMCP_DISABLE_AUTH_TOKEN)
-	MCPDeferTools       bool   // opt-in: mark low-frequency MCP tools defer_loading; off lists every tool eagerly
+	Host                   string // HTTP server bind address (default: "127.0.0.1" = loopback; use 0.0.0.0 for all interfaces)
+	Port                   int    // HTTP server port, must be 1-65535 (default: 18765)
+	DataDir                string // persistent storage directory; empty means default ($TERMCP_DATA_DIR or ~/.termcp)
+	AssetsDir              string // external static assets directory; files there override the embedded UI/docs (default: $TERMCP_ASSETS_DIR or ~/.termcp/assets)
+	LogLevel               string // log verbosity: debug|info|warn|error (default: "info")
+	NoInternal             bool   // disable the built-in loopback SSH profile
+	MCPManageSSHConfigs    bool   // enable MCP tools for creating/editing/deleting SSH configs (default: false)
+	NoSerial               bool   // disable serial support entirely (tools, profiles and sessions)
+	MCPManageSerialConfigs bool   // enable MCP tools for creating/editing/deleting serial configs (default: false)
+	AuthToken              string // plaintext HTTP auth token ($TERMCP_AUTH_TOKEN); mutually exclusive with AuthHash
+	AuthHash               string // salted SHA-256 token hash ($TERMCP_AUTH_HASH); generate with `termcp --gen-auth-hash`
+	DisableAuth            bool   // force HTTP authentication off (--disable-auth / $TERMCP_DISABLE_AUTH_TOKEN)
+	MCPDeferTools          bool   // opt-in: mark low-frequency MCP tools defer_loading; off lists every tool eagerly
 }
 
 // Default returns a Config with sensible defaults.

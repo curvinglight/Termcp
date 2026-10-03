@@ -331,6 +331,9 @@ func (c *Channel) Device() string { return port.CanonicalDevice(c.profile.Device
 // Baud returns the configured rate, for session_info.
 func (c *Channel) Baud() int { return c.profile.Baud }
 
+// ProfileName returns the profile this channel was opened from.
+func (c *Channel) ProfileName() string { return c.name }
+
 // emptyReader reports EOF immediately.
 type emptyReader struct{}
 

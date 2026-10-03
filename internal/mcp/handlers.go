@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,7 +17,9 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/ansi"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/connections"
 	"github.com/open-mcp-ai/termcp/internal/notify"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sftp"
 	"github.com/open-mcp-ai/termcp/internal/shell"
@@ -181,10 +184,20 @@ func (s *Server) requireRunningSession(sessionID string) (*session.Session, *mcp
 // sshClientForSession resolves a running session and returns its live SSH client.
 // Closed (DEAD) sessions — whether just terminated or restored after a restart —
 // return session_not_running so SFTP/forward internals never see a dead transport.
+//
+// A session whose transport is not SSH (serial) is a different failure from one
+// that is not running: the session is up and usable, it simply has no SSH
+// features. Reporting "not running" for it sent the caller looking for a dead
+// session instead of at the transport, so the two cases are separated here.
 func (s *Server) sshClientForSession(sessionID string) (*session.Session, *ssh.Client, *mcpgo.CallToolResult) {
 	sess, bad := s.requireRunningSession(sessionID)
 	if bad != nil {
 		return nil, nil, bad
+	}
+	if !sess.SupportsSSH() {
+		return nil, nil, toolError(CodeSerialUnsupported, "%s",
+			fmt.Sprintf("Session '%s' is a %s session; this operation needs an SSH connection",
+				sessionID, sess.Kind))
 	}
 	cli := sess.SSHClient()
 	if cli == nil {
@@ -304,6 +317,88 @@ func (s *Server) resolveSSHFromArgs(args map[string]any) (string, *sshconfig.Ent
 	return name, ent, r, nil
 }
 
+// resolveProfileFromArgs resolves the ssh_config argument through the shared
+// Resolver, reporting which kind of profile the name turned out to be.
+//
+// It exists so the caller can branch on kind before any SSH-specific work. A
+// name that is a serial profile must not be loaded through the ssh store, which
+// would report it as missing and send the caller to the wrong problem.
+func (s *Server) resolveProfileFromArgs(args map[string]any) (string, *serial.Entry, *connections.Resolved, error) {
+	name := strings.TrimSpace(getString(args, "ssh_config", ""))
+	if name == "" {
+		return "", nil, nil, errMissingSSHConfig
+	}
+	if looksLikeResourceLocator(name) {
+		p, perr := parseResourceURL(name)
+		if perr != nil {
+			return "", nil, nil, fmt.Errorf("%w: %v", errInvalidResourceLocator, perr)
+		}
+		if p.Kind != resourceURLEntry {
+			return "", nil, nil, fmt.Errorf("%w: ssh_config %q is a session/shell locator; pass an entry name or termcp://<entry>", errInvalidResourceLocator, name)
+		}
+		name = p.Entry
+	}
+
+	resolved, err := s.resolver().Resolve(name)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return string(resolved.Kind), resolved.Serial, resolved, nil
+}
+
+// resolver builds the profile resolver from the stores this server holds.
+func (s *Server) resolver() *connections.Resolver {
+	return &connections.Resolver{SSH: s.sshConfigs, Serial: s.serialConfigs}
+}
+
+// startSerialSession opens a serial profile as a session.
+//
+// command, args and mode are refused rather than ignored. A serial device has no
+// process to run and no shell to select, so accepting the parameters would mean
+// silently discarding what the caller asked for, and the session would not be
+// what the request described.
+func (s *Server) startSerialSession(args map[string]any, resolved *connections.Resolved, entry *serial.Entry, command string, toolArgs []string) (*mcpgo.CallToolResult, error) {
+	if s.serialConfigs == nil {
+		return toolError(CodeSerialDisabled, "%s", "serial support is not enabled on this instance"), nil
+	}
+	if strings.TrimSpace(command) != "" || len(toolArgs) > 0 {
+		return toolError(CodeSerialCommandUnsupported, "%s",
+			"a serial session has no process to run; command/args are not supported"), nil
+	}
+	if mode := strings.TrimSpace(getString(args, "mode", "")); mode != "" {
+		return toolError(CodeSerialCommandUnsupported, "%s",
+			"a serial session has no shell mode; mode is not supported (the terminal size is managed by the client)"), nil
+	}
+
+	sessName := strings.TrimSpace(getString(args, "name", ""))
+	if sessName == "" {
+		sessName = resolved.Name
+	}
+
+	sess, err := s.sessMgr.Create(session.Config{
+		Name: sessName,
+		// Rows/Cols stay zero: a serial device has no terminal, so there is no
+		// size to report. The front-end xterm manages its own layout.
+		Serial: &session.SerialConfig{
+			ProfileName: resolved.Name,
+			Device:      entry.Device,
+			Baud:        entry.Baud,
+			Entry:       entry,
+		},
+		Approval: entry.DefaultApproval,
+	})
+	if err != nil {
+		return toolError(serialErrCode(err), "%s", err.Error()), nil
+	}
+
+	return jsonResult(map[string]any{
+		"session_id": sess.ID,
+		"shell_id":   sess.PrimaryShellID(),
+		"serial":     sess.SerialInfo(),
+		"kind":       string(api.KindSerial),
+	}), nil
+}
+
 func (s *Server) handleStartSession(_ context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	args := request.GetArguments()
 	command := getString(args, "command", "")
@@ -313,6 +408,18 @@ func (s *Server) handleStartSession(_ context.Context, request mcpgo.CallToolReq
 	}
 	if bad, _ := validateStartParams(args); bad != nil {
 		return bad, nil
+	}
+
+	// The profile may name a serial device. Resolve before assuming SSH so a
+	// serial profile is not reported as a missing ssh profile, and so the
+	// command/args/mode checks below apply to the transport that is actually
+	// being opened.
+	kind, serialEntry, resolved, rerr := s.resolveProfileFromArgs(args)
+	if rerr != nil {
+		return toolError(serialErrCode(rerr), "%s", rerr.Error()), nil
+	}
+	if kind == connections.KindSerial {
+		return s.startSerialSession(args, resolved, serialEntry, command, toolArgs)
 	}
 
 	cfgName, ent, remote, err := s.resolveSSHFromArgs(args)
@@ -457,6 +564,11 @@ func (s *Server) handleStartSubShell(_ context.Context, request mcpgo.CallToolRe
 	}
 	cs, err := sess.CreateChildShell(command, nil, mode == "pty", rows, cols, name)
 	if err != nil {
+		// A serial session refusing a second channel is a distinct condition
+		// from a generic failure: the session is fine, it simply has one stream.
+		if errors.Is(err, session.ErrSerialSingleChannel) {
+			return toolError(CodeSerialSingleChannel, "%s", err.Error()), nil
+		}
 		return toolError(CodeOperationFailed, "%s", err.Error()), nil
 	}
 	return jsonResult(map[string]any{"shell_id": cs.ID, "session_id": parentID, "name": cs.Name}), nil
@@ -696,6 +808,12 @@ func (s *Server) handleResizePty(ctx context.Context, request mcpgo.CallToolRequ
 		return bad, nil
 	}
 	if err := shell.ResizePty(rows, cols); err != nil {
+		// A serial device has no terminal, so there is no size to set. Reporting
+		// it as serial_no_pty lets a caller tell it apart from a pty shell that
+		// could not be resized for some other reason.
+		if errors.Is(err, session.ErrUnsupported) {
+			return toolError(CodeSerialNoPTY, "%s", err.Error()), nil
+		}
 		return toolError(CodeOperationFailed, "%s", err.Error()), nil
 	}
 	return successResult(), nil

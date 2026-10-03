@@ -27,12 +27,14 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/auth"
 	"github.com/open-mcp-ai/termcp/internal/config"
+	"github.com/open-mcp-ai/termcp/internal/connections"
 	"github.com/open-mcp-ai/termcp/internal/daemon"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/logansi"
 	mcpmod "github.com/open-mcp-ai/termcp/internal/mcp"
 	"github.com/open-mcp-ai/termcp/internal/mcpbridge"
 	"github.com/open-mcp-ai/termcp/internal/message"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 	"github.com/open-mcp-ai/termcp/internal/sshserver"
@@ -157,6 +159,8 @@ func main() {
 	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log verbosity: debug|info|warn|error")
 	flag.BoolVar(&cfg.NoInternal, "no-internal", cfg.NoInternal, "Disable the built-in loopback SSH profile (no internal connection)")
 	flag.BoolVar(&cfg.MCPManageSSHConfigs, "mcp-manage-ssh-configs", cfg.MCPManageSSHConfigs, "Enable MCP tools to create/edit/delete SSH configs (off by default; passwords/keys are never exposed)")
+	flag.BoolVar(&cfg.NoSerial, "no-serial", cfg.NoSerial, "Disable serial support entirely (serial_ports/serial_ctl tools and serial profiles)")
+	flag.BoolVar(&cfg.MCPManageSerialConfigs, "mcp-manage-serial-configs", cfg.MCPManageSerialConfigs, "Enable MCP tools to create/edit/delete serial configs (off by default; listing ports and profiles stays available)")
 	flag.StringVar(&cfg.AuthToken, "auth-token", cfg.AuthToken, "HTTP authentication token (or $TERMCP_AUTH_TOKEN)")
 	flag.StringVar(&cfg.AuthHash, "auth-hash", cfg.AuthHash, "Salted SHA-256 HTTP token hash (or $TERMCP_AUTH_HASH; generate with 'termcp --gen-auth-hash')")
 	flag.BoolVar(&cfg.DisableAuth, "disable-auth", cfg.DisableAuth, "Disable HTTP authentication entirely, even on non-loopback binds (or TERMCP_DISABLE_AUTH_TOKEN=1). Errors out if a token or hash is also configured.")
@@ -385,6 +389,16 @@ func main() {
 
 	sshStore := sshconfig.NewStore(cfg.DataDir)
 
+	// Serial profiles live in their own directory so an ssh profile and a serial
+	// profile can never be confused for one another. Wire installs the mutual
+	// name checks: a name used by both kinds is ambiguous to every caller that
+	// resolves a bare profile name, so it is refused at write time.
+	var serialStore *serial.Store
+	if !cfg.NoSerial {
+		serialStore = serial.NewStore(cfg.DataDir)
+		connections.Wire(sshStore, serialStore)
+	}
+
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	mux := http.NewServeMux()
 	mainSrv := &http.Server{Addr: addr, Handler: mux}
@@ -399,12 +413,24 @@ func main() {
 		// tools entirely rather than merely load them later.
 		mcpOpts = append(mcpOpts, mcpmod.DeferTools())
 	}
+	// The serial store is passed as an option, not assigned after New: tool
+	// registration happens inside New and reads this field to decide whether the
+	// serial tools exist at all. Setting it afterwards left them unregistered.
+	if serialStore != nil {
+		mcpOpts = append(mcpOpts, mcpmod.WithSerialStore(serialStore))
+	}
 	mcpSrv := mcpmod.New(sessMgr, msgMgr, sshStore, forwardMgr, versionString(), mcpOpts...)
 	// Same embedded docs the Web UI serves over HTTP become MCP resources/prompts.
 	mcpSrv.SetDocsFS(webui.Assets())
 	mcpSrv.NoInternal = cfg.NoInternal
 	if cfg.MCPManageSSHConfigs {
 		mcpSrv.RegisterSSHConfigWriteTools()
+	}
+	// A nil serial store is what --no-serial means: the serial tools are never
+	// registered, so the instance does not advertise capabilities it will refuse.
+	mcpSrv.NoSerial = cfg.NoSerial
+	if serialStore != nil && cfg.MCPManageSerialConfigs {
+		mcpSrv.RegisterSerialConfigWriteTools()
 	}
 	mux.Handle("GET /sse", mcpSrv.SSEHandler())
 	mux.Handle("POST /message", mcpSrv.MessageHandler())
@@ -576,6 +602,7 @@ func runDaemonHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --data-dir              (start, stdio) where the launched instance keeps its")
 	fmt.Fprintln(w, "                          data; its log is written to <data-dir>/termcp.log.")
 	fmt.Fprintln(w, "  --assets, --log-level, --no-internal, --mcp-manage-ssh-configs,")
+	fmt.Fprintln(w, "  --no-serial, --mcp-manage-serial-configs,")
 	fmt.Fprintln(w, "  --mcp-defer-tools, --disable-auth")
 	fmt.Fprintln(w, "                          (start, stdio) inherited by the launched instance, so")
 	fmt.Fprintln(w, "                          it serves what `termcp` with the same flags would.")

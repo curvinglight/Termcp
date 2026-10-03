@@ -27,7 +27,7 @@ func enterBytes(txEOL string) []byte {
 	}
 }
 
-// replaceEnter swaps the line ending produced by the session layer for the one
+// ReplaceEnter swaps the line ending produced by the session layer for the one
 // this profile wants.
 //
 // The session's appendEnter/KeyBytes turn Enter into "\n" or "\r\n" depending on
@@ -37,7 +37,10 @@ func enterBytes(txEOL string) []byte {
 // "none" wrong), the serial path discards whatever was produced and substitutes
 // its own ending. A serial ChildShell keeps enterCRLF false so the input here is
 // always a bare LF.
-func replaceEnter(data []byte, txEOL string) []byte {
+//
+// It is exported because the session package owns the write paths and has to
+// apply the same rule to both of them.
+func ReplaceEnter(data []byte, txEOL string) []byte {
 	enter := enterBytes(txEOL)
 
 	switch len(data) {

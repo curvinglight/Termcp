@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
 
 // ErrNotFound reports that a named serial profile does not exist. Callers branch
@@ -96,17 +95,23 @@ func (s *Store) configPath(name string) (string, error) {
 	return filepath.Join(s.root(), name, "config.toml"), nil
 }
 
+// nameRe is the profile-name syntax, kept identical to sshconfig's by a test
+// rather than by an import: serial cannot import sshconfig (session imports
+// serial, and sshconfig imports session), so a shared constant would close a
+// cycle. TestValidateNameMatchesSSHRules pins the two together.
+var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
+
 // ValidateName checks a profile id.
 //
-// The syntax rules come from sshconfig.ValidateName rather than a copy: a serial
-// profile and an ssh profile are addressed by the same name in the same call
-// sites, so the two must accept exactly the same strings. Only the reserved-name
-// rule is added, and that one is serial-specific.
+// A serial profile and an ssh profile are addressed by the same name in the same
+// call sites, so both must accept exactly the same strings. Only the
+// reserved-name rule is added here, and that one is serial-specific.
 func ValidateName(name string) error {
-	if err := sshconfig.ValidateName(name); err != nil {
-		return fmt.Errorf("invalid serial config name %q: %w", strings.TrimSpace(name), err)
+	name = strings.TrimSpace(name)
+	if !nameRe.MatchString(name) {
+		return fmt.Errorf("invalid serial config name %q (letters, digits, _, -; max 64)", name)
 	}
-	if strings.EqualFold(strings.TrimSpace(name), ReservedName) {
+	if strings.EqualFold(name, ReservedName) {
 		return fmt.Errorf("serial config name %q is reserved", ReservedName)
 	}
 	return nil

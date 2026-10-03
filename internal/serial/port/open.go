@@ -136,6 +136,15 @@ func normalizeIOError(err error) error {
 			return fmt.Errorf("%w: %s", sentinel, err)
 		}
 	}
+	// A modem-line or break request the device cannot perform comes back as a
+	// bare ENOTTY ("inappropriate ioctl for device"), not as a PortError: the
+	// library passes the syscall error straight through for SetDTR/SetRTS/Break.
+	// It means the operation is not available here, which is what
+	// ErrUnsupportedFormat says, and it keeps the raw errno text out of the
+	// caller's error code.
+	if isUnsupportedIoctl(err) {
+		return fmt.Errorf("%w: this device does not support the requested operation", ErrUnsupportedFormat)
+	}
 	return err
 }
 

@@ -8,6 +8,41 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
 
+func TestNameRulesAgreeBetweenKinds(t *testing.T) {
+	// A serial profile and an ssh profile are addressed by the same name in the
+	// same call sites, so the two stores must accept exactly the same strings.
+	//
+	// serial cannot import sshconfig to share the rule (session imports serial,
+	// and sshconfig imports session), so the two regexes are kept identical by
+	// this test. If one is edited without the other, this fails.
+	candidates := []string{
+		"board", "board-1", "Board_2", "a", "A1", "1board",
+		"", " ", "-board", "_board", "has space", "a/b",
+		"internal", "Internal", "INTERNAL",
+		strings.Repeat("x", 64), strings.Repeat("x", 65),
+	}
+
+	for _, name := range candidates {
+		sshErr := sshconfig.ValidateName(name)
+		serialErr := serial.ValidateName(name)
+
+		// "internal" is the one intended difference: the ssh store allows the
+		// reserved name (it IS that profile), while a serial profile may not
+		// take it.
+		if strings.EqualFold(strings.TrimSpace(name), serial.ReservedName) {
+			if serialErr == nil {
+				t.Errorf("name %q: serial must refuse the reserved name", name)
+			}
+			continue
+		}
+
+		if (sshErr == nil) != (serialErr == nil) {
+			t.Errorf("name %q: ssh says %v, serial says %v; the two rules must agree",
+				name, sshErr, serialErr)
+		}
+	}
+}
+
 func TestWirePreventsSSHSavingOverSerialName(t *testing.T) {
 	// The serial profile is saved first; the ssh save must then be refused, or
 	// the instance would hold an ambiguous pair it created itself.

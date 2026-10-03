@@ -8,7 +8,11 @@ import (
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/open-mcp-ai/termcp/internal/connections"
 	"github.com/open-mcp-ai/termcp/internal/forward"
+	"github.com/open-mcp-ai/termcp/internal/serial"
+	"github.com/open-mcp-ai/termcp/internal/serial/port"
+	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
 
@@ -59,7 +63,65 @@ const (
 	CodeConnectionFailed    = "connection_failed"
 	CodeOperationFailed     = "operation_failed"
 	CodeInternalError       = "internal_error"
+
+	// Serial codes. They exist so a caller can tell "this device is busy" from
+	// "this session has no SSH" without reading prose, and so the same condition
+	// reports the same code wherever it is hit.
+	CodeSerialPortBusy           = "serial_port_busy"
+	CodeSerialPortNotFound       = "serial_port_not_found"
+	CodeSerialPermissionDenied   = "serial_permission_denied"
+	CodeSerialUnsupportedFormat  = "serial_unsupported_format"
+	CodeSerialFlowControl        = "serial_flow_control_unsupported"
+	CodeSerialDeviceGone         = "serial_device_gone"
+	CodeSerialSingleChannel      = "serial_single_channel"
+	CodeSerialNoPTY              = "serial_no_pty"
+	CodeSerialUnsupported        = "serial_unsupported"
+	CodeSerialDisabled           = "serial_disabled"
+	CodeSerialCommandUnsupported = "serial_command_unsupported"
+	CodeProfileAmbiguous         = "profile_name_ambiguous"
 )
+
+// serialErrCode maps a serial port or profile failure onto its tool error code.
+//
+// It is a single mapping rather than a message per call site: the same failure
+// reaching the user through a different tool should read the same way, and a
+// caller branching on the code should get one answer per condition.
+func serialErrCode(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	// The argument-shape failures come from the shared resolver path, so they
+	// keep the codes the ssh-only path already used. Mapping them here rather
+	// than at each call site is what keeps a malformed locator reported as an
+	// invalid argument whichever profile kind it names.
+	case errors.Is(err, errMissingSSHConfig), errors.Is(err, errInvalidResourceLocator):
+		return CodeInvalidArgument
+	case errors.Is(err, serial.ErrNotFound):
+		return CodeSerialPortNotFound
+	case errors.Is(err, connections.ErrAmbiguous):
+		return CodeProfileAmbiguous
+	case errors.Is(err, connections.ErrNotFound):
+		return CodeSSHConfigNotFound
+	case errors.Is(err, port.ErrBusy):
+		return CodeSerialPortBusy
+	case errors.Is(err, port.ErrNotFound):
+		return CodeSerialPortNotFound
+	case errors.Is(err, port.ErrPermission):
+		return CodeSerialPermissionDenied
+	case errors.Is(err, port.ErrDeviceGone):
+		return CodeSerialDeviceGone
+	case errors.Is(err, port.ErrUnsupportedFormat):
+		return CodeSerialUnsupportedFormat
+	case errors.Is(err, port.ErrInvalidConfig):
+		return CodeInvalidArgument
+	case errors.Is(err, session.ErrSerialSingleChannel):
+		return CodeSerialSingleChannel
+	case errors.Is(err, session.ErrUnsupported):
+		return CodeSerialUnsupported
+	default:
+		return CodeOperationFailed
+	}
+}
 
 // toolError builds a failed tool result whose text content is a JSON object
 // with a dedicated error_code field plus a human-readable message:

@@ -17,6 +17,23 @@ const (
 	ModePipe SessionMode = "pipe"
 )
 
+// SessionKind names what carries a session's bytes.
+//
+// It is a container-level property, like SSHEndpoint, and is set only on the
+// session record: a shell channel is a shell channel whatever the transport
+// underneath, so ChildShell.Info() leaves it empty rather than claiming the
+// channel is "a serial".
+type SessionKind string
+
+const (
+	// KindInternal is the built-in loopback SSH server.
+	KindInternal SessionKind = "internal"
+	// KindRemote is an outbound SSH connection.
+	KindRemote SessionKind = "remote"
+	// KindSerial is a local serial device.
+	KindSerial SessionKind = "serial"
+)
+
 // Session holds metadata for an interactive process session.
 //
 // Timestamps are Unix milliseconds, the one time representation this project
@@ -41,7 +58,15 @@ type Session struct {
 	Rows      int           `json:"rows"`
 	Cols      int           `json:"cols"`
 	// SSHEndpoint is a coarse hint for clients: "internal" (built-in loopback SSH) or "remote" (no host/user/port exposed).
+	//
+	// It is SSH-specific and empty for a serial session; prefer Kind, which is
+	// meaningful for every transport. SSHEndpoint is kept because existing
+	// clients read it, and because "internal" versus "remote" still says
+	// something Kind does not.
 	SSHEndpoint string `json:"ssh_endpoint,omitempty"`
+	// Kind says what carries this session's bytes: "internal", "remote" or
+	// "serial". It is omitted on shell records (see SessionKind).
+	Kind SessionKind `json:"kind,omitempty"`
 	// ApprovalMode reports whether this session gates input behind N-person
 	// approval. It is a session-level policy, not a per-shell one: turning it on
 	// covers every shell channel in the session. The Web UI reads it to show that
