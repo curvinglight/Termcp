@@ -51,6 +51,164 @@ var _connTemplateRemote = [
   ''
 ].join('\n');
 
+// TOML shown when creating a serial profile. Unlike the remote template every
+// value here is a real, safe default: a wrong serial setting fails against a
+// device that does not answer, where a wrong host dials a stranger's machine —
+// so the hints live in comments only. The tx_eol comment carries the P1-3
+// clarification, worded the same as the profile docs and the MCP serial_config
+// description: none = Enter 发送裸 CR (\r)，并非"不发送行尾"
+var _connTemplateSerial = [
+  '# termcp serial config (TOML)',
+  'kind = "serial"',
+  'description = ""',
+  '',
+  '# Required: the device. Prefer the stable by-id path — ttyUSB numbers move',
+  '# with plug order, so a profile written against one works until the next',
+  '# cable shuffle.',
+  'device = "/dev/serial/by-id/usb-…"',
+  'baud = 115200',
+  'data_bits = 8',
+  'stop_bits = "1"',
+  'parity = "none"',
+  'dtr = "keep"',
+  'rts = "keep"',
+  '',
+  '# Line ending written when Enter is pressed.',
+  '# none = Enter 发送裸 CR (\\r)，并非"不发送行尾"',
+  'tx_eol = "cr"',
+  '',
+  '# How device input is presented: auto, text, hex or b64. The transcript',
+  '# keeps the raw bytes either way.',
+  'encoding = "auto"',
+  'rx_normalize = true',
+  '# local_echo = true',
+  '',
+  '# default_approval = true',
+  ''
+].join('\n');
+
+// editingConnKind is the schema the editor is currently showing: 'serial' for a
+// serial profile, 'ssh' for both remote and internal (they share one schema —
+// internal only narrows which fields apply). The save path writes this kind
+// into the TOML and the server dispatches on it, so a serial profile saved as
+// kind="remote" would land in the ssh directory and resolve as a host.
+var editingConnKind = 'ssh';
+
+// _applyConnKind repaints the modal for the current kind: which field groups
+// are visible, whether the kind picker itself is on offer (hidden while editing
+// — a kind is a schema, and changing it would move the file out from under the
+// name), and whether Test exists at all (a serial profile has nothing to dial,
+// and probing it would open and claim the device).
+//
+// The approval checkbox is deliberately outside every group: review mode is a
+// property of how sessions from this profile are governed, and a serial device
+// takes input exactly like an SSH one.
+function _applyConnKind() {
+  var isSerial = editingConnKind === 'serial';
+  var isInternal = editingConnName === 'internal';
+  var el;
+  if ((el = document.getElementById('conn-kind-wrap'))) el.style.display = editingConnName ? 'none' : '';
+  if ((el = document.getElementById('conn-kind'))) el.value = editingConnKind;
+  if ((el = document.getElementById('conn-f-loopback-only'))) el.style.display = isInternal ? '' : 'none';
+  if ((el = document.getElementById('conn-f-remote-fields'))) el.style.display = (isInternal || isSerial) ? 'none' : '';
+  if ((el = document.getElementById('conn-f-remote-extra'))) el.style.display = (isInternal || isSerial) ? 'none' : '';
+  if ((el = document.getElementById('conn-f-serial-fields'))) el.style.display = isSerial ? '' : 'none';
+  if ((el = document.getElementById('conn-f-shell'))) el.closest('.conn-field').style.display = isSerial ? 'none' : '';
+  if ((el = document.getElementById('conn-test'))) el.style.display = isSerial ? 'none' : '';
+  if (isSerial) _fillSerialDeviceList();
+}
+
+// _fillSerialDeviceList feeds the device datalist from the same enumeration
+// the MCP serial_ports tool reports (GET /api/serial/ports). The stable by-id
+// path sorts first and is what the option carries as its value; the plain
+// ttyUSB / COM path is the fallback for devices that have no id link.
+function _fillSerialDeviceList() {
+  var dl = document.getElementById('conn-f-device-list');
+  if (!dl) return;
+  fetch('/api/serial/ports').then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (j) {
+    var ports = (j && j.ports) || [];
+    // port.Info carries no JSON tags, so the keys are the Go field names.
+    ports.sort(function (a, b) {
+      var as = a.StableName ? 0 : 1, bs = b.StableName ? 0 : 1;
+      if (as !== bs) return as - bs;
+      return String(a.StableName || a.Name || '').localeCompare(String(b.StableName || b.Name || ''));
+    });
+    dl.innerHTML = ports.map(function (p) {
+      var path = p.StableName || p.Name || '';
+      if (!path) return '';
+      var label = ((p.Product || p.Manufacturer || '') +
+        (p.VID && p.PID ? (' (' + p.VID + ':' + p.PID + ')') : '')).trim();
+      return '<option value="' + _hesc(path) + '">' + (label ? _hesc(label) : '') + '</option>';
+    }).join('');
+  }).catch(function () {
+    // Enumeration is best-effort: without it the field is still a plain input,
+    // and a path typed by hand saves like any other.
+    dl.innerHTML = '';
+  });
+}
+
+// _setSelect assigns a value the profile carried, falling back to the default
+// when the option is not in the list — a hand-written profile may say
+// stop_bits = 4, and a select that silently went blank would lose that
+// information on the next save instead of the server reporting it.
+function _setSelect(el, value, fallback) {
+  if (!el) return;
+  el.value = value;
+  if (el.value === '') el.value = fallback;
+}
+
+// _serialEolHint shows the tx_eol clarification only on "none", the value it is
+// about — the rest of the options say what they send in their own labels.
+function _serialEolHint() {
+  var eol = document.getElementById('conn-f-txeol');
+  var hint = document.getElementById('conn-f-txeol-hint');
+  if (!eol || !hint) return;
+  hint.style.display = eol.value === 'none' ? '' : 'none';
+}
+
+function _serialFormToTOML() {
+  var lines = ['kind = "serial"'];
+  lines.push('device = ' + _tomlVal(document.getElementById('conn-f-device').value.trim()));
+  lines.push('baud = ' + (parseInt(document.getElementById('conn-f-baud').value, 10) || 115200));
+  // The whole line configuration is written out, defaults included. These
+  // fields are what a serial profile is; omitting the ones that happen to
+  // match the defaults would leave a reader guessing at the actual framing.
+  lines.push('data_bits = ' + (parseInt(document.getElementById('conn-f-databits').value, 10) || 8));
+  lines.push('stop_bits = ' + _tomlVal(document.getElementById('conn-f-stopbits').value || '1'));
+  lines.push('parity = ' + _tomlVal(document.getElementById('conn-f-parity').value || 'none'));
+  lines.push('dtr = ' + _tomlVal(document.getElementById('conn-f-dtr').value || 'keep'));
+  lines.push('rts = ' + _tomlVal(document.getElementById('conn-f-rts').value || 'keep'));
+  lines.push('tx_eol = ' + _tomlVal(document.getElementById('conn-f-txeol').value || 'cr'));
+  lines.push('encoding = ' + _tomlVal(document.getElementById('conn-f-encoding').value || 'auto'));
+  // Booleans follow the remote form's rule: a line restating the default is
+  // noise in a file a human reads, so only a departure from it is written.
+  if (!document.getElementById('conn-f-rxnorm').checked) lines.push('rx_normalize = false');
+  if (document.getElementById('conn-f-localecho').checked) lines.push('local_echo = true');
+  if (document.getElementById('conn-f-approval').checked) lines.push('default_approval = true');
+  return lines.join('\n') + '\n';
+}
+
+function _serialTOMLToForm(o) {
+  document.getElementById('conn-f-device').value = o.device || '';
+  document.getElementById('conn-f-baud').value = o.baud || 115200;
+  _setSelect(document.getElementById('conn-f-databits'), String(o.data_bits || 8), '8');
+  _setSelect(document.getElementById('conn-f-parity'), o.parity || 'none', 'none');
+  _setSelect(document.getElementById('conn-f-stopbits'), String(o.stop_bits != null ? o.stop_bits : '1'), '1');
+  _setSelect(document.getElementById('conn-f-dtr'), o.dtr || 'keep', 'keep');
+  _setSelect(document.getElementById('conn-f-rts'), o.rts || 'keep', 'keep');
+  _setSelect(document.getElementById('conn-f-txeol'), o.tx_eol || 'cr', 'cr');
+  _setSelect(document.getElementById('conn-f-encoding'), o.encoding || 'auto', 'auto');
+  // rx_normalize defaults to true server-side (the field is a pointer there,
+  // so omitted and true are the same answer).
+  document.getElementById('conn-f-rxnorm').checked = o.rx_normalize !== false;
+  document.getElementById('conn-f-localecho').checked = o.local_echo === true;
+  document.getElementById('conn-f-approval').checked = o.default_approval === true;
+  _serialEolHint();
+}
+
 function _tomlEscape(v) { return v.replace(/\\/g,'\\\\').replace(/"/g,'\\"'); }
 function _tomlVal(s) { return s ? ('"'+_tomlEscape(s)+'"') : '""'; }
 function _hesc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -189,6 +347,7 @@ function _jumpToLines(c, depth) {
 }
 
 function _connFormToTOML() {
+  if (editingConnKind === 'serial') return _serialFormToTOML();
   // The internal profile's override carries only the settings it actually uses.
   // Emitting host/credentials for it would either be ignored on load (confusing)
   // or, worse, make a loopback profile look like it dials somewhere.
@@ -223,6 +382,16 @@ function _connFormToTOML() {
 function _connTOMLToForm(toml) {
   var parsed = _parseConnTOML(toml);
   var o = parsed.root;
+  // The kind in the body is what the save will write, so it is what the form
+  // must show. This runs on edit-load, on the form/TOML toggle, and when the
+  // kind picker reseeds a create — one dispatch covers all three, and the form
+  // can never be showing one schema while the body carries another.
+  editingConnKind = o.kind === 'serial' ? 'serial' : 'ssh';
+  _applyConnKind();
+  if (editingConnKind === 'serial') {
+    _serialTOMLToForm(o);
+    return;
+  }
   document.getElementById('conn-f-host').value = o.host || '';
   document.getElementById('conn-f-port').value = o.port || 22;
   document.getElementById('conn-f-user').value = o.user || '';
@@ -292,14 +461,11 @@ function openConnModal(edit, name, kind) {
   // it is pinned; the host/user/auth fields below are hidden since the loopback
   // dial ignores them.
   nameEl.readOnly = !!edit;
-  var loopbackOnly = document.getElementById('conn-f-loopback-only');
-  if (loopbackOnly) loopbackOnly.style.display = isInternal ? '' : 'none';
-  var remoteFields = document.getElementById('conn-f-remote-fields');
-  if (remoteFields) remoteFields.style.display = isInternal ? 'none' : '';
-  // Proxy and the jump chain are the dial path; loopback dials this machine, so it
-  // hides them too — but it keeps 默认 Shell / 默认审核, which are its own settings.
-  var remoteExtra = document.getElementById('conn-f-remote-extra');
-  if (remoteExtra) remoteExtra.style.display = isInternal ? 'none' : '';
+  // The caller says which kind of card was pressed; the fetched body confirms
+  // it below (and is authoritative — a stale card kind cannot save wrong TOML,
+  // because _connTOMLToForm re-derives from the body it is given).
+  editingConnKind = kind === 'serial' ? 'serial' : 'ssh';
+  _applyConnKind();
   // Start in form view
   document.getElementById('conn-form-view').style.display = '';
   document.getElementById('conn-config-view').style.display = 'none';
@@ -315,14 +481,33 @@ function openConnModal(edit, name, kind) {
       document.getElementById('modal-conn-err').style.display = 'block';
     });
   } else {
-    document.getElementById('conn-config').value = _connTemplateRemote;
-    _connTOMLToForm(_connTemplateRemote);
+    var tmpl = editingConnKind === 'serial' ? _connTemplateSerial : _connTemplateRemote;
+    document.getElementById('conn-config').value = tmpl;
+    _connTOMLToForm(tmpl);
   }
   resetConnPasswordVisibility();
   showModal('modal-conn');
 }
 
 document.getElementById('conn-f-auth').onchange = _connAuthChange;
+document.getElementById('conn-f-txeol').onchange = function () { _serialEolHint(); };
+document.getElementById('conn-kind').onchange = function () {
+  _connDirty = true;
+  editingConnKind = this.value === 'serial' ? 'serial' : 'ssh';
+  if (editingConnName) {
+    // Editing never offers the picker (the kind is the file's schema), so this
+    // branch only runs if the control was reached some other way — repaint and
+    // leave the loaded values alone.
+    _applyConnKind();
+    return;
+  }
+  // Creating: reseed both views from the chosen kind's template. Keeping the
+  // other schema's values around would either save them into a body that never
+  // reads them or, worse, show a host field on a serial profile.
+  var tmpl = editingConnKind === 'serial' ? _connTemplateSerial : _connTemplateRemote;
+  document.getElementById('conn-config').value = tmpl;
+  _connTOMLToForm(tmpl);
+};
 document.getElementById('conn-toggle-view').onclick = function () { _connDirty = true; _connToggleView(); };
 // Track unsaved edits inside the connection editor so leaving the page first asks.
 var _connModalEl = document.getElementById('modal-conn');
@@ -544,6 +729,10 @@ document.getElementById('conn-duplicate').onclick = function () {
   var nameEl = document.getElementById('conn-name');
   // Switch into create mode while keeping the current form/TOML values.
   editingConnName = '';
+  // The kind picker belongs to create mode; the kind itself carries over —
+  // a duplicated serial profile stays serial, and its fields are already on
+  // screen from the edit that fed this.
+  _applyConnKind();
   nameEl.value = '';
   nameEl.readOnly = false;
   document.getElementById('modal-conn-title').textContent = t('modal.conn.titleAdd');
@@ -554,8 +743,26 @@ document.getElementById('conn-duplicate').onclick = function () {
   try { nameEl.focus(); } catch (e) {}
 };
 
-function openStartModal(connName, clickEvent) {
+// startConnIsSerial mirrors the profile kind the start modal was opened for.
+// Command and mode are process concepts: a serial session opens a device and
+// has neither, so the form hides them and this makes the submit agree — the
+// server refuses a non-empty mode or command for a serial profile rather than
+// ignoring it, and a form that sends one would reopen with an error the user
+// never caused.
+var startConnIsSerial = false;
+
+function openStartModal(connName, clickEvent, conn) {
   startConnName = connName;
+  if (!conn) {
+    // Callers that only know the name still get the right form: the grid's
+    // snapshot is already on the page, and guessing ssh here would send a
+    // mode the server refuses for a serial profile.
+    var list = window._lastConnections || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].name === connName) { conn = list[i]; break; }
+    }
+  }
+  startConnIsSerial = !!(conn && conn.kind === 'serial');
   document.getElementById('modal-start-err').style.display = 'none';
   document.getElementById('start-ssh-config').value = connName;
   var startNameEl = document.getElementById('start-name');
@@ -563,6 +770,10 @@ function openStartModal(connName, clickEvent) {
   document.getElementById('start-title').textContent = t('modal.start.titleConnect', { name: connName });
   document.getElementById('start-cmd').value = '';
   document.getElementById('start-mode').value = 'pty';
+  var sshOnly = document.getElementById('start-ssh-only');
+  if (sshOnly) sshOnly.style.display = startConnIsSerial ? 'none' : '';
+  var hint = document.getElementById('start-serial-hint');
+  if (hint) hint.style.display = startConnIsSerial ? '' : 'none';
   showModal('modal-start');
   window._startClickEvt = clickEvent;
 }
@@ -570,7 +781,7 @@ document.getElementById('modal-start-close').onclick = function () { hideModal('
 document.getElementById('start-run').onclick = function () {
   var err = document.getElementById('modal-start-err');
   err.style.display = 'none';
-  var cmd = document.getElementById('start-cmd').value.trim();
+  var cmd = startConnIsSerial ? '' : document.getElementById('start-cmd').value.trim();
   var sname = document.getElementById('start-name').value.trim();
   // Close immediately on submit: the pending terminal window already shows
   // connection progress (spinner). On failure the dialog reopens with the
@@ -578,8 +789,9 @@ document.getElementById('start-run').onclick = function () {
   hideModal('modal-start');
   startSessionAndOpenShell(document.getElementById('start-ssh-config').value || startConnName, window._startClickEvt, {
     command: cmd,
-    mode: document.getElementById('start-mode').value,
-    name: sname || undefined
+    mode: startConnIsSerial ? '' : document.getElementById('start-mode').value,
+    name: sname || undefined,
+    kind: startConnIsSerial ? 'serial' : 'ssh'
   })
     .catch(function (e) {
       err.textContent = String(e.message || e);

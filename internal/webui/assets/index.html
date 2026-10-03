@@ -132,6 +132,16 @@
         <input type="text" id="conn-name" placeholder="my-server" autocomplete="off" style="margin-bottom:8px;width:100%">
         <!-- Form view -->
         <form id="conn-form-view" autocomplete="off" onsubmit="return false">
+          <!-- The kind picker only exists while creating: a profile's kind is
+               its schema (which directory it lives in), and changing it later
+               would move the file out from under the name. Editing hides it. -->
+          <div class="conn-field" id="conn-kind-wrap" style="display:none">
+            <label for="conn-kind" data-i18n="modal.conn.field.kind">Type</label>
+            <select id="conn-kind">
+              <option value="ssh" data-i18n="modal.conn.kind.ssh">SSH</option>
+              <option value="serial" data-i18n="modal.conn.kind.serial">Serial device</option>
+            </select>
+          </div>
           <div id="conn-f-loopback-only" style="display:none" class="conn-field conn-check-hint" data-i18n="modal.conn.loopbackOnly">Built-in loopback connection: it dials this machine over termcp's own SSH server, so host, credentials and jumps do not apply. Only the settings below are used.</div>
           <div id="conn-f-remote-fields">
             <div class="conn-field"><label for="conn-f-host" data-i18n="modal.conn.field.host">Host</label><input type="text" id="conn-f-host" placeholder="192.168.1.1" autocomplete="off"></div>
@@ -140,6 +150,20 @@
             <div class="conn-field" id="conn-f-password-wrap"><label for="conn-f-password" data-i18n="modal.conn.field.password">Password</label><div class="psw-wrap"><input type="password" id="conn-f-password" class="psw-input" autocomplete="new-password"><button type="button" class="psw-eye" title="Show password" data-i18n-title="modal.conn.showPassword"><svg class="eye-open" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2.5"/></svg><svg class="eye-closed" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M6 3.5A6.4 6.4 0 018 3.2C12.5 3.2 15 8 15 8s-1 2-2.8 3.8M10 10a3 3 0 01-4-4M3.5 11.5l-2 2M3 8c0 0 2.5-5 7-5 1 0 2 .4 3 1M14.5 1l-13 13"/></svg></button></div></div>
             <div class="conn-field" id="conn-f-pem-wrap" style="display:none"><label for="conn-f-pem" data-i18n="modal.conn.field.privateKey">Private Key</label><textarea id="conn-f-pem" spellcheck="false" rows="4"></textarea></div>
             <div class="conn-field" id="conn-f-passphrase-wrap" style="display:none"><label for="conn-f-passphrase" data-i18n="modal.conn.field.passphrase">Key Passphrase (optional)</label><div class="psw-wrap"><input type="password" id="conn-f-passphrase" class="psw-input" autocomplete="new-password"><button type="button" class="psw-eye" title="Show" data-i18n-title="modal.conn.show"><svg class="eye-open" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2.5"/></svg><svg class="eye-closed" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M6 3.5A6.4 6.4 0 018 3.2C12.5 3.2 15 8 15 8s-1 2-2.8 3.8M10 10a3 3 0 01-4-4M3.5 11.5l-2 2M3 8c0 0 2.5-5 7-5 1 0 2 .4 3 1M14.5 1l-13 13"/></svg></button></div></div>
+          </div>
+          <!-- Serial profile fields. The two kinds share this modal but not a
+               schema: a serial profile has no host, no credentials, no jumps
+               and no shell, so this block and conn-f-remote-fields are
+               never visible together. -->
+          <div id="conn-f-serial-fields" style="display:none">
+            <div class="conn-field"><label for="conn-f-device" data-i18n="modal.conn.field.device">Device</label><input type="text" id="conn-f-device" list="conn-f-device-list" placeholder="/dev/serial/by-id/…" autocomplete="off"><datalist id="conn-f-device-list"></datalist><div class="conn-check-hint" data-i18n="modal.conn.field.deviceHint">Suggestions come from the ports found on this machine; the by-id path is the stable one — ttyUSB numbers move with plug order.</div></div>
+            <div class="conn-row"><div class="conn-field"><label for="conn-f-baud" data-i18n="modal.conn.field.baud">Baud rate</label><input type="number" id="conn-f-baud" value="115200" min="1" autocomplete="off"></div><div class="conn-field"><label for="conn-f-databits" data-i18n="modal.conn.field.dataBits">Data bits</label><select id="conn-f-databits"><option>5</option><option>6</option><option>7</option><option>8</option></select></div></div>
+            <div class="conn-row"><div class="conn-field"><label for="conn-f-parity" data-i18n="modal.conn.field.parity">Parity</label><select id="conn-f-parity"><option value="none">none</option><option value="odd">odd</option><option value="even">even</option><option value="mark">mark</option><option value="space">space</option></select></div><div class="conn-field"><label for="conn-f-stopbits" data-i18n="modal.conn.field.stopBits">Stop bits</label><select id="conn-f-stopbits"><option value="1">1</option><option value="1.5">1.5</option><option value="2">2</option></select></div></div>
+            <div class="conn-row"><div class="conn-field"><label for="conn-f-dtr" data-i18n="modal.conn.field.dtr">DTR</label><select id="conn-f-dtr"><option value="keep">keep</option><option value="high">high</option><option value="low">low</option></select></div><div class="conn-field"><label for="conn-f-rts" data-i18n="modal.conn.field.rts">RTS</label><select id="conn-f-rts"><option value="keep">keep</option><option value="high">high</option><option value="low">low</option></select></div></div>
+            <div class="conn-field"><label for="conn-f-txeol" data-i18n="modal.conn.field.lineEnding">Line ending for Enter</label><select id="conn-f-txeol"><option value="cr">CR (\r)</option><option value="crlf">CRLF (\r\n)</option><option value="lf">LF (\n)</option><option value="none">none</option></select><div class="conn-check-hint" id="conn-f-txeol-hint" style="display:none" data-i18n="modal.conn.field.lineEndingNone">none = Enter sends a bare CR (\r); it does not mean no line ending</div></div>
+            <div class="conn-field"><label for="conn-f-encoding" data-i18n="modal.conn.field.encoding">Display encoding</label><select id="conn-f-encoding"><option value="auto">auto</option><option value="text">text</option><option value="hex">hex</option><option value="b64">b64</option></select><div class="conn-check-hint" data-i18n="modal.conn.field.encodingHint">auto passes valid UTF-8 through and escapes the rest, so binary arrives as hex escapes instead of replacement characters.</div></div>
+            <div class="conn-field conn-field-check"><label class="conn-check" for="conn-f-rxnorm"><input type="checkbox" id="conn-f-rxnorm" checked><span data-i18n="modal.conn.field.rxNormalize">Normalize line endings</span></label><div class="conn-check-hint" data-i18n="modal.conn.field.rxNormalizeHint">Adds CR before bare LF so the terminal breaks lines the way devices expect. Turn it off only when the device already sends CRLF.</div></div>
+            <div class="conn-field conn-field-check"><label class="conn-check" for="conn-f-localecho"><input type="checkbox" id="conn-f-localecho"><span data-i18n="modal.conn.field.localEcho">Local echo</span></label><div class="conn-check-hint" data-i18n="modal.conn.field.localEchoHint">Echo your keystrokes into the transcript as well as sending them; on only for devices that do not echo back.</div></div>
           </div>
           <div class="conn-field"><label for="conn-f-shell" data-i18n="modal.conn.field.shell">Default Shell (optional)</label><input type="text" id="conn-f-shell" placeholder="auto-detect" data-i18n-placeholder="modal.conn.field.shellPlaceholder" autocomplete="off"></div>
           <div class="conn-field conn-field-check"><label class="conn-check" for="conn-f-approval"><input type="checkbox" id="conn-f-approval"><span data-i18n="modal.conn.field.approval">Review every AI write by default</span></label><div class="conn-check-hint" data-i18n="modal.conn.field.approvalHint">Sessions started from this profile begin with review mode on: each command waits for you to Accept or Reject it before any byte reaches the shell.</div></div>
@@ -181,10 +205,17 @@
         <input type="hidden" id="start-ssh-config">
         <label for="start-name" data-i18n="modal.start.name">Session name (optional)</label>
         <input type="text" id="start-name" placeholder="Default: connection name" data-i18n-placeholder="modal.start.namePlaceholder" autocomplete="off">
-        <label for="start-cmd" data-i18n="modal.start.cmd">Command (optional)</label>
-        <input type="text" id="start-cmd" placeholder="Empty = SSH login shell; or bash, powershell, …" data-i18n-placeholder="modal.start.cmdPlaceholder" autocomplete="off">
-        <label for="start-mode" data-i18n="modal.start.mode">Mode</label>
-        <select id="start-mode"><option value="pty">pty</option><option value="pipe">pipe</option></select>
+        <!-- Command and mode are process concepts. A serial session opens a
+             device and has neither, so this pair is hidden for one — hiding it
+             rather than leaving it to be refused server-side, which would make
+             the form look broken. -->
+        <div id="start-ssh-only">
+          <label for="start-cmd" data-i18n="modal.start.cmd">Command (optional)</label>
+          <input type="text" id="start-cmd" placeholder="Empty = SSH login shell; or bash, powershell, …" data-i18n-placeholder="modal.start.cmdPlaceholder" autocomplete="off">
+          <label for="start-mode" data-i18n="modal.start.mode">Mode</label>
+          <select id="start-mode"><option value="pty">pty</option><option value="pipe">pipe</option></select>
+        </div>
+        <p id="start-serial-hint" class="conn-check-hint" style="display:none" data-i18n="modal.start.serialHint">This opens the device directly: no command and no shell mode, only the line settings from the profile.</p>
         <div class="modal-actions">
           <button type="button" class="btn btn-primary" id="start-run" data-i18n="modal.start.run">Connect</button>
         </div>

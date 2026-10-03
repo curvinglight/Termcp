@@ -1,5 +1,23 @@
 var _selectedSessionIds = new Set();
 
+/** serialDeviceLabel shortens a device path for the session card: the short
+ *  model name the by-id link carries (FT232R @115200), else the basename
+ *  (ttyUSB0, COM3). The full path stays in the line's title attribute — the
+ *  card's job is recognition, and by-id strings are too long to recognize from.
+ *
+ *  by-id links are named `usb-<vendor>_<product>_<serial>-ifNN-portNN`; the
+ *  vendor and the bare "USB" token say nothing a person needs, so they drop out
+ *  and the product is what remains. */
+function serialDeviceLabel(device) {
+  var path = String(device || '');
+  if (!path) return '';
+  var base = path.split('/').pop();
+  if (base.indexOf('usb-') !== 0) return base;
+  var parts = base.replace(/^usb-/, '').replace(/-if\d+-port\d+$/, '').split('_');
+  var name = parts.slice(1).filter(function (p) { return p && p !== 'USB'; })[0];
+  return name || parts[0] || base;
+}
+
 function updateSessionBatchBar() {
   var countEl = document.getElementById('session-batch-count');
   var delBtn = document.getElementById('batch-del-btn');
@@ -91,6 +109,22 @@ function renderSessionGrid(sessions, bannerMsg) {
         '<svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" d="M2 2l8 8M10 2L2 10"/></svg>' +
       '</button>';
 
+    /* A serial session sits beside the SSH ones with its kind badge and the
+       device line — FT232R @115200 — the way a host card shows user@host. The
+       path behind that short label stays in the title: recognition on the card,
+       identification in the tooltip. */
+    var isSerial = s.kind === 'serial';
+    var serialBadge = isSerial
+      ? '<span class="conn-kind-badge" data-i18n="conn.badge.serial">Serial</span>'
+      : '';
+    var serialLineHtml = '';
+    if (isSerial) {
+      var sdev = (s.serial && s.serial.device) || '';
+      var sbaud = (s.serial && s.serial.baud) || 0;
+      serialLineHtml = '<div class="sess-serial-line" title="' + escapeHtml(sdev) + '">' +
+        escapeHtml(serialDeviceLabel(sdev) + (sbaud ? (' @' + sbaud) : '')) + '</div>';
+    }
+
     tile.innerHTML =
       '<div class="conn-tile-stack">' +
       actionCornerHtml +
@@ -100,12 +134,14 @@ function renderSessionGrid(sessions, bannerMsg) {
       '<div class="sess-name-row">' +
       '<input type="checkbox" class="sess-checkbox" title="Select session" data-i18n-title="session.aria.select" aria-label="Select session" data-i18n-aria="session.aria.select"' + (isSelected ? ' checked' : '') + '>' +
       '<div class="sess-entry-line" role="button" tabindex="0" title="Rename session" data-i18n-title="session.aria.rename" aria-label="Rename session" data-i18n-aria="session.aria.rename">' + escapeHtml(entryLine) + '</div>' +
+      serialBadge +
       '</div>' +
       '<div class="sess-meta-row">' +
       statusIc +
       lockHtml +
       '<span class="sess-sid-line" role="button" tabindex="0" title="Copy session URL" data-i18n-title="session.aria.copyUrl" aria-label="Copy session URL" data-i18n-aria="session.aria.copyUrl">' + escapeHtml(sid) + '</span>' +
       '</div>' +
+      serialLineHtml +
       reviewBadgeHtml(sid) +
       '</div>' +
       '<div class="sess-fwd-info" style="display:none;font-size:0.62rem;color:#656d76;margin-top:2px;text-align:center"></div>';
@@ -214,7 +250,9 @@ function renderSessionGrid(sessions, bannerMsg) {
     tile.onclick = function (e) {
       if (e.target.closest('.sess-x') || e.target.closest('.sess-checkbox') || e.target.closest('.sess-entry-line') || e.target.closest('.sess-sid-line') || e.target.closest('.sess-status-ic')) return;
       clearSessNotified(sid); // opening the session acknowledges its notification highlight
-      focusSessionWindow(s.name || '', s.id, e, dead ? { readOnly: true } : null);
+      var openOpts = { kind: s.kind };
+      if (dead) openOpts.readOnly = true;
+      focusSessionWindow(s.name || '', s.id, e, openOpts);
     };
     if (!dead) {
       var fwdInfo = tile.querySelector('.sess-fwd-info');
@@ -398,6 +436,10 @@ function applySessionsSnapshot(sessions) {
       continue;
     }
     if (s.status !== 'running') lockWindowReadonly(w);
+    // The kind is part of the snapshot like approval mode, so a window opened
+    // before this session was known serial (or from another entry point that
+    // did not pass one) converges here instead of keeping SSH-only chrome.
+    setSessionKindChrome(w, s.kind);
     // Approval mode is part of the session snapshot, so an open window reflects a
     // switch flipped in another tab without needing its own request.
     w._approvalNeed = s.approval_need || 1;

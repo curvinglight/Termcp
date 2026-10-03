@@ -246,18 +246,22 @@ function showUiNotify(n) {
     var openSession = function (e) {
       if (e.target.closest('.ui-notify-close')) return;
       var snap = window._lastSessionsSnapshot || [];
-      var name = '', dead = false;
+      var name = '', dead = false, kind = '';
       for (var i = 0; i < snap.length; i++) {
         if (snap[i] && snap[i].id === sid) {
           name = snap[i].name || '';
           dead = snap[i].status !== 'running';
+          kind = snap[i].kind || '';
           break;
         }
       }
       dismissUiNotify(card);
       // Same entrance the session tiles use, so a session with no window yet is
-      // opened rather than ignored, and a DEAD one opens read-only.
-      var win = focusSessionWindow(name, sid, null, dead ? { readOnly: true } : null);
+      // opened rather than ignored, a DEAD one opens read-only, and a serial one
+      // opens with the kind it needs to hide the controls it cannot use.
+      var openOpts = { kind: kind };
+      if (dead) openOpts.readOnly = true;
+      var win = focusSessionWindow(name, sid, null, openOpts);
       // A notification about a pending decision should land on the decision, not
       // just on the session that has one: arriving at a terminal and still having
       // to find the queue is the step this click exists to remove. Waiting for the

@@ -282,10 +282,35 @@ function _showChannelEmpty(win, show) {
   if (body) body.style.display = show ? 'none' : '';
 }
 
+/** setSessionKindChrome marks a shell window with the kind of session it holds.
+ *
+ *  A serial session has exactly one channel, no PTY to resize, and no shell to
+ *  open — the server refuses all three by name — so the window drops the
+ *  controls that would only bounce: the channel splitter, and the forwarding
+ *  and file tabs. The marker is both the class the stylesheet keys on and
+ *  win._sessionKind, which the resize choke point reads before sending a size
+ *  a device has no use for.
+ *
+ *  kind is the session's kind from the snapshot ('internal' | 'remote' |
+ *  'serial'); anything that is not "serial" is an ordinary SSH window. */
+function setSessionKindChrome(win, kind) {
+  if (!win) return;
+  win._sessionKind = kind || 'ssh';
+  win.classList.toggle('is-serial', kind === 'serial');
+}
+
 /** "+" button / empty-state click handler: create the default shell.
  *  One press is the common case, so it stays one press; the caret beside it is
  *  where the mode menu lives. */
 function addChannelClick(win) {
+  // Defense in depth: the splitter is hidden by CSS on a serial window, and
+  // the server would refuse anyway — but a refusal here would arrive as a
+  // generic channel-open failure when the real answer is "this device has one
+  // channel, and it is already open".
+  if (win && win._sessionKind === 'serial') {
+    showCopyToast(t('channel.serial.single'));
+    return;
+  }
   createChannel(win, 'pty', '');
 }
 
@@ -304,6 +329,7 @@ function addChannelClick(win) {
  */
 function openChannelAddMenu(win, anchorEl) {
   if (!win._parentSid || win._readOnly) return;
+  if (win._sessionKind === 'serial') return;
   if (typeof _channelAddMenu !== 'undefined' && _channelAddMenu) {
     var same = _channelAddMenu._win === win;
     closeChannelAddMenu();
@@ -1239,7 +1265,7 @@ SHELL_WINDOW_PANELS_HTML +
   return win;
 }
 
-function finalizePendingShellWindow(win, connLabel, sessionId, shellId, clickEvent) {
+function finalizePendingShellWindow(win, connLabel, sessionId, shellId, clickEvent, kind) {
   if (!win || !win.parentNode || !sessionId) return;
   win._connectAbort = null;
   win._placeholder = false;
@@ -1249,6 +1275,9 @@ function finalizePendingShellWindow(win, connLabel, sessionId, shellId, clickEve
   win._parentSid = sessionId;
   win._primaryShellId = shellId || sessionId;
   win._connName = connLabel || '';
+  // The POST response carries the kind; without it a serial window would open
+  // with SSH chrome until the next snapshot frame arrived.
+  setSessionKindChrome(win, kind);
   var sidEl = win.querySelector('.shell-sid-copy .sid');
   if (sidEl) sidEl.textContent = stripSessionPrefix(sessionId);
   var pend = win.querySelector('.shell-pending');
@@ -1352,6 +1381,9 @@ function openShellWindow(connLabel, sessionId, clickEvent, opts) {
   win.id = 'shell-window-' + shellWindowCount;
   win._sid = sessionId;
   win._readOnly = readOnly;
+  // The caller may know the kind from the snapshot it opened the session from;
+  // applySessionsSnapshot converges it if this window was opened blind.
+  setSessionKindChrome(win, opts.kind);
 
       win.innerHTML =
     '<div class="shell-window-header">' +
@@ -1485,6 +1517,11 @@ function startSessionAndOpenShell(connName, clickEvt, opt) {
   if (!pendingWin) {
     return Promise.reject(new Error('Could not open terminal window'));
   }
+  // When the caller already knows the kind (it came from the profile card or
+  // the start form), mark the pending window now: the POST's own response is
+  // authoritative and re-applies it in finalize, but until then the window is
+  // on screen and must not offer controls the device will refuse.
+  if (opt.kind) setSessionKindChrome(pendingWin, opt.kind);
   var body = {
     command: opt.command != null ? opt.command : '',
     args: opt.args || [],
@@ -1507,9 +1544,9 @@ function startSessionAndOpenShell(connName, clickEvt, opt) {
       if (!shellId) throw new Error('No shell_id in response');
       pendingWin._connectAbort = null;
       if (pendingWin.parentNode) {
-        finalizePendingShellWindow(pendingWin, connName || 'session', sid, shellId, clickEvt);
+        finalizePendingShellWindow(pendingWin, connName || 'session', sid, shellId, clickEvt, j.kind);
       } else {
-        openShellWindow(connName || 'session', sid, clickEvt);
+        openShellWindow(connName || 'session', sid, clickEvt, { kind: j.kind });
       }
       return j;
     })
@@ -1616,8 +1653,11 @@ function openSessionSwitchMenu(anchorBtn) {
       e.stopPropagation();
       closeSessionSwitchMenu();
       // Same entrance the session tiles use, so a session with no window yet is
-      // opened rather than ignored.
-      focusSessionWindow(s.name || '', s.id, null, dead ? { readOnly: true } : null);
+      // opened rather than ignored. The kind rides along so a serial session
+      // opened here gets its chrome from the first frame.
+      var itemOpts = { kind: s.kind };
+      if (dead) itemOpts.readOnly = true;
+      focusSessionWindow(s.name || '', s.id, null, itemOpts);
     });
     el.appendChild(item);
   });

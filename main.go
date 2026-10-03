@@ -435,7 +435,7 @@ func main() {
 	mux.Handle("GET /sse", mcpSrv.SSEHandler())
 	mux.Handle("POST /message", mcpSrv.MessageHandler())
 	mux.Handle("/stream", mcpSrv.StreamableHTTPHandler())
-	webuiH := &webui.Handler{Sessions: sessMgr, SSH: sshStore, ForwardMgr: forwardMgr, NotifyMgr: mcpSrv.NotifyManager(), NoInternal: cfg.NoInternal, Version: versionString(), Daemon: isDaemonChild, StartedAt: time.Now().UTC().Format(time.RFC3339)}
+	webuiH := &webui.Handler{Sessions: sessMgr, SSH: sshStore, Serial: serialStore, ForwardMgr: forwardMgr, NotifyMgr: mcpSrv.NotifyManager(), NoInternal: cfg.NoInternal, Version: versionString(), Daemon: isDaemonChild, StartedAt: time.Now().UTC().Format(time.RFC3339)}
 	// The effective countdown is published at GET /api/daemon so the stdio
 	// bridge can ping faster than it (see daemon.InstanceInfo.IdleTimeoutMS).
 	if isDaemonChild {

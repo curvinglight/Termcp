@@ -644,6 +644,11 @@ function setupShellWindowResize(win) {
 }
 
 function postResize(win, optSid) {
+  // A serial session has no terminal to resize: rows/cols are zero in its
+  // record and a size frame would be meaningless. The server refuses the
+  // resize as well, but the window frame resizes fire this on every drag, and
+  // a refusal per drag is noise the guard simply does not generate.
+  if (win && win._sessionKind === 'serial') return;
   var sid = optSid || win._activeChannelSid || win._sid;
   if (!sid) return;
   var ch = win._channels && win._channels[sid];

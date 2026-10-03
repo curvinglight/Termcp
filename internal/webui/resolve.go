@@ -1,9 +1,11 @@
 package webui
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
+	"github.com/open-mcp-ai/termcp/internal/connections"
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 	"github.com/open-mcp-ai/termcp/pkg/api"
@@ -47,10 +49,15 @@ func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// resolveEntry maps termcp://<entry> to the ssh_config profile name used by
+// resolveEntry maps termcp://<entry> to the profile name used by
 // POST /api/sessions. Unknown profiles are a 404 with the actionable reason.
+//
+// The lookup goes through the shared connections.Resolver, the same
+// implementation session_start and the Web UI's own session creation use, so a
+// termcp:// locator names a serial profile exactly as it does an ssh one
+// (design §3.6) instead of reporting it missing.
 func (h *Handler) resolveEntry(w http.ResponseWriter, p *locator.Parsed) {
-	if h.SSH == nil {
+	if h.SSH == nil && h.Serial == nil {
 		http.Error(w, "ssh config store not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -58,15 +65,29 @@ func (h *Handler) resolveEntry(w http.ResponseWriter, p *locator.Parsed) {
 		http.Error(w, `connection profile "internal" is disabled on this instance`, http.StatusNotFound)
 		return
 	}
-	ent, err := h.SSH.Load(p.Entry)
+	resolved, err := h.resolver().Resolve(p.Entry)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("connection profile %q not found (list profiles with GET /api/connections)", p.Entry), http.StatusNotFound)
+		switch {
+		case errors.Is(err, connections.ErrAmbiguous):
+			// Present in both directories: neither profile is reachable by this
+			// name, and picking one would hide the other.
+			http.Error(w, err.Error(), http.StatusConflict)
+		case errors.Is(err, connections.ErrNotFound):
+			http.Error(w, fmt.Sprintf("connection profile %q not found (list profiles with GET /api/connections)", p.Entry), http.StatusNotFound)
+		default:
+			// The profile exists but does not parse: say what is wrong with it
+			// rather than claiming there is nothing there.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
 		return
 	}
-	if ent.Kind == sshconfig.KindInternal && h.NoInternal {
+	if resolved.Kind == connections.KindSSH && resolved.SSH.Kind == sshconfig.KindInternal && h.NoInternal {
 		http.Error(w, `connection profile "internal" is disabled on this instance`, http.StatusNotFound)
 		return
 	}
+	// SSHConfig carries the profile name for both kinds: it is the field
+	// POST /api/sessions reads, and that endpoint resolves it by name through
+	// the same resolver, so a serial name lands back here correctly.
 	writeJSON(w, http.StatusOK, resolveResponse{
 		Kind:      "entry",
 		Entry:     p.Entry,

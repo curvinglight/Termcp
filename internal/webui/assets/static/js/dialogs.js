@@ -137,7 +137,13 @@ function renderConnGrid(connections, bannerMsg) {
     var tile = document.createElement('div');
     tile.className = 'conn-tile entry-card';
     tile.setAttribute('data-conn-name', c.name);
-    var icon = c.kind === 'internal' ? '🔁' : '🌐';
+    var icon = c.kind === 'internal' ? '🔁' : (c.kind === 'serial' ? '🔌' : '🌐');
+    // A serial profile is not a host, and the card says so before anyone opens
+    // it: the badge is the same word the session tiles use, so one kind label
+    // reads across both lists.
+    var kindBadge = c.kind === 'serial'
+      ? '<span class="conn-kind-badge" data-i18n="conn.badge.serial">Serial</span>'
+      : '';
     // The internal profile is editable too: its settings (review default, shell)
     // are stored as an override. There is nothing to rename or delete, but there
     // is a setting to change, so the button belongs here as well.
@@ -159,6 +165,7 @@ function renderConnGrid(connections, bannerMsg) {
       '<div class="conn-nm-row">' +
       '<span class="conn-nm-cluster">' +
       '<span class="conn-nm" title="Connect" data-i18n-title="conn.title.connect">' + escapeHtml(c.name) + '</span>' +
+      kindBadge +
       '<button type="button" class="sess-copy-btn" title="Copy URL" data-i18n-title="common.copyUrl" aria-label="Copy URL" data-i18n-aria="common.copyUrl">' + SVG_COPY_12 + '</button>' +
       '</span>' +
       quickBtn +
@@ -171,6 +178,12 @@ function renderConnGrid(connections, bannerMsg) {
     var tipConnect = t('conn.tip.connect');
     if (c.kind === 'internal') {
       inner.title = tipConnect + ' · ' + t('conn.tip.internal');
+    } else if (c.kind === 'serial') {
+      // The device is the "address" of a serial profile, shown in full: this
+      // is where you confirm which cable the card points at, and the session
+      // tiles carry the short FT232R form.
+      var devLine = ((c.device || '') + (c.baud ? (' @' + c.baud) : '')).trim();
+      inner.title = devLine ? (tipConnect + ' — ' + devLine) : tipConnect;
     } else {
       var hostLine = ((c.user || '') + '@' + (c.host || '') + (c.port && c.port !== 22 ? ':' + c.port : '')).trim();
       inner.title = hostLine ? (tipConnect + ' — ' + hostLine) : tipConnect;
@@ -183,7 +196,7 @@ function renderConnGrid(connections, bannerMsg) {
       rememberConnBanner(null);
       tile.classList.add('entry-connecting');
       inner.classList.add('entry-connecting');
-      startSessionAndOpenShell(c.name, e)
+      startSessionAndOpenShell(c.name, e, { kind: c.kind })
         .catch(function (err) {
           if (err && err.name === 'AbortError') return;
           console.error(err);
@@ -202,7 +215,7 @@ function renderConnGrid(connections, bannerMsg) {
       quickBtnEl.addEventListener('click', function (e) {
         e.preventDefault();
         e.stopPropagation();
-        openStartModal(c.name, e);
+        openStartModal(c.name, e, c);
       });
     }
     var entryCopyBtn = tile.querySelector('.sess-copy-btn');

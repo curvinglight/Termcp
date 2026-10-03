@@ -179,6 +179,41 @@
     border: 1px solid rgba(207,34,46,.35); border-radius: 10px; padding: 1px 6px;
   }
   .conn-tile.sess-tile .sess-review[hidden] { display: none; }
+
+  /* --- serial sessions and profiles --- */
+  /* The kind badge a serial profile card and a serial session card share. One
+     label, both lists: purple because it names what the connection IS rather
+     than what state it is in (green lamp, amber lock), and pill-shaped like the
+     review badge so it reads as metadata, not as something to press. */
+  .conn-kind-badge {
+    flex: 0 0 auto;
+    align-self: center;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    line-height: 1.3;
+    white-space: nowrap;
+    padding: 1px 6px;
+    color: #8250df;
+    background: rgba(130, 80, 223, 0.1);
+    border: 1px solid rgba(130, 80, 223, 0.35);
+    border-radius: 10px;
+  }
+  /* Device @ baud under the session card's id line — the serial counterpart of
+     user@host on a host card. Monospace because it is an identifier, ellipsised
+     because a by-id path is long and the full value is in the title. */
+  .conn-tile.sess-tile .sess-serial-line {
+    margin-top: 3px;
+    font-size: 0.62rem;
+    font-family: ui-monospace, monospace;
+    color: #656d76;
+    text-align: center;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   /* Sessions toolbar: always-visible select-all / delete-selected / clear-dead */
   .icon-btn-sm { width: 28px; height: 28px; border-radius: 6px; }
   .icon-btn-sm svg { width: 16px; height: 16px; }
@@ -1183,6 +1218,15 @@
   .shell-split { display: inline-flex; align-items: stretch; }
   .shell-split > :first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
   .shell-split > :last-child { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: none; }
+  /* A serial window drops the controls the server would refuse: the channel
+     split (a serial session has exactly one channel — the device is already
+     open) and the forwarding / file tabs (both need an SSH connection the
+     device does not have). The existing channel tab stays: it is the device.
+     The window frame's own resize handles are NOT hidden — they size the
+     browser window, which is not a PTY. */
+  .shell-window.is-serial .shell-split { display: none; }
+  .shell-window.is-serial .shell-tab-btn[data-stab="fw"],
+  .shell-window.is-serial .shell-tab-btn[data-stab="file"] { display: none; }
   .shell-channel-add-caret {
     flex-shrink: 0;
     width: 16px;

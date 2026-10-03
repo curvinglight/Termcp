@@ -795,6 +795,9 @@ function focusSessionWindow(connLabel, sessionId, clickEvent, opts) {
   }
   bringShellWindowToFront(ex);
   if (opts.readOnly) lockWindowReadonly(ex);
+  // Re-apply on raise as well as on open: a window restored from the tab bar
+  // (which passes no opts) may predate the snapshot that named the kind.
+  if (opts.kind) setSessionKindChrome(ex, opts.kind);
   /* The tab bar's own "hide all" is a global state; showing one window has to
      clear it or the window we just raised stays invisible. */
   if (_winsHidden) showAllWindows();

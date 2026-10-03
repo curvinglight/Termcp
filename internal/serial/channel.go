@@ -325,8 +325,16 @@ func (c *Channel) ModemStatus() (CTS, DSR, RI, DCD bool, err error) {
 	return c.handle.ModemStatus()
 }
 
-// Device returns the canonical device path, for session_info and logging.
-func (c *Channel) Device() string { return port.CanonicalDevice(c.profile.Device) }
+// Device returns the device path as the profile named it, for session_info.
+//
+// It is deliberately not the canonical path. Canonicalisation resolves a by-id
+// alias to the tty it points at, which is what the claim gate needs — two names
+// for one device must collide — and what a person reading the session record
+// does not: the by-id path is the stable identity the profile was written with,
+// it is what DeviceExists probes, and it is the string the Web UI badge
+// (FT232R @115200) is derived from. port.CanonicalDevice still runs wherever
+// identity is the question.
+func (c *Channel) Device() string { return c.profile.Device }
 
 // Baud returns the configured rate, for session_info.
 func (c *Channel) Baud() int { return c.profile.Baud }

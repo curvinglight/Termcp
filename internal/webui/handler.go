@@ -2,6 +2,7 @@ package webui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"io"
@@ -13,11 +14,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/connections"
 	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/notify"
+	"github.com/open-mcp-ai/termcp/internal/serial"
+	"github.com/open-mcp-ai/termcp/internal/serial/port"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sftp"
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
@@ -49,6 +55,7 @@ func markdownContentType(next http.Handler) http.Handler {
 type Handler struct {
 	Sessions   *session.Manager
 	SSH        *sshconfig.Store
+	Serial     *serial.Store // serial profiles; nil when the instance runs with --no-serial
 	ForwardMgr *forward.ForwardManager
 	NotifyMgr  *notify.Manager // active shell notification rules (read-only listing + delete)
 	NoInternal bool            // when true, hide and refuse the built-in loopback profile
@@ -108,6 +115,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	if h.SSH != nil {
 		h.SSH.SetOnChange(h.sessionHub().broadcast)
 	}
+	// Serial profiles refresh through the same hub as ssh ones, so one save
+	// repaints the entry grid whether the file landed in ssh_configs/ or
+	// serial_configs/ (design §3.5).
+	if h.Serial != nil {
+		h.Serial.SetOnChange(h.sessionHub().broadcast)
+	}
 	// Build metadata
 	mux.HandleFunc("GET /api/version", h.handleVersion)
 	// Daemon management (`termcp daemon status|start|stop`): an instance is
@@ -121,6 +134,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/connections/{name}", h.handlePutConnection)
 	mux.HandleFunc("DELETE /api/connections/{name}", h.handleDeleteConnection)
 	mux.HandleFunc("POST /api/connections/test", h.handleTestConnection)
+	// Serial ports for the profile form's device dropdown: the Web UI's copy of
+	// the MCP serial_ports tool (same read-only enumeration, same shape).
+	mux.HandleFunc("GET /api/serial/ports", h.handleSerialPorts)
 
 	// Sessions
 	mux.HandleFunc("GET /api/sessions", h.handleListSessions)
@@ -220,33 +236,78 @@ type connectionSummary struct {
 	Host        string `json:"host,omitempty"`
 	User        string `json:"user,omitempty"`
 	Port        int    `json:"port,omitempty"`
+	// Device and Baud describe a serial profile's line. They are absent on an
+	// ssh profile, whose transport is already described by Host/User/Port.
+	Device string `json:"device,omitempty"`
+	Baud   int    `json:"baud,omitempty"`
 	// DefaultApproval is the profile's review default for new sessions. It is
 	// served on the list so the card can show the flag without a second fetch.
 	DefaultApproval bool `json:"default_approval"`
 }
 
+// resolver answers profile-name lookups against both stores: the one shared
+// implementation session_start, the termcp:// locator and this API all go
+// through, so a name resolves to the same kind for every caller (design §3.6).
+func (h *Handler) resolver() *connections.Resolver {
+	return &connections.Resolver{SSH: h.SSH, Serial: h.Serial}
+}
+
+// handleListConnections serves both profile kinds from one list. The entry grid
+// has a single tile shape that picks its editor off `kind`, so serial profiles
+// are appended to the ssh ones rather than given a parallel endpoint the UI
+// would have to merge anyway (design §8).
 func (h *Handler) handleListConnections(w http.ResponseWriter, r *http.Request) {
-	if h.SSH == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"connections": []connectionSummary{}})
-		return
-	}
-	names, err := h.SSH.List()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	var list []connectionSummary
-	for _, n := range names {
-		ent, err := h.SSH.Load(n)
+	if h.SSH != nil {
+		names, err := h.SSH.List()
 		if err != nil {
-			continue
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		if h.NoInternal && ent.Kind == sshconfig.KindInternal {
-			continue
+		for _, n := range names {
+			ent, err := h.SSH.Load(n)
+			if err != nil {
+				continue
+			}
+			if h.NoInternal && ent.Kind == sshconfig.KindInternal {
+				continue
+			}
+			list = append(list, summarizeConnection(n, ent))
 		}
-		list = append(list, summarizeConnection(n, ent))
+	}
+	if h.Serial != nil {
+		names, err := h.Serial.List()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, n := range names {
+			ent, err := h.Serial.Load(n)
+			if err != nil {
+				continue
+			}
+			list = append(list, summarizeSerialConnection(n, ent))
+		}
+	}
+	if list == nil {
+		list = []connectionSummary{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"connections": list})
+}
+
+// summarizeSerialConnection projects a serial profile onto the shared tile
+// summary: kind, the device the card names (design's `FT232R @115200`), and the
+// review default. The line settings stay out — they belong to the editor, which
+// fetches the profile itself.
+func summarizeSerialConnection(name string, ent *serial.Entry) connectionSummary {
+	return connectionSummary{
+		Name:            name,
+		Kind:            connections.KindSerial,
+		Description:     ent.Description,
+		Device:          ent.Device,
+		Baud:            ent.Baud,
+		DefaultApproval: ent.DefaultApproval,
+	}
 }
 
 func summarizeConnection(name string, ent *sshconfig.Entry) connectionSummary {
@@ -267,8 +328,55 @@ func summarizeConnection(name string, ent *sshconfig.Entry) connectionSummary {
 	return cs
 }
 
+// profileIsSerial reports whether name lives in the serial directory.
+//
+// The two directories are mutually exclusive by construction — connections.Wire
+// installs a name check on each store — so existence is the whole question, and
+// ReadRaw answers it. A profile that exists but fails to parse still answers
+// true: the editor is asking for its bytes or its error, and reporting a broken
+// serial profile as "not found" would send that message from the wrong store.
+func (h *Handler) profileIsSerial(name string) bool {
+	if h.Serial == nil {
+		return false
+	}
+	_, err := h.Serial.ReadRaw(name)
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, serial.ErrNotFound)
+}
+
+// profileKindOf reports the kind a profile body declares. PUT dispatches on
+// this rather than on the name: a create has no existing file to look up, so
+// the body is the only evidence of which store it belongs in. Unparsable TOML
+// reports "", and the ssh path then answers with the parse error it always did.
+func profileKindOf(body []byte) string {
+	var probe struct {
+		Kind string `toml:"kind"`
+	}
+	if err := toml.Unmarshal(body, &probe); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.ToLower(probe.Kind))
+}
+
 func (h *Handler) handleGetConnection(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if h.profileIsSerial(name) {
+		data, err := h.Serial.ReadRaw(name)
+		if err != nil {
+			if errors.Is(err, serial.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return
+	}
 	if h.SSH == nil {
 		http.Error(w, "ssh store not configured", http.StatusServiceUnavailable)
 		return
@@ -289,6 +397,18 @@ func (h *Handler) handleGetConnection(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handlePutConnection(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The body's kind picks the store: on a create there is no existing file to
+	// consult, and sending a serial profile at the ssh store would fail on its
+	// kind instead of validating what it actually says.
+	if profileKindOf(body) == connections.KindSerial {
+		h.putSerialConnection(w, r, name, body)
+		return
+	}
 	if h.SSH == nil {
 		http.Error(w, "ssh store not configured", http.StatusServiceUnavailable)
 		return
@@ -302,11 +422,6 @@ func (h *Handler) handlePutConnection(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "the built-in internal profile cannot be renamed", http.StatusForbidden)
 			return
 		}
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
 	}
 	if _, err := sshconfig.ParseAndValidate(body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -326,8 +441,43 @@ func (h *Handler) handlePutConnection(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// putSerialConnection is the serial half of PUT /api/connections/{name}: same
+// request shape and status codes as the ssh path, so the editor does not need
+// to know which store answered. Validation runs before the rename so a bad body
+// cannot move the profile and then fail to write it.
+func (h *Handler) putSerialConnection(w http.ResponseWriter, r *http.Request, name string, body []byte) {
+	if h.Serial == nil {
+		http.Error(w, "serial config store not configured (instance runs with --no-serial)", http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := serial.ParseAndValidate(body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	from := strings.TrimSpace(r.URL.Query().Get("from"))
+	if from != "" && from != name {
+		if err := h.Serial.Rename(from, name); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if err := h.Serial.Save(name, body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) handleDeleteConnection(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if h.profileIsSerial(name) {
+		if err := h.Serial.Delete(name); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if h.SSH == nil {
 		http.Error(w, "ssh store not configured", http.StatusServiceUnavailable)
 		return
@@ -353,6 +503,13 @@ func (h *Handler) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// A serial profile has nothing to dial: probing it would open (and claim)
+	// the device, changing machine state from a button labelled "test". The
+	// editor hides Test for a serial profile; this is the server saying why.
+	if profileKindOf(body) == connections.KindSerial {
+		http.Error(w, "a serial profile has nothing to dial: the device is opened when a session starts", http.StatusBadRequest)
+		return
+	}
 	ent, err := sshconfig.ParseAndValidate(body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -368,6 +525,29 @@ func (h *Handler) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, session.TestConnection(remote))
+}
+
+// handleSerialPorts is GET /api/serial/ports: the Web UI's device dropdown is
+// fed from the same enumeration the MCP serial_ports tool reports, so both
+// surfaces offer the same paths — including the stable by-id one the form
+// prefers, since ttyUSB numbers move with plug order.
+//
+// Read-only, and like serial_ports it is refused only by --no-serial (a nil
+// store), not by the write gate: listing what is plugged in changes nothing.
+func (h *Handler) handleSerialPorts(w http.ResponseWriter, r *http.Request) {
+	if h.Serial == nil {
+		http.Error(w, "serial support is not enabled on this instance", http.StatusServiceUnavailable)
+		return
+	}
+	infos, err := port.List()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if infos == nil {
+		infos = []port.Info{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ports": infos})
 }
 
 type startSessionBody struct {
@@ -389,6 +569,25 @@ func (h *Handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(body.Command) == "" && len(body.Args) > 0 {
 		http.Error(w, "command is required when args are provided", http.StatusBadRequest)
+		return
+	}
+
+	// Resolve through the shared resolver first: the field is called
+	// ssh_config for history, but the name may be a serial profile, and loading
+	// it through the ssh store alone would report it as missing and send the
+	// caller to the wrong problem (design §3.6). An absent name falls through
+	// to resolveSSH, which still defaults to "internal".
+	if resolved, rerr := h.resolver().Resolve(strings.TrimSpace(body.SSHConfig)); rerr == nil {
+		if resolved.Kind == connections.KindSerial {
+			h.createSerialSession(w, body, resolved)
+			return
+		}
+	} else if !errors.Is(rerr, connections.ErrNotFound) {
+		if errors.Is(rerr, connections.ErrAmbiguous) {
+			http.Error(w, rerr.Error(), http.StatusConflict)
+		} else {
+			http.Error(w, rerr.Error(), http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -451,6 +650,66 @@ func (h *Handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		"shell_id":   sess.PrimaryShellID(),
 		"pid":        sess.PID,
 		"ssh_config": cfgName,
+		// kind tells the front end which chrome the window needs: a serial
+		// session must not offer resize or an extra channel, and the session
+		// card badges it as a device rather than a host.
+		"kind": string(sess.Info().Kind),
+	})
+}
+
+// createSerialSession starts a serial profile as a session: the Web UI's
+// counterpart of the MCP session_start serial branch, mirroring it field for
+// field so the two entry points cannot drift (design §3.6).
+//
+// command, args and mode are refused rather than ignored, for the same reason
+// the MCP tool refuses them: a serial device has no process to run and no shell
+// mode to select, and accepting the parameters would silently discard what the
+// caller asked for.
+func (h *Handler) createSerialSession(w http.ResponseWriter, body startSessionBody, resolved *connections.Resolved) {
+	if h.Serial == nil {
+		http.Error(w, "serial support is not enabled on this instance", http.StatusServiceUnavailable)
+		return
+	}
+	entry := resolved.Serial
+	if strings.TrimSpace(body.Command) != "" || len(body.Args) > 0 {
+		http.Error(w, "a serial session has no process to run; command/args are not supported", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Mode) != "" {
+		http.Error(w, "a serial session has no shell mode; mode is not supported (the terminal size is managed by the client)", http.StatusBadRequest)
+		return
+	}
+
+	sessName := strings.TrimSpace(body.Name)
+	if sessName == "" {
+		sessName = resolved.Name
+	}
+
+	sess, err := h.Sessions.Create(session.Config{
+		Name: sessName,
+		// Rows/Cols are deliberately left at zero: a serial device has no
+		// terminal, so there is no size to report, and the front-end xterm
+		// manages its own layout. The rows/cols validation above is SSH-only
+		// and never runs on this path.
+		Serial: &session.SerialConfig{
+			ProfileName: resolved.Name,
+			Device:      entry.Device,
+			Baud:        entry.Baud,
+			Entry:       entry,
+		},
+		Approval: entry.DefaultApproval,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	time.Sleep(100 * time.Millisecond)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id": sess.ID,
+		"shell_id":   sess.PrimaryShellID(),
+		"ssh_config": resolved.Name,
+		"kind":       string(api.KindSerial),
+		"serial":     sess.SerialInfo(),
 	})
 }
 
