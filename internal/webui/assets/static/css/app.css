@@ -667,6 +667,23 @@
     border-radius: 3px; accent-color: #bf8700; cursor: pointer;
   }
   .conn-check-hint { font-size: 0.68rem; line-height: 1.35; color: #6e7681; }
+  /* The visible half of the serial device picker. The datalist on the field is
+     the escape hatch for a path typed by hand, but a menu that only opens once
+     the field is focused never tells anyone what there is to type — on Windows
+     that means a COM number the operator has not seen yet. The row is a flex
+     wrap so a long by-id path truncates inside its pill instead of stretching
+     the field; the full path lives in the title. */
+  .conn-port-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+  .conn-port-chip {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem; line-height: 1.35; padding: 3px 9px;
+    border: 1px solid #d0d7de; border-radius: 999px;
+    background: #f6f8fa; color: #24292f; cursor: pointer;
+    max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .conn-port-chip:hover { background: #eaeef2; border-color: #afb8c1; }
+  .conn-port-chip:focus-visible { outline: 2px solid #bf8700; outline-offset: 1px; }
+  .conn-port-none { font-size: 0.68rem; line-height: 1.35; color: #6e7681; }
   .conn-row { display: flex; gap: 8px; }
   .conn-row > .conn-field { flex: 1; }
   .jump-chain { margin-top: 6px; }

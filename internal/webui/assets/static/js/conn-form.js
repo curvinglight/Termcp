@@ -118,12 +118,62 @@ function _applyConnKind() {
   if (isSerial) _fillSerialDeviceList();
 }
 
+// _serialPortsCache is the last enumeration, kept so the chip row can be
+// redrawn on a language switch without refetching — dynamic markup calls t()
+// at render time and is never observed, so a repaint is the only way the
+// "no ports" sentence follows the language the rest of the form just took.
+var _serialPortsCache = null;
+
+// _renderSerialDeviceChips draws the visible half of the port picker. The
+// datalist stays (typing a path by hand is the escape hatch for a device that
+// enumerates oddly), but a menu that only appears once the field is focused is
+// no help to someone who does not yet know what to type — least of all on
+// Windows, where the answer is a COM number they have never seen.
+function _renderSerialDeviceChips() {
+  var row = document.getElementById('conn-f-device-chips');
+  if (!row) return;
+  if (!_serialPortsCache) { row.innerHTML = ''; return; }
+  if (!_serialPortsCache.length) {
+    row.innerHTML = '<span class="conn-port-none">' + _hesc(t('modal.conn.field.deviceNone')) + '</span>';
+    return;
+  }
+  row.innerHTML = _serialPortsCache.map(function (p) {
+    var path = p.StableName || p.Name || '';
+    if (!path) return '';
+    var label = p.Product || p.Name || path;
+    var vidpid = p.VID && p.PID ? (' (' + p.VID + ':' + p.PID + ')') : '';
+    return '<button type="button" class="conn-port-chip" data-path="' + _hesc(path) +
+      '" title="' + _hesc(path + vidpid) + '">' + _hesc(label) + '</button>';
+  }).join('');
+}
+
+// One delegated listener for the whole row: the row is rebuilt on every
+// enumeration, and a handler per chip would leak on each redraw. The click also
+// marks the form dirty by hand — it is neither an input nor a change event, so
+// the modal's own listeners would not see it and closing would not prompt.
+(function () {
+  var row = document.getElementById('conn-f-device-chips');
+  if (!row) return;
+  row.addEventListener('click', function (ev) {
+    var chip = ev.target && ev.target.closest ? ev.target.closest('.conn-port-chip') : null;
+    if (!chip) return;
+    var dev = document.getElementById('conn-f-device');
+    if (dev) dev.value = chip.getAttribute('data-path') || '';
+    _connDirty = true;
+  });
+})();
+
 // _fillSerialDeviceList feeds the device datalist from the same enumeration
 // the MCP serial_ports tool reports (GET /api/serial/ports). The stable by-id
 // path sorts first and is what the option carries as its value; the plain
 // ttyUSB / COM path is the fallback for devices that have no id link.
 function _fillSerialDeviceList() {
   var dl = document.getElementById('conn-f-device-list');
+  // The placeholder is platform text. "…" is only a path on a POSIX machine;
+  // on Windows the same field takes COM3, and a Linux-shaped hint there reads
+  // as a mistake rather than an example.
+  var dev = document.getElementById('conn-f-device');
+  if (dev) dev.placeholder = /win/i.test(navigator.platform || '') ? 'COM3' : '/dev/serial/by-id/…';
   if (!dl) return;
   fetch('/api/serial/ports').then(function (r) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -136,6 +186,7 @@ function _fillSerialDeviceList() {
       if (as !== bs) return as - bs;
       return String(a.StableName || a.Name || '').localeCompare(String(b.StableName || b.Name || ''));
     });
+    _serialPortsCache = ports;
     dl.innerHTML = ports.map(function (p) {
       var path = p.StableName || p.Name || '';
       if (!path) return '';
@@ -143,12 +194,19 @@ function _fillSerialDeviceList() {
         (p.VID && p.PID ? (' (' + p.VID + ':' + p.PID + ')') : '')).trim();
       return '<option value="' + _hesc(path) + '">' + (label ? _hesc(label) : '') + '</option>';
     }).join('');
+    _renderSerialDeviceChips();
   }).catch(function () {
     // Enumeration is best-effort: without it the field is still a plain input,
-    // and a path typed by hand saves like any other.
+    // and a path typed by hand saves like any other. The chips go with it —
+    // a failed fetch says nothing about which ports exist, so it must not be
+    // rendered as "there are none".
     dl.innerHTML = '';
+    _serialPortsCache = null;
+    _renderSerialDeviceChips();
   });
 }
+
+onLangChange(function () { if (_serialPortsCache) _renderSerialDeviceChips(); });
 
 // _setSelect assigns a value the profile carried, falling back to the default
 // when the option is not in the list — a hand-written profile may say
