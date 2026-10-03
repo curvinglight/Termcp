@@ -46,6 +46,30 @@ func TestReplaceEnterBareLF(t *testing.T) {
 	}
 }
 
+func TestReplaceEnterSingleCRInput(t *testing.T) {
+	// KeyBytes sends a bare CR for Enter in pty mode. A single CR is an Enter
+	// just like the bare LF appendEnter sends, so every setting must replace
+	// it — otherwise crlf/lf degrade to a bare CR on that path only, and the
+	// profile's promised line ending silently depends on which input path the
+	// agent happened to use.
+	cases := map[string]string{
+		TxEOLCR:   "\r",
+		TxEOLCRLF: "\r\n",
+		TxEOLLF:   "\n",
+		TxEOLNone: "\r",
+	}
+	for setting, want := range cases {
+		got := ReplaceEnter([]byte{'\r'}, setting)
+		if string(got) != want {
+			t.Errorf("tx_eol=%q: single CR got %q, want %q", setting, got, want)
+		}
+	}
+	// A single non-Enter byte is text and must pass through untouched.
+	if got := ReplaceEnter([]byte{'x'}, TxEOLLF); string(got) != "x" {
+		t.Errorf("plain byte got %q, want %q", got, "x")
+	}
+}
+
 func TestReplaceEnterCRLFInput(t *testing.T) {
 	// Defensive: if a CRLF ever reaches here, the whole ending is replaced, not
 	// just the LF, or the CR would be left behind.

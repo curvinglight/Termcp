@@ -98,6 +98,12 @@ func serialErrCode(err error) string {
 		return CodeInvalidArgument
 	case errors.Is(err, serial.ErrNotFound):
 		return CodeSerialPortNotFound
+	case errors.Is(err, serial.ErrFlowControl):
+		// Design §7: a profile that asks for hardware the transport does not
+		// have reports its own code, not operation_failed — the caller must be
+		// able to tell "fix the profile's flow_control field" from a random
+		// failure.
+		return CodeSerialFlowControl
 	case errors.Is(err, connections.ErrAmbiguous):
 		return CodeProfileAmbiguous
 	case errors.Is(err, connections.ErrNotFound):

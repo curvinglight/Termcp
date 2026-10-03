@@ -342,6 +342,7 @@ var I18N_CATALOG = {
     'review.kind.fileTruncate': 'truncate',
     'review.kind.forwardOpen': 'port forward',
     'review.kind.forwardClose': 'forward close',
+    'review.kind.serialCtl': 'serial control',
 
     /* --- terminal timeline rail --- */
     'rail.label': 'Terminal timeline',
@@ -688,6 +689,7 @@ var I18N_CATALOG = {
     'review.kind.fileTruncate': '截断',
     'review.kind.forwardOpen': '端口转发',
     'review.kind.forwardClose': '关闭转发',
+    'review.kind.serialCtl': '串口控制',
 
     /* --- terminal timeline rail --- */
     'rail.label': '终端时间轴',
@@ -1034,6 +1036,7 @@ var I18N_CATALOG = {
     'review.kind.fileTruncate': '截斷',
     'review.kind.forwardOpen': '通訊埠轉送',
     'review.kind.forwardClose': '關閉轉送',
+    'review.kind.serialCtl': '序列埠控制',
 
     /* --- terminal timeline rail --- */
     'rail.label': '終端時間軸',

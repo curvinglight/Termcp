@@ -160,6 +160,39 @@ func waitFor(t *testing.T, r io.Reader, want string, d time.Duration) string {
 	}
 }
 
+// drain reads until EOF or the deadline and returns everything seen. Used
+// where the assertion is on ABSENCE: a stream that never ends (the device is
+// open, nothing more is coming) must still give up its buffered bytes instead
+// of blocking the test until the timeout alone decides.
+func drain(t *testing.T, r io.Reader, d time.Duration) string {
+	t.Helper()
+	type result struct {
+		s   string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		var acc strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				acc.Write(buf[:n])
+			}
+			if err != nil {
+				ch <- result{acc.String(), err}
+				return
+			}
+		}
+	}()
+	select {
+	case res := <-ch:
+		return res.s
+	case <-time.After(d):
+		return ""
+	}
+}
+
 func TestIntegrationWriteAndRead(t *testing.T) {
 	device, peer := startPTYPair(t)
 
@@ -238,20 +271,189 @@ func TestIntegrationDeviceBusyIsReported(t *testing.T) {
 	}
 }
 
-// Device loss is not covered here, and the reason is worth stating rather than
-// leaving as a gap.
+// What is still NOT covered here is worth stating rather than leaving as a gap.
 //
 // When a pty's peer closes, the device node stays present and reads keep
 // returning (0, nil) forever: there is no error to observe and nothing for the
-// existence check to find missing. A USB adapter being unplugged is different —
-// the node disappears, which is what DeviceExists catches, and the driver
-// starts returning errors, which is what the consecutive-failure path catches.
-// The unit tests drive both of those paths against a fake port
-// (TestReadLoopMarksAbortedOnDeviceGone, TestRepeatedReadFailuresReportAborted,
-// TestDeviceDisappearanceDetectedByExistenceCheck).
+// existence check to find missing. The unplug case — a node that disappears —
+// IS covered below (TestIntegrationUnpluggingTheDeviceEndsTheChannel), because
+// removing the by-id alias leaves a dangling profile path exactly the way a
+// pulled USB adapter leaves a stale /dev/ttyUSB0; the driver-error variant of
+// the same loss is driven against a fake port in
+// TestRepeatedReadFailuresReportAborted.
 //
-// This matches the limitation the design already records: a pure RS-232 device
-// on a cable that is pulled leaves the session looking alive.
+// A pure RS-232 device on a cable that is pulled while the process holds the
+// descriptor is the remaining blind spot the design records: the node may stay
+// and the reads may never fail, so nothing can detect it.
+
+// readExactly pulls n bytes from r or fails the test. Reading exactly n (and
+// comparing byte for byte) is the point of the tx_eol test below: a substring
+// match would pass for "AT\r" when the profile promised "AT\r\n".
+func readExactly(t *testing.T, r io.Reader, n int, d time.Duration) []byte {
+	t.Helper()
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out := make([]byte, 0, n)
+		buf := make([]byte, 64)
+		for len(out) < n {
+			m, err := r.Read(buf)
+			if m > 0 {
+				out = append(out, buf[:m]...)
+			}
+			if err != nil {
+				ch <- result{out, err}
+				return
+			}
+		}
+		ch <- result{out, nil}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil && len(res.b) < n {
+			t.Fatalf("read %d of %d bytes: %v", len(res.b), n, res.err)
+		}
+		return res.b
+	case <-time.After(d):
+		t.Fatalf("timed out reading %d bytes", n)
+		return nil
+	}
+}
+
+// TestIntegrationTxEOLBytesReachPeer runs the profile's line ending all the way
+// out to the wire: what the session layer would write (ReplaceEnter) must reach
+// the device byte-for-byte, for every tx_eol setting.
+//
+// Byte-exact, not substring: "cr" and "none" both produce "AT\r" while "crlf"
+// must produce "AT\r\n", and a contains-check would pass for either. It pins
+// the whole path — conversion, WriteStdin, the port, and the pty relay — as one
+// property rather than three units that each assumed the others.
+func TestIntegrationTxEOLBytesReachPeer(t *testing.T) {
+	cases := []struct {
+		setting string
+		want    string
+	}{
+		{TxEOLCR, "AT\r"},
+		{TxEOLCRLF, "AT\r\n"},
+		{TxEOLLF, "AT\n"},
+		// "none" means "no conversion", not "no line ending": the byte the
+		// terminal already produced (a bare CR) is what must arrive.
+		{TxEOLNone, "AT\r"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.setting, func(t *testing.T) {
+			device, peer := startPTYPair(t)
+
+			entry := testEntry(device)
+			entry.TxEOL = tc.setting
+			ch, err := Open(entry, "integration", 0)
+			if err != nil {
+				t.Fatalf("open %s: %v", device, err)
+			}
+			defer ch.Close()
+
+			// Exactly the bytes the session layer writes for "AT" + Enter.
+			payload := ReplaceEnter([]byte("AT\n"), tc.setting)
+			if _, err := ch.WriteStdin(payload); err != nil {
+				t.Fatalf("WriteStdin: %v", err)
+			}
+
+			got := readExactly(t, peer, len(tc.want), 5*time.Second)
+			if string(got) != tc.want {
+				t.Errorf("tx_eol=%q: peer received %q, want %q", tc.setting, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIntegrationCloseStopsFurtherWrites pins close semantics (design §9.2):
+// Close ends the channel, the reader exits, and nothing that arrives afterwards
+// reaches the output stream.
+//
+// The marker is written to the peer AFTER Done has closed, so the assertion is
+// not racing the shutdown — a channel that reports "closed" and then keeps
+// relaying bytes would leave a session the operator believes is over still
+// feeding data into a transcript nobody is watching.
+func TestIntegrationCloseStopsFurtherWrites(t *testing.T) {
+	device, peer := startPTYPair(t)
+
+	ch, err := Open(testEntry(device), "integration", 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", device, err)
+	}
+
+	// Sanity: the channel is alive and relaying before we close it.
+	if _, err := peer.WriteString("alive\n"); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	_ = waitFor(t, ch.StdoutReader(), "alive", 5*time.Second)
+
+	if err := ch.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-ch.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done did not close after Close")
+	}
+
+	// The peer keeps writing as far as it is concerned; the device end is ours.
+	if _, err := peer.WriteString("after-close-marker"); err != nil {
+		t.Fatalf("peer write after close: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Drain whatever is buffered: stdout is closed with the channel, so this
+	// ends with EOF rather than blocking.
+	rest := drain(t, ch.StdoutReader(), 2*time.Second)
+	if strings.Contains(rest, "after-close-marker") {
+		t.Errorf("bytes written after Close still reached the output: %q", rest)
+	}
+	if ch.Aborted() {
+		t.Error("a deliberate Close must not report the channel as aborted")
+	}
+}
+
+// TestIntegrationUnpluggingTheDeviceEndsTheChannel is the DEAD path against a
+// real descriptor: the profile's device path stops resolving, and the idle
+// existence probe must end the channel as aborted rather than leave a session
+// that looks alive (design §9.2 拔线 DEAD).
+//
+// Removing the by-id alias is what unplugging looks like from the profile's
+// side — the open handle keeps working (the pty node is still there), so only
+// the existence check can notice, which is exactly the failure mode this probe
+// exists for.
+func TestIntegrationUnpluggingTheDeviceEndsTheChannel(t *testing.T) {
+	device, peer := startPTYPair(t)
+
+	ch, err := Open(testEntry(device), "integration", 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", device, err)
+	}
+	defer ch.Close()
+
+	// Sanity: relaying works, so the ending below is caused by the removal.
+	if _, err := peer.WriteString("alive\n"); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	_ = waitFor(t, ch.StdoutReader(), "alive", 5*time.Second)
+
+	if err := os.Remove(device); err != nil {
+		t.Fatalf("remove device alias: %v", err)
+	}
+
+	select {
+	case <-ch.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel did not end after the device path disappeared")
+	}
+	if !ch.Aborted() {
+		t.Error("a vanished device must end the channel as aborted (DEAD)")
+	}
+}
 
 func TestIntegrationAcquireBlocksSecondProfile(t *testing.T) {
 	device, _ := startPTYPair(t)

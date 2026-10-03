@@ -142,11 +142,18 @@ func (s *Server) handleSerialConfigOps(_ context.Context, request mcpgo.CallTool
 
 // handleSerialCtl drives a serial session's modem lines and buffers.
 //
-// These actions change device state — DTR and break can reset a board — so they
-// go through the same review gate as terminal input when review mode is on. The
-// read-only status action does not: it changes nothing, and gating it would make
-// the operator wait for approval to look at a pin.
-func (s *Server) handleSerialCtl(_ context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+// These actions change device state — DTR and break can reset a board — so
+// review mode queues them like the file and forward writes: the human decides,
+// and approval replays this same handler with an approved context. A hold with
+// no approver (what "held, not queued" would amount to) is a disable wearing a
+// review badge: the action could never run, and the reply would tell the agent
+// to press an ending key that has nothing to do with it. The read-only status
+// action is not gated: it changes nothing, and gating it would make the operator
+// wait for approval to look at a pin.
+//
+// Arguments are validated before queueing, in each branch: a malformed request
+// must fail for the agent that sent it, not for the reviewer who approves it.
+func (s *Server) handleSerialCtl(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	if s.serialConfigs == nil {
 		return toolError(CodeSerialDisabled, "%s", "serial support is not enabled on this instance"), nil
 	}
@@ -169,11 +176,12 @@ func (s *Server) handleSerialCtl(_ context.Context, request mcpgo.CallToolReques
 			fmt.Sprintf("shell '%s' is not a serial session; serial_ctl works on serial devices only", shellID)), nil
 	}
 
-	// A state-changing action is a write, and review mode gates writes: the same
-	// reason it gates input applies twice over here, because toggling DTR can
-	// reset the device.
-	if action != "status" && shell.RequiresApproval() {
-		return reviewPendingResult(false), nil
+	// gate is the review gate for a state-changing action. gateOperation is the
+	// same call the file and forward tools make: it passes through when review
+	// mode is off or when this call is itself the replay of an approval, and
+	// otherwise queues the original arguments for a human decision.
+	gate := func() (*mcpgo.CallToolResult, bool) {
+		return s.gateOperation(ctx, request, "serial_ctl", shell.ParentSessionID())
 	}
 
 	switch action {
@@ -181,6 +189,9 @@ func (s *Server) handleSerialCtl(_ context.Context, request mcpgo.CallToolReques
 		level := strings.ToLower(strings.TrimSpace(getString(args, "level", "")))
 		if level != "high" && level != "low" {
 			return toolError(CodeInvalidArgument, "%s", `level must be "high" or "low"`), nil
+		}
+		if res, held := gate(); held {
+			return res, nil
 		}
 		on := level == "high"
 		var err error
@@ -199,6 +210,9 @@ func (s *Server) handleSerialCtl(_ context.Context, request mcpgo.CallToolReques
 		if ms <= 0 || ms > 60_000 {
 			return toolError(CodeInvalidArgument, "%s", "duration_ms must be between 1 and 60000"), nil
 		}
+		if res, held := gate(); held {
+			return res, nil
+		}
 		if err := ctrl.Break(time.Duration(ms) * time.Millisecond); err != nil {
 			return toolError(serialErrCode(err), "%s", err.Error()), nil
 		}
@@ -206,6 +220,14 @@ func (s *Server) handleSerialCtl(_ context.Context, request mcpgo.CallToolReques
 
 	case "flush":
 		direction := strings.ToLower(strings.TrimSpace(getString(args, "direction", "both")))
+		switch direction {
+		case "in", "out", "both":
+		default:
+			return toolError(CodeInvalidArgument, "%s", `direction must be "in", "out" or "both"`), nil
+		}
+		if res, held := gate(); held {
+			return res, nil
+		}
 		switch direction {
 		case "in":
 			if err := ctrl.FlushInput(); err != nil {
@@ -222,8 +244,6 @@ func (s *Server) handleSerialCtl(_ context.Context, request mcpgo.CallToolReques
 			if err := ctrl.FlushOutput(); err != nil {
 				return toolError(serialErrCode(err), "%s", err.Error()), nil
 			}
-		default:
-			return toolError(CodeInvalidArgument, "%s", `direction must be "in", "out" or "both"`), nil
 		}
 		return jsonResult(map[string]any{"ok": true, "action": "flush", "direction": direction}), nil
 

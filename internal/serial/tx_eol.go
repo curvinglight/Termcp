@@ -35,8 +35,9 @@ func enterBytes(txEOL string) []byte {
 // device, which is neither unix nor Windows. Rather than let that inference run
 // and then correct it (which would apply the conversion twice and get tx_eol =
 // "none" wrong), the serial path discards whatever was produced and substitutes
-// its own ending. A serial ChildShell keeps enterCRLF false so the input here is
-// always a bare LF.
+// its own ending. A serial ChildShell keeps enterCRLF false, so the input here
+// is a bare LF — or, from KeyBytes in pty mode, a bare CR; both are an Enter
+// and both are replaced.
 //
 // It is exported because the session package owns the write paths and has to
 // apply the same rule to both of them.
@@ -48,7 +49,12 @@ func ReplaceEnter(data []byte, txEOL string) []byte {
 		return enter
 
 	case 1:
-		if data[0] != '\n' {
+		// Either Enter byte the session layer can produce: appendEnter sends a
+		// bare LF (enterCRLF is always false for serial), while KeyBytes sends
+		// CR in pty mode. Entry points refuse a mode for serial sessions, but a
+		// shell that somehow carried pty mode must still convert rather than
+		// let tx_eol=crlf/lf silently degrade to a bare CR on one path.
+		if data[0] != '\n' && data[0] != '\r' {
 			return data
 		}
 		return enter

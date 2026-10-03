@@ -177,6 +177,7 @@ function kindLabelOf(kind) {
   if (kind === 'file_truncate') return t('review.kind.fileTruncate');
   if (kind === 'forward_open') return t('review.kind.forwardOpen');
   if (kind === 'forward_close') return t('review.kind.forwardClose');
+  if (kind === 'serial_ctl') return t('review.kind.serialCtl');
   return '';
 }
 

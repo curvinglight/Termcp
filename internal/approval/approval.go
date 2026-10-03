@@ -106,6 +106,10 @@ const (
 	KindForwardOpen Kind = "forward_open"
 	// KindForwardClose closes one.
 	KindForwardClose Kind = "forward_close"
+	// KindSerialCtl changes a serial device's state: DTR, RTS, line break, or a
+	// buffer flush. At least as dangerous as text input — DTR resets a board
+	// into its bootloader — so it rides the same queue (design §6.5).
+	KindSerialCtl Kind = "serial_ctl"
 )
 
 // Request is one submitted operation awaiting a decision, plus its outcome.

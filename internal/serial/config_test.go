@@ -1,6 +1,7 @@
 package serial
 
 import (
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
@@ -114,6 +115,12 @@ func TestValidateRefusesFlowControl(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "flow control") {
 			t.Errorf("flow_control %q: error should mention it, got %v", fc, err)
+		}
+		// The sentinel, not just prose: the MCP layer maps ErrFlowControl to
+		// serial_flow_control_unsupported, and a caller branching on that code
+		// must get it wherever the refusal surfaced (design §7).
+		if !errors.Is(err, ErrFlowControl) {
+			t.Errorf("flow_control %q: error should wrap ErrFlowControl, got %v", fc, err)
 		}
 	}
 }

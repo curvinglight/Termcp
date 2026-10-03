@@ -9,6 +9,7 @@
 package serial
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -16,6 +17,13 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/serial/port"
 )
+
+// ErrFlowControl reports a profile that asked for flow control. It is a
+// sentinel because the MCP layer maps it to its own error code: a caller
+// branching on serial_flow_control_unsupported must get one answer wherever
+// the refusal surfaced (create, update, or a session start re-validating the
+// profile), not operation_failed plus prose.
+var ErrFlowControl = errors.New("serial flow control unsupported")
 
 const maxConfigFileSize = 256 * 1024
 
@@ -200,8 +208,8 @@ func (e *Entry) Validate() error {
 	// Flow control first: it is the one field that must be refused before any
 	// device is touched, and its error is more specific than a generic one.
 	if e.FlowControl != "" && e.FlowControl != "none" {
-		return fmt.Errorf("serial flow control %q is not supported (only \"none\"); "+
-			"the device would silently drop data without it", e.FlowControl)
+		return fmt.Errorf("%w: %q is not supported (only \"none\"); "+
+			"the device would silently drop data without it", ErrFlowControl, e.FlowControl)
 	}
 
 	if err := e.PortConfig().Validate(); err != nil {

@@ -73,6 +73,9 @@ var gatedTools = []gatedTool{
 	{"file_link", approval.KindFileLink},
 	{"file_fs", approval.KindFileTruncate},
 	{"forward", approval.KindForwardOpen},
+	// serial_ctl writes device state (design §6.5): DTR/RTS/break can reset a
+	// board, flush discards bytes — each needs the same decision as the rest.
+	{"serial_ctl", approval.KindSerialCtl},
 }
 
 // kindForTool maps a tool name to the kind recorded on the request.
@@ -220,6 +223,26 @@ func summarizeOperation(tool string, args map[string]any) string {
 			return fmt.Sprintf("open local forward :%d -> %s:%d",
 				int(n("local_port", 0)), s("remote_host"), int(n("remote_port", 0)))
 		}
+
+	case "serial_ctl":
+		// The reviewer is deciding whether to move a pin or discard a buffer,
+		// so the summary names the action, its argument, and the shell whose
+		// device it is — nothing else on the card identifies the hardware.
+		shell := s("shell_id")
+		switch s("action") {
+		case "dtr", "rts":
+			return fmt.Sprintf("%s %s on %s", s("action"), s("level"), shell)
+		case "break":
+			return fmt.Sprintf("line break for %dms on %s", int(n("duration_ms", 250)), shell)
+		case "flush":
+			dir := s("direction")
+			if dir == "" {
+				dir = "both"
+			}
+			return fmt.Sprintf("flush %s buffers of %s", dir, shell)
+		default:
+			return "serial control on " + shell
+		}
 	}
 	return tool
 }
@@ -301,6 +324,8 @@ func (s *Server) gatedHandler(tool string) func(context.Context, mcpgo.CallToolR
 		return s.handleFileFsOp
 	case "forward":
 		return s.handleForwardOps
+	case "serial_ctl":
+		return s.handleSerialCtl
 	default:
 		return nil
 	}
