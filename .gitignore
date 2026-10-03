@@ -17,6 +17,9 @@ build/
 .idea/
 .vscode/
 
+# Local code index (machine-generated, per-workspace)
+.codegraph/
+
 # Data (runtime)
 /data
 
