@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/open-mcp-ai/termcp/internal/serial/port"
 )
@@ -68,6 +69,16 @@ type Channel struct {
 	// read loop, mirroring the SSH transport's behaviour.
 	readersOnce sync.Once
 	readersDone chan struct{}
+
+	// The local-echo line state. Unlike the read path, which is stateless
+	// because the device decides what a reply looks like, erasing what was typed
+	// needs to know what is currently on screen — the transcript is append-only
+	// and a device that does not echo will never send the rewrite an SSH shell
+	// would. Guarded separately because it is per-keystroke hot and unrelated to
+	// the lifecycle mutexes above.
+	echoMu    sync.Mutex
+	echoBuf   []byte // the bytes echoed for the line being edited
+	echoCells int    // display cells echoBuf occupies
 }
 
 // Open opens the device for a profile and starts its read loop.
@@ -253,9 +264,165 @@ func (c *Channel) WriteStdin(data []byte) (int, error) {
 	// do not echo their input: without it the transcript shows replies to
 	// commands it never shows anyone typing.
 	if c.profile.LocalEcho {
-		c.stdout.Write(data)
+		c.echoLocal(data)
 	}
+	// The device always gets the bytes verbatim. 0x7f is a real backspace the
+	// far side may act on; rewriting it for the display must never rewrite it
+	// for the protocol.
 	return c.handle.Write(data)
+}
+
+// echoLocal renders keystrokes into the transcript the way a terminal would:
+// the bytes go in as typed, and the editing keys rewrite the line already on
+// screen. It is a display of the input, not a second copy of it.
+//
+// Only bytes that draw a cell are remembered. Controls that draw nothing (ESC
+// from an arrow key, say) are passed through untracked: counting them would
+// make a later backspace erase a cell that was never drawn, which is the exact
+// wrongness this function exists to remove.
+func (c *Channel) echoLocal(data []byte) {
+	c.echoMu.Lock()
+	defer c.echoMu.Unlock()
+	for i := 0; i < len(data); {
+		b := data[i]
+		switch {
+		case b == '\r' || b == '\n':
+			// Enter ends the line. What follows is the device's reply, not an
+			// edit of what was typed, so the remembered line is dropped.
+			c.stdout.Write(data[i : i+1])
+			c.echoBuf = c.echoBuf[:0]
+			c.echoCells = 0
+			i++
+		case b == 0x7f || b == 0x08:
+			c.eraseEchoLast()
+			i++
+		case b == 0x15: // ctrl+u, kill the line
+			c.eraseEchoCells(c.echoCells)
+			c.echoBuf = c.echoBuf[:0]
+			c.echoCells = 0
+			i++
+		case b == 0x17: // ctrl+w, kill the word before the cursor
+			c.eraseEchoWord()
+			i++
+		case b < 0x20 || b == 0x7f:
+			// Every other control draws no cell of its own; xterm ignores it
+			// here, so the transcript gets the byte and the line state does not.
+			c.stdout.Write(data[i : i+1])
+			i++
+		default:
+			r, size := utf8.DecodeRune(data[i:])
+			if r == utf8.RuneError && size <= 1 {
+				// Not valid UTF-8 — an invalid byte or a sequence split across
+				// two writes. Echo it as the single replacement cell the
+				// terminal draws, so a backspace over it still erases one.
+				size = 1
+			}
+			c.stdout.Write(data[i : i+size])
+			c.echoBuf = append(c.echoBuf, data[i:i+size]...)
+			c.echoCells += runeWidth(r)
+			i += size
+		}
+	}
+}
+
+// eraseEchoLast pops the last rune from the remembered line and erases the
+// cells it occupied.
+func (c *Channel) eraseEchoLast() {
+	if len(c.echoBuf) == 0 {
+		return
+	}
+	r, size := utf8.DecodeLastRune(c.echoBuf)
+	c.echoBuf = c.echoBuf[:len(c.echoBuf)-size]
+	w := runeWidth(r)
+	c.eraseEchoCells(w)
+	c.echoCells -= w
+	if c.echoCells < 0 {
+		c.echoCells = 0
+	}
+}
+
+// eraseEchoWord drops trailing spaces and then the word before them, erasing
+// exactly the cells that disappear — so ctrl+w after a space removes the
+// previous word and only that, the way a shell does.
+func (c *Channel) eraseEchoWord() {
+	n := len(c.echoBuf)
+	for n > 0 && (c.echoBuf[n-1] == ' ' || c.echoBuf[n-1] == '\t') {
+		n--
+	}
+	for n > 0 && c.echoBuf[n-1] != ' ' && c.echoBuf[n-1] != '\t' {
+		n--
+	}
+	w := echoWidth(c.echoBuf[n:])
+	if w == 0 {
+		return
+	}
+	c.echoBuf = c.echoBuf[:n]
+	c.eraseEchoCells(w)
+	c.echoCells -= w
+	if c.echoCells < 0 {
+		c.echoCells = 0
+	}
+}
+
+// eraseEchoCells writes the sequence every terminal emits to rub out n cells:
+// back over them, blank them, back again. n is the cell count, not the byte
+// count, so a wide character erases as the two cells it was drawn as.
+func (c *Channel) eraseEchoCells(n int) {
+	if n <= 0 {
+		return
+	}
+	var seq []byte
+	for i := 0; i < n; i++ {
+		seq = append(seq, '\b')
+	}
+	for i := 0; i < n; i++ {
+		seq = append(seq, ' ')
+	}
+	for i := 0; i < n; i++ {
+		seq = append(seq, '\b')
+	}
+	c.stdout.Write(seq)
+}
+
+// echoWidth is the cell count of bytes already echoed, decoding them the same
+// way echoLocal did so the two never disagree about what is on screen.
+func echoWidth(s []byte) int {
+	w := 0
+	for len(s) > 0 {
+		r, size := utf8.DecodeRune(s)
+		if r == utf8.RuneError && size <= 1 {
+			w++
+			s = s[1:]
+			continue
+		}
+		w += runeWidth(r)
+		s = s[size:]
+	}
+	return w
+}
+
+// wideRanges are the East Asian Wide and Fullwidth blocks plus the emoji
+// blocks that terminals draw as two cells. The module deliberately carries no
+// text-width dependency, and an erase must count the same cells the terminal
+// drew, so the ranges are listed rather than derived from a table that would
+// arrive as a new transitive dependency for one display fix.
+var wideRanges = [][2]rune{
+	{0x1100, 0x115F}, {0x2E80, 0x303E}, {0x3041, 0x33FF}, {0x3400, 0x4DBF},
+	{0x4E00, 0x9FFF}, {0xA000, 0xA4CF}, {0xA960, 0xA97F}, {0xAC00, 0xD7A3},
+	{0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F}, {0xFF00, 0xFF60},
+	{0xFFE0, 0xFFE6}, {0x1F300, 0x1F64F}, {0x1F680, 0x1F6FF}, {0x1F900, 0x1F9FF},
+	{0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
+}
+
+// runeWidth returns how many cells r occupies: two for the wide and fullwidth
+// ranges, one for everything else, which is what a terminal does with them.
+func runeWidth(r rune) int {
+	for _, rg := range wideRanges {
+		if r >= rg[0] && r <= rg[1] {
+			return 2
+		}
+	}
+	return 1
 }
 
 // StdoutReader returns the device input stream.
