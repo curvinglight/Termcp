@@ -446,18 +446,34 @@ flowchart TD
 
 `go.bug.st/serial` v1.8.0 及其 `enumerator` 子包**只在此包内出现**。换库或自补流控只改这一个目录。
 
-> ⚠️ **`go.mod` 目前没有这个依赖**，实施第 2 步需先 `go get`（见 §11）。
+> ✅ **依赖已引入**：`go.bug.st/serial v1.8.0`（实施时 `go get` 加入 `go.mod`）。
 
-已核实的库能力：
+已核实的库能力（**逐项对 `v1.8.0` 源码核实，非文档转述**）：
 
-| 能力 | 支持 | 依据 |
+| 能力 | 支持 | 依据（源码位置） |
 |---|---|---|
-| baud / data bits / parity / stop bits（含 1.5） | 是 | `serial.Mode` |
-| dtr / rts 初始电平 | 是 | `Mode.InitialStatusBits *ModemOutputBits` |
-| 运行时 DTR / RTS / Break / ModemStatus | 是 | `serial.Port` 接口 |
-| **流控** | **否** | `Mode` 无该字段，`Port` 无该方法 |
-| 错误分类 | 是 | `PortErrorCode`：PortBusy / PortNotFound / PermissionDenied / Invalid\* |
-| 端口枚举（含 VID/PID） | 是 | `enumerator.GetDetailedPortsList` |
+| baud / data bits / parity / stop bits（含 1.5） | 是 | `Mode`（`serial.go:98`）；`StopBits`：`OneStopBit`/`OnePointFiveStopBits`/`TwoStopBits`（`serial.go:125-132`） |
+| dtr / rts 初始电平 | 是 | `Mode.InitialStatusBits *ModemOutputBits`（`serial.go:103`、`:76`） |
+| 运行时 DTR / RTS / Break / ModemStatus | 是 | `Port` 接口 `SetDTR`/`SetRTS`/`Break`/`GetModemStatusBits`（`serial.go:14-53`） |
+| **流控** | **否** | `Mode` 无该字段，`Port` 无该方法 —— **已在源码确认** |
+| 错误分类 | 是 | `PortError.Code() PortErrorCode`（`serial.go:211`）；含 `PortBusy`/`PortNotFound`/`PermissionDenied`/`Invalid*`/`PortClosed`/`FunctionNotImplemented` |
+| 端口枚举（含 VID/PID） | 是（除 darwin 无 cgo） | `enumerator.GetDetailedPortsList(...)`（`enumerator/enumerator.go:48`），返回 `*PortDetails` |
+
+**v4 新增核实的两条（v1–v3 漏了，直接影响 §4.1 的实现）：**
+
+| 能力 | 支持 | 依据 | 影响 |
+|---|---|---|---|
+| **`SetReadTimeout(d)`**（含 `serial.NoTimeout`） | 是 | `Port.SetReadTimeout`（`serial.go:50`）、`NoTimeout = -1`（`serial.go:59`） | §4.1 要求的"可控超时"**可直接由库提供**，不必只靠轮询或 `Close` 打断 |
+| `Read` 的阻塞语义 | 阻塞到至少 1 字节或出错 | `Port.Read` 文档注释（`serial.go:18-23`） | 正是 §4.1 关注点；配合 `SetReadTimeout` 可避免永久阻塞 |
+
+> **对 §4.1 的修正**：原文把"读取可中断"的实现选项写成"超时 **或** `Close` 唤醒"。
+> 既然库里就有 `SetReadTimeout`，**实现应优先用它**（设 `internalReadPoll`），
+> 把 `Close` 唤醒作为兜底并保证其可靠。这比纯轮询更省 CPU，也让 §4.1 第 1 条
+> 的"要么有超时、要么能被唤醒"有明确答案。
+>
+> `PortError` 是**结构体且字段未导出**，只有 `Code()` 和 `Error()` 两个方法 ——
+> 错误归一必须走 `errors.As(err, &serial.PortError{})` 后调 `.Code()`，
+> 不能靠字符串匹配。
 
 ```go
 package port
@@ -506,19 +522,73 @@ func DeviceExists(device string) (bool, error) // unix: os.Stat；Windows: Creat
 func CanonicalDevice(device string) string     // 解符号链接 + 规范化
 ```
 
-#### build tag 方案（已核实）
+#### build tag 方案（v4 修正：原方案不可实现）
 
-`enumerator` 在 **Linux / Windows / FreeBSD 为纯 Go**，仅 `usb_darwin.go` 使用 cgo
-（链接 IOKit / CoreFoundation）。Go 的 cgo 是构建传播的，macOS 上 import 即会破坏
-`CGO_ENABLED=0`。
+**v1–v3 写的三文件方案是错的，实测无法实现。** 原方案假设：macOS 无 cgo 时
+不 import `enumerator`，退化到 `serial.GetPortsList()`。实际不是"退化"，
+而是**编译直接失败**。
 
-| 文件 | build tag | 行为 |
+实测（`go.bug.st/serial@v1.8.0`）：
+
+```
+$ CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build
+# go.bug.st/serial/enumerator
+.../enumerator/enumerator.go:49:9: undefined: nativeGetDetailedPortsList
+```
+
+原因：`nativeGetDetailedPortsList` 只在 `usb_<os>.go` 里定义，而
+**`usb_darwin.go` 是 macOS 唯一的实现**，且它 `import "C"`（IOKit / CoreFoundation）。
+该文件没有 `//go:build cgo` 标签——它靠**文件名后缀**选平台，
+因此 `darwin && !cgo` 时**没有任何文件提供该符号**。库自身没有
+"darwin 无 cgo" 的回退实现。
+
+| 平台 | `enumerator` 可用性 |
+|---|---|
+| Linux / Windows / FreeBSD | ✅ 纯 Go |
+| **darwin + cgo** | ✅ 可用 |
+| **darwin + `CGO_ENABLED=0`** | ❌ **包编译失败，无回退** |
+
+##### 正确方案：用 build tag 把 import 挡在**本包内**
+
+关键：问题在**依赖**里，不在我们的代码里，所以三个文件要在**我们自己的 `port` 包**
+里切分 import，而不是指望依赖自己退化：
+
+| 文件（`internal/serial/port/`） | build tag | 行为 |
 |---|---|---|
-| `enumerator_default.go` | `!darwin` | 全平台启用枚举器，纯 Go |
-| `enumerator_darwin_cgo.go` | `darwin && cgo` | macOS 带 cgo 时启用枚举器 |
-| `enumerator_darwin_nocgo.go` | `darwin && !cgo` | macOS 退化到 `serial.GetPortsList()`，VID/PID 为空 |
+| `enumerator_supported.go` | `!darwin` | import `enumerator`，走 `GetDetailedPortsList`，带 VID/PID |
+| `enumerator_darwin_cgo.go` | `darwin && cgo` | import `enumerator`，同上 |
+| `enumerator_darwin_nocgo.go` | `darwin && !cgo` | **不 import `enumerator`**，仅 `serial.GetPortsList()`，VID/PID 为空 |
 
-**CI 必须新增三平台 `CGO_ENABLED=0 go build ./...` 检查。**
+两个 darwin 文件都实现同一个内部函数，例如：
+
+```go
+// enumerateDetailed lists ports with USB detail where the platform supports it.
+// The darwin && !cgo build cannot import the enumerator package at all (its only
+// macOS implementation needs IOKit via cgo), so it falls back to names only.
+func enumerateDetailed() ([]Info, error)
+```
+
+- `enumerator_supported.go` / `enumerator_darwin_cgo.go`：调
+  `enumerator.GetDetailedPortsList()`，填 VID/PID/序列号/厂商
+- `enumerator_darwin_nocgo.go`：调 `serial.GetPortsList()`，只填 `Name`，
+  其余字段留空
+
+**改动只落在 `internal/serial/port` 一个包内**，与 §2.8 的"库只在此包出现"约束一致。
+
+**CI 必须新增三平台 `CGO_ENABLED=0 go build ./...` 检查**——这条现在不只是好习惯，
+它是**唯一**能拦住 macOS 构建失败的手段（本地跑 Linux 永远发现不了）。
+
+> **对 `CGO_ENABLED=0` 门槛的影响**：Termcp 现有跨平台策略不受影响。
+> 全仓库 `CGO_ENABLED=0` 构建**仍然成立**，只是 macOS 上串口枚举拿不到 VID/PID。
+> 这是 §10 已知限制第 2 条的准确表述。
+
+**实测记录**（本次环境，`go.bug.st/serial@v1.8.0`）：
+
+| 检查 | 结果 |
+|---|---|
+| `CGO_ENABLED=0 go run`（linux/amd64） | ✅ `GetPortsList` / `GetDetailedPortsList` 均返回 nil error |
+| `CGO_ENABLED=0 GOOS=windows go build` | ✅ |
+| `CGO_ENABLED=0 GOOS=darwin go build` | ❌ `undefined: nativeGetDetailedPortsList` |
 
 ### 2.9 一行摘要
 
@@ -1286,7 +1356,10 @@ omitempty，旧客户端不受影响。`SSHEndpoint` 字段保留但串口会话
 1. **不支持流控**：需硬件流控的设备（高波特率、大数据量）暂不适合。profile 保留
    `flow_control` 字段但仅接受 `none`，非 `none` 报错 `serial_flow_control_unsupported`
    （配了流控却无流控会在高波特率下悄悄丢数据，这是最糟的结果，因此显式报错而非静默忽略）
-2. **macOS 无 cgo 时无 VID/PID**：退化为 `GetPortsList()`，VID/PID 为空
+2. **macOS 无 cgo 时无 VID/PID**：`enumerator` 在 `darwin && !cgo` 下**无法编译**
+   （其唯一 macOS 实现 `usb_darwin.go` 需要 cgo 且无回退），因此由
+   `internal/serial/port` 的 build tag 主动不 import 它，退化为 `serial.GetPortsList()`，
+   VID/PID 为空。详见 §2.8
 3. **纯 RS-232 无 USB 设备拔线不可检测**：会话保持 live 直到用户主动关闭
 4. **端口独占**：同一设备被两个 profile 引用时，第二个报 `serial_port_busy`
 5. **无信号语义**：`session_terminate` 在串口上跳过 grace period 直接关闭（§2.4、§2.6）
