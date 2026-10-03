@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/serial/port"
 )
 
@@ -66,11 +67,16 @@ const (
 
 // Encoding values. They describe how bytes are presented, not how they are
 // stored: the transcript keeps raw bytes either way.
+//
+// They are aliases of the display layer's vocabulary rather than a second copy
+// of it: the value stored in the profile is the value EncodeForDisplay switches
+// on, so one string written in TOML and one string matched at the outlet must
+// be the same string by construction, not by two switches agreeing today.
 const (
-	EncodingAuto = "auto"
-	EncodingText = "text"
-	EncodingHex  = "hex"
-	EncodingB64  = "b64"
+	EncodingAuto = encoding.Auto
+	EncodingText = encoding.Text
+	EncodingHex  = encoding.Hex
+	EncodingB64  = encoding.B64
 )
 
 // Defaults applied when a field is absent. Baud has none: it is required,

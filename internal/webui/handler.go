@@ -15,6 +15,7 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/session"
@@ -744,11 +745,21 @@ func (h *Handler) writeOutputRange(w http.ResponseWriter, r *http.Request, id st
 		start = total
 	}
 
+	// data stays raw until the last line: start/end/total are byte offsets into
+	// the stored stream, and a client pages with them (the history loader sets
+	// its next start from end). Encoding for presentation changes the length of
+	// the payload but not the length of the range it came from, so the offsets
+	// are computed from the raw slice and only the payload is converted.
+	enc := h.Sessions.DisplayEncodingFor(id)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"start": start,
 		"end":   start + int64(len(data)),
 		"total": total,
-		"d":     string(data),
+		// encoding says how d is rendered. The same value the terminal stream
+		// and the MCP reader use, so a hex transcript is hex everywhere it is
+		// looked at rather than only in the terminal (design §3.2).
+		"encoding": enc,
+		"d":        encoding.EncodeForDisplay(data, enc),
 	})
 }
 

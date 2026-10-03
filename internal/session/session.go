@@ -20,6 +20,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/buffer"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/shell"
@@ -180,6 +181,14 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	var sessionKind api.SessionKind
 	// serialTxEOL is the profile's Enter byte sequence, empty for SSH sessions.
 	var serialTxEOL string
+	// serialEncoding is the profile's display encoding, empty for SSH sessions
+	// (which present bytes as they arrive and always have).
+	var serialEncoding string
+	// serialInfo is the device record for a serial session, nil otherwise. It is
+	// built here rather than read from the channel later so it lands on the
+	// session record and therefore in the manifest: a restart-restored session
+	// still knows what it was talking to.
+	var serialInfo *api.SerialInfo
 	// releaseDevice releases the serial device claim; nil for SSH sessions.
 	var releaseDevice func()
 
@@ -211,6 +220,12 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		releaseDevice = release
 		sessionKind = api.KindSerial
 		serialTxEOL = cfg.Serial.Entry.TxEOL
+		serialEncoding = cfg.Serial.Entry.Encoding
+		serialInfo = &api.SerialInfo{
+			Profile: ch.ProfileName(),
+			Device:  ch.Device(),
+			Baud:    ch.Baud(),
+		}
 	} else if isRemote(cfg) {
 		r := cfg.Remote
 		port := r.Port
@@ -303,6 +318,15 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		}
 	}
 
+	// The effective display encoding, normalised once so the shell and its
+	// session cannot answer the question differently: the record keeps the
+	// profile's value (empty for SSH, so the JSON stays as it was), the readers
+	// get the value with no empty case left in it.
+	displayEnc := serialEncoding
+	if displayEnc == "" {
+		displayEnc = encoding.Text
+	}
+
 	// First shell is a peer in shells map; its id is never equal to session id.
 	// For a serial session this is the only shell it will ever have.
 	root := &ChildShell{
@@ -319,6 +343,7 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		mode:        cfg.Mode,
 		serial:      serialChannel != nil,
 		txEOL:       serialTxEOL,
+		displayEnc:  displayEnc,
 	}
 
 	s := &Session{
@@ -334,6 +359,8 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 			Cols:        cfg.Cols,
 			SSHEndpoint: sshEndpointPublic,
 			Kind:        sessionKind,
+			Encoding:    serialEncoding,
+			Serial:      serialInfo,
 		},
 		enterCRLF:      enterCRLF,
 		defaultShell:   cfg.DefaultShell,
@@ -516,7 +543,14 @@ func (s *Session) readOutput(ctx context.Context, readerID int, timeout time.Dur
 	if err != nil && err != io.EOF {
 		return "", err
 	}
-	output := string(data)
+	// Presentation is the last step before the bytes leave the process, and it
+	// goes through the one shared encoder: four outlets each converting on
+	// their own is how the same segment ends up hexed in one response,
+	// replacement-chars in another and raw in a third (design §3.2).
+	// Encoding comes before the ANSI strip so a hex or base64 caller keeps the
+	// bytes it asked for — the strip finds no escape byte in ASCII and is a
+	// no-op — while a text caller is stripped exactly as before.
+	output := encoding.EncodeForDisplay(data, s.DisplayEncoding())
 	if stripAnsi {
 		output = ansi.Strip(output)
 		output = ansi.Compact(output)
@@ -893,28 +927,42 @@ func (s *Session) SupportsSSH() bool {
 // SerialInfo reports the device details of a serial session, or nil for any
 // other kind. It feeds session_info, which otherwise has nothing to say about a
 // connection with no host.
+//
+// The value comes off the session record rather than the live channel: device,
+// baud and profile are fixed when the session starts, so reading them from the
+// record means a restart-restored session answers the same question the live
+// one did. The live channel could not — it does not exist after a restart.
 func (s *Session) SerialInfo() *SerialInfo {
 	if s == nil {
 		return nil
 	}
 	s.mu.RLock()
-	ch := s.serialChannel
-	s.mu.RUnlock()
-	if ch == nil {
-		return nil
-	}
-	return &SerialInfo{
-		Profile: ch.ProfileName(),
-		Device:  ch.Device(),
-		Baud:    ch.Baud(),
-	}
+	defer s.mu.RUnlock()
+	return s.Session.Serial
 }
 
-// SerialInfo describes a serial session's device for display.
-type SerialInfo struct {
-	Profile string `json:"profile,omitempty"`
-	Device  string `json:"device"`
-	Baud    int    `json:"baud"`
+// SerialInfo describes a serial session's device for display. It is declared in
+// pkg/api and aliased here so the record the session builds and the type this
+// package hands out are one and the same.
+type SerialInfo = api.SerialInfo
+
+// DisplayEncoding reports how this session's output bytes are presented:
+// the profile's encoding for a serial session, "text" for everything else.
+//
+// The empty value is never returned. A session without a profile chose no
+// encoding, and the readers have to be told *something*, so the normalisation
+// happens here rather than at each of the outlets — four call sites each
+// inventing their own answer for "" is how they drift apart again.
+func (s *Session) DisplayEncoding() string {
+	if s == nil {
+		return encoding.Text
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Session.Encoding != "" {
+		return s.Session.Encoding
+	}
+	return encoding.Text
 }
 
 func (s *Session) HasMoreOutput(readerID int) bool {
@@ -980,6 +1028,12 @@ type ChildShell struct {
 	// txEOL is the serial profile's Enter byte sequence. Empty for SSH shells,
 	// which decide their ending from the target shell family instead.
 	txEOL string
+	// displayEnc is this shell's presentation encoding, inherited from the
+	// session at creation and never empty (the session normalises it first).
+	// Read by the output outlet, so it is a plain field rather than a parent
+	// lookup: the reader runs under the buffer and must not take the session
+	// lock to find out how to print what it already holds.
+	displayEnc string
 	// closed marks a shell the user explicitly closed (CloseChildShell). A
 	// closed shell is a DELETE, not a DEAD transition: it is removed from the
 	// live map AND the per-shell history snapshot. Atomic so the exit watcher
@@ -1296,7 +1350,12 @@ func (cs *ChildShell) ReadTerminalStream(ctx context.Context, readerID int, time
 	if err != nil && err != io.EOF {
 		return "", err
 	}
-	output := string(data)
+	// Same presentation step as Session.readOutput, through the same encoder:
+	// this is the outlet both the MCP live read and the Web UI terminal stream
+	// go through, so it is where a serial profile's encoding actually reaches
+	// the screen. displayEnc is written once at construction, so reading it
+	// here needs no lock (and the buffer's lock is the only one held).
+	output := encoding.EncodeForDisplay(data, cs.displayEnc)
 	if stripAnsi {
 		output = ansi.Strip(output)
 		output = ansi.Compact(output)
@@ -1659,6 +1718,7 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 		Cols:        cols,
 		enterCRLF:   s.enterCRLF,
 		mode:        mode,
+		displayEnc:  s.DisplayEncoding(),
 	}
 
 	s.shells.Store(id, cs)

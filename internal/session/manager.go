@@ -8,6 +8,7 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/sshserver"
 	"github.com/open-mcp-ai/termcp/internal/storage"
@@ -326,6 +327,27 @@ func (m *Manager) GetSessionByShellID(shellID string) *Session {
 		return true
 	})
 	return found
+}
+
+// DisplayEncodingFor resolves the presentation encoding for an id that may name
+// a session or one of its shells, including a shell whose session is DEAD or
+// restored (no live ChildShell, only the retained snapshot).
+//
+// The outlets that convert raw bytes — the range endpoints, the scrollback
+// rail, the MCP tail/offset reads — hold an id, not a session, and they must
+// all land on the same answer as the live path or a replayed transcript would
+// render differently from the live one it came from.
+//
+// "text" for an unknown id: those callers are about to fail the lookup they
+// care about, and an encoding is not what they are validating.
+func (m *Manager) DisplayEncodingFor(id string) string {
+	if s := m.Get(id); s != nil {
+		return s.DisplayEncoding()
+	}
+	if s := m.GetSessionByShellID(id); s != nil {
+		return s.DisplayEncoding()
+	}
+	return encoding.Text
 }
 
 // CloseChildShell terminates a child shell by its ID and removes it from the owning

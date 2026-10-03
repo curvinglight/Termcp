@@ -34,6 +34,21 @@ const (
 	KindSerial SessionKind = "serial"
 )
 
+// SerialInfo describes the device a serial session is attached to, for display.
+//
+// It lives here rather than beside the session implementation because it is
+// session metadata that clients read: the Web UI prints "device @baud" on the
+// session card, and session_info reports it. It carries no credentials — a
+// serial profile has none — which is why it is safe to put on a record that is
+// listed, persisted and restored.
+type SerialInfo struct {
+	// Profile is the serial profile the session was started from, empty when
+	// the profile was deleted after the session started.
+	Profile string `json:"profile,omitempty"`
+	Device  string `json:"device"`
+	Baud    int    `json:"baud"`
+}
+
 // Session holds metadata for an interactive process session.
 //
 // Timestamps are Unix milliseconds, the one time representation this project
@@ -67,6 +82,25 @@ type Session struct {
 	// Kind says what carries this session's bytes: "internal", "remote" or
 	// "serial". It is omitted on shell records (see SessionKind).
 	Kind SessionKind `json:"kind,omitempty"`
+	// Encoding is how this session's output bytes are presented for display:
+	// "auto", "text", "hex" or "b64", taken from the serial profile when the
+	// session started.
+	//
+	// It is a presentation property, not a storage one — the transcript keeps
+	// raw bytes whichever value is set — and it is session-level because the
+	// profile it comes from is. Empty means no profile chose one, which the
+	// readers treat as "text": bytes out, unaltered, the behaviour every
+	// session had before the field existed. It is carried on the manifest so a
+	// replayed transcript is presented the way it was captured, across a
+	// restart. Like Kind it is omitted on shell records.
+	Encoding string `json:"encoding,omitempty"`
+	// Serial names the device a serial session is attached to. Nil for every
+	// other kind, which is what keeps the absence of a host unambiguous: a
+	// session with no SSHEndpoint is serial only if Serial says so.
+	//
+	// It is set from the profile at creation and never changes, so a
+	// restart-restored session still knows what it was talking to.
+	Serial *SerialInfo `json:"serial,omitempty"`
 	// ApprovalMode reports whether this session gates input behind N-person
 	// approval. It is a session-level policy, not a per-shell one: turning it on
 	// covers every shell channel in the session. The Web UI reads it to show that

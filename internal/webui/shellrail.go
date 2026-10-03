@@ -119,6 +119,20 @@ func (h *Handler) handleShellRail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The log is replayed raw — deliberately not through the session's display
+	// encoding, the one every output outlet goes through. This endpoint answers
+	// with a row→byte-range map, and those ranges are the same byte ranges the
+	// mark index and output-range use: the stored stream's coordinates. Feeding
+	// the layout hex (twice as long) or \xHH-escaped bytes would record spans in
+	// the rendered string's coordinates instead, and every mark overlay and row
+	// jump built on them would land on the wrong byte.
+	//
+	// The cost is row parity with the terminal for a session that renders bytes
+	// it cannot show (encoding=hex, or auto falling back to escapes): the rail
+	// counts the rows the raw log has, the terminal paints the rows the
+	// rendering has. Byte-correct beats row-correct here — a wrong row misplaces
+	// one cell, a wrong span misplaces every mark on it.
+	//
 	// A row's byte range is settled once the layout has moved past it, so the read
 	// stops as soon as the rows wanted are: a rail drawn at the bottom of the log
 	// pays for the log, not for the rows beyond the window.

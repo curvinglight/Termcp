@@ -18,6 +18,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/ansi"
 	"github.com/open-mcp-ai/termcp/internal/clock"
 	"github.com/open-mcp-ai/termcp/internal/connections"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/session"
@@ -651,11 +652,26 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 	if readerID > 0 && src.live == nil {
 		return toolError(CodeInvalidArgument, "%s", "reader_id requires a live shell; closed sessions are read with offset/tail_lines"), nil
 	}
+	// The presentation encoding of the session being read, resolved before the
+	// read modes split below. The live path encodes inside
+	// ReadTerminalStream; the tail and offset paths encode here. One resolution
+	// either way, because a reader paging through a transcript with offset
+	// would otherwise get raw bytes for the history and hex for the live tail —
+	// two renderings of the same stream (design §3.2).
+	enc := s.sessMgr.DisplayEncodingFor(src.sessID)
+
+	// Presentation comes before the ANSI strip. For hex and base64 the result
+	// is ASCII with no escape byte left in it, so the strip is a no-op and the
+	// caller keeps the bytes it asked for; for the text-like encodings the
+	// string is still the terminal's own, so stripping behaves as it always
+	// did. The order cannot be inverted without stripping something the
+	// caller never sent.
 	clean := func(raw []byte) string {
+		out := encoding.EncodeForDisplay(raw, enc)
 		if !stripAnsi {
-			return string(raw)
+			return out
 		}
-		return ansi.Compact(ansi.Strip(string(raw)))
+		return ansi.Compact(ansi.Strip(out))
 	}
 
 	var output string
@@ -708,7 +724,13 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 	}
 
 	result := map[string]any{
-		"output":         output,
+		"output": output,
+		// The encoding output is in, declared because the bytes are no longer
+		// raw: "hex" means the offsets above still count raw stream bytes while
+		// the string below is twice as long, and a caller that cannot tell the
+		// two apart pages wrong. Empty never happens — the session normalises
+		// it — but it is reported as it stands rather than reinterpreted here.
+		"encoding":       enc,
 		"has_more":       hasMore,
 		"lines_returned": strings.Count(output, "\n"),
 		"bytes_returned": len(output),
