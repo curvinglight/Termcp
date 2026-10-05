@@ -47,6 +47,16 @@ without being told:
   run all three inside a single `mcpScript` turn, and let
   `shell_output(timeout≤3)` do the only waiting there is. The loop is
   input → execute → read → next input, with nothing in between.
+  `shell_input` appends nothing: two calls with no `enter` between them reach the
+  target as one line, and a half-written command is not a command. The reply
+  carries `pending_line` for exactly this reason — treat `pending_line: true` as
+  "this line is still open", never as "a command was sent".
+- **Back up before a destructive write.** A mangled or truncated command still
+  runs; it just runs wrong. Copy the file (`cp -a target target.bak`) before
+  `sed -i`, a redirect into a config, a `truncate`, or a `git clean`. This is not
+  specific to serial links — a bootloader console may keep only the first ~20
+  characters of a line, and the resulting error names a file or device that
+  looks broken rather than the command that was cut.
 - **`shell_id` is the I/O target, `session_id` is the connection.** Every I/O
   tool takes `shell_id`. One task gets one session (give it a `name`).
 

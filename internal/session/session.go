@@ -1040,6 +1040,19 @@ type ChildShell struct {
 	// and TerminateShell can check it without extra locking; see
 	// CloseChildShell and the watcher's store-then-recheck in startReaders.
 	closed atomic.Bool
+	// pendingLine reports that input has been written to this shell since the
+	// last write that ended a line. It is the input side's own bookkeeping, and
+	// it exists because the byte stream cannot answer the question: two
+	// shell_input calls with no enter between them land on the target as one
+	// line, and nothing in the output distinguishes that from one deliberate
+	// command. Callers that can act on the difference (the MCP shell_input
+	// reply) read it through PendingLine.
+	//
+	// It records what termcp wrote, not what the device received: a bootloader
+	// that truncates its input buffer still gets bytes_written=true here,
+	// because termcp has no way to know that device's limit. Atomic rather than
+	// under cs.mu so a reader never blocks behind a writer's stdinMu.
+	pendingLine atomic.Bool
 }
 
 // ParentSessionID returns the parent Session ID for this child shell.
@@ -1128,6 +1141,12 @@ func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src In
 	// consumer watching newlines sees a line end when the terminal only repainted.
 	// The input side knows the truth — the user pressed enter.
 	submit := submitsLine(toWrite)
+	// Track the open line alongside the submit signal, from the same bytes and
+	// the same rule: this write either closed the line or left it open, and the
+	// answer is only correct if both agree. Set before the write so a reader
+	// that races the call cannot see "no line open" for input already on the
+	// wire.
+	cs.setPendingLine(submit)
 	// Record the input *before* the bytes go out, and only when it submits the
 	// line: the status display is live feedback that must not wait on the write,
 	// and a keystroke that leaves the line open is not a span of the transcript.
@@ -1209,6 +1228,33 @@ func submitsLine(payload []byte) bool {
 	return false
 }
 
+// PendingLine reports whether input has been written to this shell without a
+// line ending since the last write that closed one — the state the MCP
+// shell_input reply reports as pending_line.
+//
+// It answers a question about termcp's own writes, and nothing more:
+//
+//   - It is not a statement about the target. A bootloader that keeps only the
+//     first ~20 characters of a line leaves this true while the agent's command
+//     arrived mangled; termcp has no way to know that device's input limit, and
+//     guessing one produced worse failures than saying nothing.
+//   - A human typing in the Web UI writes to the same byte stream, so a manual
+//     enter clears the flag exactly as shell_key("enter") would.
+//   - Under review mode the flag still describes the last *executed* write. Text
+//     that is staged but not yet approved never reached the device, so it is
+//     deliberately not counted here: PendingLine is a statement about the
+//     device's input, not about the approval queue.
+func (cs *ChildShell) PendingLine() bool {
+	return cs.pendingLine.Load()
+}
+
+// setPendingLine records the line state after a write. submit is the same
+// signal logInput reports: true means the write ended the line, so nothing is
+// left open.
+func (cs *ChildShell) setPendingLine(submit bool) {
+	cs.pendingLine.Store(!submit)
+}
+
 // PressKey writes a named key sequence (enter, ctrl+c, arrows, …) repeat times.
 func (cs *ChildShell) PressKey(key string, repeat int) error {
 	return cs.PressKeyFrom(key, repeat, InputFromAPI)
@@ -1284,6 +1330,7 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 	// from the key's name: the name is a label, the sequence is what the terminal
 	// receives.
 	submit := submitsLine(payload)
+	cs.setPendingLine(submit)
 	cs.logInput(src, submit)
 	cs.stdinMu.Lock()
 	_, err = cs.execSession.WriteStdin(payload)

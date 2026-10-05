@@ -493,7 +493,23 @@ func (s *Server) handleSendInput(ctx context.Context, request mcpgo.CallToolRequ
 	if err := shell.SendTerminalBytesFrom([]byte(text), false, session.InputFromAI); err != nil {
 		return toolError(CodeOperationFailed, "%s", err.Error()), nil
 	}
-	return successResult(), nil
+	// The reply carries what a bare success cannot: this call wrote bytes but
+	// closed no line, so the command is still being typed on the far side. Two
+	// shell_input calls with no enter between them reach the target as one
+	// concatenated line, and the agent that sent them is the only party that can
+	// still prevent that — so it is told, rather than left to discover it in the
+	// output after a sed has already rewritten a file.
+	//
+	// bytes_written is the length termcp handed to the device. It is not a
+	// delivery receipt: a bootloader that keeps only the first ~20 characters of
+	// a line still reports the full count, because termcp cannot know that
+	// device's input limit. It exists so a caller that can see an echo can check
+	// the echo against what it sent, which is the only way to catch that.
+	return jsonResult(map[string]any{
+		"success":       true,
+		"pending_line":  shell.PendingLine(),
+		"bytes_written": len([]byte(text)),
+	}), nil
 }
 
 func (s *Server) handlePressKey(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -666,6 +682,11 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 	// string is still the terminal's own, so stripping behaves as it always
 	// did. The order cannot be inverted without stripping something the
 	// caller never sent.
+	//
+	// ansi.Strip marks a page whose escape sequence the read boundary cut, and
+	// the marker is the only way the caller can tell that apart from a page that
+	// really ended there. The live path strips inside the session package, so
+	// the marker is what all three read modes have in common.
 	clean := func(raw []byte) string {
 		out := encoding.EncodeForDisplay(raw, enc)
 		if !stripAnsi {
@@ -673,10 +694,14 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 		}
 		return ansi.Compact(ansi.Strip(out))
 	}
+	cutMidEscape := func(out string) bool {
+		return stripAnsi && strings.HasSuffix(out, ansi.CutMarker)
+	}
 
 	var output string
 	var start, end, total int64
 	var hasMore bool
+	var ansiTruncated bool
 
 	switch {
 	case tailLines > 0 || (src.live == nil && offset < 0):
@@ -722,6 +747,10 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 		start = pre
 		hasMore = end < total
 	}
+	// Reported from the final text, so the three read modes agree: the offset
+	// and tail paths strip here, the live path strips inside the session
+	// package, and the marker is what all three produce.
+	ansiTruncated = cutMidEscape(output)
 
 	result := map[string]any{
 		"output": output,
@@ -730,10 +759,20 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 		// the string below is twice as long, and a caller that cannot tell the
 		// two apart pages wrong. Empty never happens — the session normalises
 		// it — but it is reported as it stands rather than reinterpreted here.
-		"encoding":       enc,
-		"has_more":       hasMore,
+		"encoding": enc,
+		"has_more": hasMore,
+		// How many raw stream bytes this page covers, which is end-start. It
+		// used to be len(output), and that number was not comparable with the
+		// offsets beside it: strip_ansi deletes escape sequences and compact
+		// rewrites line endings, so a page of 13 raw bytes returned
+		// bytes_returned=4. A caller verifying an echo against what it sent —
+		// the only way to notice a bootloader console that truncated a command —
+		// has nothing to check it against when the two count different things.
+		"bytes_returned": end - start,
+		// How long the presented output above actually is, now that
+		// bytes_returned counts something else.
+		"output_bytes":   len(output),
 		"lines_returned": strings.Count(output, "\n"),
-		"bytes_returned": len(output),
 		"start_offset":   start,
 		"end_offset":     end,
 		"total_bytes":    total,
@@ -741,6 +780,13 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 		"session_id":     src.sessID,
 		"shell_id":       src.shellID,
 		"session_status": string(src.status),
+		// True when the page ended in the middle of an ANSI escape sequence
+		// because the read boundary cut it. The output carries a
+		// ansi.CutMarker in that case and the visible tail is sequence debris
+		// rather than device text; re-read from start_offset to get the
+		// sequence whole. False whenever strip_ansi is off, since the raw bytes
+		// are then returned untouched.
+		"ansi_truncated": ansiTruncated,
 	}
 	if src.live != nil {
 		result["session_uptime_seconds"] = int(clock.Since(src.created).Seconds())

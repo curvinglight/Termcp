@@ -198,6 +198,19 @@ ssh_config(action=list)
 | `shell_id` | string | **是** | — | |
 | `text` | string | **是** | — | UTF-8 文本（不自动追加换行） |
 
+**返回**：`{ success, pending_line, bytes_written }`
+
+- `pending_line`：**上一次输入之后是否还有未收尾的行**。`true` 表示目标端仍是一行
+  正在输入的内容。**连续两次 `shell_input` 之间不加回车会粘成一条命令**——真机上
+  曾因此让 `sed` 参数异常、把 `grub.cfg` 写成 0 字节。
+- `bytes_written`：本次写入的**字节**数（不是字符数）。
+- `success: true` **只代表字节已写出，不代表设备已完整接收**。bootloader 控制台
+  （GRUB/U-Boot）有输入缓冲上限（实测约 20 字符），超长命令会被截断而 Termcp
+  无从察觉。能看到回显时，请核对回显长度与 `bytes_written` 是否一致。
+
+> 两条限制同源：`shell_input` 的语义是"打字"，它不追加任何分隔符，也永远不
+> 自动补回车——自动执行一条用户没要求的命令，比让人看见 `pending_line` 危险得多。
+
 ### shell_key
 
 向 shell 发送命名按键。
@@ -248,13 +261,23 @@ ssh_config(action=list)
 2. **`offset >= 0`（无状态绝对定位）**：读字节区间 `[offset, offset+max_bytes)`。任意时刻从头/任意位置翻页；每次调用显式传 `offset`（用返回的 `end_offset` 续读），服务器不保存状态，活会话与已关闭会话一视同仁。
 3. **`tail_lines > 0`（末尾截取）**：反向取流末尾最后 N 行——只读最近输出，绝不拖入整段历史（token 友好）。无 `offset`/`tail_lines` 且目标是已关闭/死亡会话时，默认也取末尾最近一块（≤8 KiB），不会全量导出。
 
-**返回**：`{ output, has_more, lines_returned, bytes_returned, start_offset, end_offset, total_bytes, source, session_id, shell_id, session_status, session_uptime_seconds? }`
+**返回**：`{ output, has_more, lines_returned, bytes_returned, output_bytes, start_offset, end_offset, total_bytes, ansi_truncated, source, session_id, shell_id, session_status, session_uptime_seconds? }`
 
 - `start_offset` / `end_offset`：本次返回的原始字节区间；`total_bytes`：流总长；`has_more = end_offset < total_bytes`。
+- `bytes_returned`：本次覆盖的**原始流字节数**，恒等于 `end_offset - start_offset`。
+  （旧版用 `len(output)`，而 `output` 已被 strip/compact 改写，两个口径对不上，
+  调用方无法用它核对回显长度。）
+- `output_bytes`：呈现出来的 `output` 长度，与 `bytes_returned` 分属两个口径。
+- `ansi_truncated`：`true` 表示读边界切在 ANSI 转义序列中间，**输出末尾那段是序列
+  残片而非设备输出**（GRUB 全屏重绘时高频出现，提示符会显示成 `6Hgrub>` 这种）。
+  字节没有丢——用 `start_offset` 续读即可拿到完整序列。`strip_ansi=false` 时恒为 `false`。
 - `source`：`"live"`（内存缓冲）或 `"persisted"`（磁盘消息流）。
 - 活会话流式读（模式 1）时 `start_offset`/`end_offset` 反映 reader 游标位置。
 
 > 例：只读已关闭会话最后 10 行 → `shell_output(shell_id=已关闭session_id, tail_lines=10)`；从头翻页 → `shell_output(shell_id, offset=0, max_bytes=8000)` 后用 `end_offset` 续读。
+> **核对设备回显**：`ansi_truncated=false` 且输出末尾有回显时，比对回显长度与
+> `shell_input` 返回的 `bytes_written`——长度不符即设备侧截断（bootloader 常见），
+> 此时该条命令的错误输出不可信。
 
 ### session_list
 

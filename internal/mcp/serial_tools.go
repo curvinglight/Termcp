@@ -25,6 +25,10 @@ func (s *Server) registerSerialTools(mcpServer *mcpserver.MCPServer) {
 	mcpServer.AddTool(s.newTool("serial_config",
 		mcpgo.WithDescription("Serial connection profiles: action=list returns the full contents of every profile. "+
 			"Notes: tx_eol=\"none\" means Enter sends a bare CR, NOT that no line ending is sent. "+
+			"tx_eol=\"cr\" (the default) is the right choice for bootloaders (GRUB/U-Boot): "+
+			"\"crlf\" makes Enter do nothing at all there, and single-byte keys still work, so it looks like a dead serial link. "+
+			"local_echo=true is for devices that do NOT echo their input; if it is on where the device echoes too, "+
+			"every character appears twice, and a password typed at a login prompt is written to the transcript in clear. "+
 			"flow_control must be \"none\" (the transport cannot honour it). "+
 			"Only one profile may claim a given device."),
 		mcpgo.WithString("action", mcpgo.Required(), mcpgo.Enum("list", "read", "create", "update", "delete")),
