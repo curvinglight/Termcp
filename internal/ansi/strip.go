@@ -29,23 +29,17 @@ var ansiRe = regexp.MustCompile(
 // (with BEL or ST) is complete and left alone.
 var incompleteTailRe = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*)$`)
 
-// CutMarker is appended to a page whose escape sequence was cut by the read
-// boundary. It is plain text on purpose.
+// CutMarker closes a page that stopped in the middle of an escape sequence.
 //
-// The obvious encoding — an escape sequence introducing a comment — does not
-// survive this package: Compact drops every control byte below 0x20 except CR,
-// LF and TAB, so an ESC-prefixed marker would reach the caller as a headless
-// "[0m..." fragment, which is exactly the debris this is meant to replace.
-//
-// The marker is a statement about the page, not about the terminal: the bytes
-// are intact in the buffer and re-reading from start_offset returns them whole.
-//
-// It carries no trailing newline. The pipeline is Compact(Strip(...)), and a
-// newline here would be counted as a returned line, so a cut page would report
-// one line more than it contains. Detection is therefore done on Strip's own
-// output, before Compact can trim a trailing blank line away from a marker
-// appended after one.
-const CutMarker = "…[cut mid-escape]"
+// It is bracketed and carries no trailing newline. The leading bracket is what
+// makes it findable: the fragment it follows is a run of digits and semicolons
+// ("006;12") with no boundary of its own, so a bare marker would run into it —
+// "006;12[cut mid-escape]" reads as one token. Nothing may follow it, because
+// callers detect a cut by testing for the marker at the end of the output. The
+// newline matters because the pipeline is Compact(Strip(...)) and one here
+// would be counted as a returned line, making a cut page report one line more
+// than it holds.
+const CutMarker = " [cut mid-escape]"
 
 // Strip removes ANSI escape codes from text.
 //

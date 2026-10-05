@@ -198,18 +198,22 @@ ssh_config(action=list)
 | `shell_id` | string | **是** | — | |
 | `text` | string | **是** | — | UTF-8 文本（不自动追加换行） |
 
-**返回**：`{ success, pending_line, bytes_written }`
+**返回**：`{ success, line_open, bytes_written }`
 
-- `pending_line`：**上一次输入之后是否还有未收尾的行**。`true` 表示目标端仍是一行
-  正在输入的内容。**连续两次 `shell_input` 之间不加回车会粘成一条命令**——真机上
-  曾因此让 `sed` 参数异常、把 `grub.cfg` 写成 0 字节。
+- `line_open`：**上一次输入之后是否还有未用行尾收尾的内容**。`true` = 目标端仍是
+  一行正在输入的内容，**不是**"命令已发送"。**连续两次 `shell_input` 之间不加回车
+  会粘成一条命令**——真机上曾因此让 `sed` 参数异常、把 `grub.cfg` 写成 0 字节。
+  按 `enter`（`ctrl+c` 等放弃键同样会清零）后即为 `false`。
 - `bytes_written`：本次写入的**字节**数（不是字符数）。
 - `success: true` **只代表字节已写出，不代表设备已完整接收**。bootloader 控制台
   （GRUB/U-Boot）有输入缓冲上限（实测约 20 字符），超长命令会被截断而 Termcp
   无从察觉。能看到回显时，请核对回显长度与 `bytes_written` 是否一致。
 
+> `line_open` 描述的是 **termcp 写出了什么**，不是设备收到了什么：它无法发现设备
+> 侧截断（Termcp 不知道对方的缓冲上限），也管不到人在 Web UI 里手动敲的回车。
+>
 > 两条限制同源：`shell_input` 的语义是"打字"，它不追加任何分隔符，也永远不
-> 自动补回车——自动执行一条用户没要求的命令，比让人看见 `pending_line` 危险得多。
+> 自动补回车——自动执行一条用户没要求的命令，比让人看见 `line_open` 危险得多。
 
 ### shell_key
 

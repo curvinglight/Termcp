@@ -355,7 +355,7 @@ func New(sessMgr *session.Manager, msgMgr *message.Manager, sshConfigs *sshconfi
 	), withLogging("shell_close", s.handleCloseShell))
 
 	mcpServer.AddTool(s.newTool("shell_input",
-		mcpgo.WithDescription("Write text bytes to a shell's stdin. Follow with shell_key(key=\"enter\") to execute the typed line, then shell_output for the result. Consecutive calls with no enter between them concatenate into ONE line on the target, which can corrupt data; the reply reports pending_line so this is visible before it matters. success means the bytes were written, NOT that the device received them all — a bootloader console may keep only the first ~20 characters. shell_id accepts a raw id, a session id, or a termcp:// locator (\"termcp://#<sid>\" = primary shell, \"termcp://#<sid>:2\" = 2nd shell channel)."),
+		mcpgo.WithDescription("Write text bytes to a shell's stdin. Follow with shell_key(key=\"enter\") to execute the typed line, then shell_output for the result. Consecutive calls with no enter between them concatenate into ONE line on the target, which can corrupt data; the reply reports line_open so this is visible before it matters. success means the bytes were written, NOT that the device received them all — a bootloader console may keep only the first ~20 characters. shell_id accepts a raw id, a session id, or a termcp:// locator (\"termcp://#<sid>\" = primary shell, \"termcp://#<sid>:2\" = 2nd shell channel)."),
 		mcpgo.WithString("shell_id", mcpgo.Required()),
 		mcpgo.WithString("text", mcpgo.Required(), mcpgo.Description("UTF-8 text to write (no automatic newline)")),
 	), withLogging("shell_input", s.handleSendInput))

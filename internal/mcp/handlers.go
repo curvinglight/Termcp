@@ -507,7 +507,7 @@ func (s *Server) handleSendInput(ctx context.Context, request mcpgo.CallToolRequ
 	// the echo against what it sent, which is the only way to catch that.
 	return jsonResult(map[string]any{
 		"success":       true,
-		"pending_line":  shell.PendingLine(),
+		"line_open":     shell.LineOpen(),
 		"bytes_written": len([]byte(text)),
 	}), nil
 }

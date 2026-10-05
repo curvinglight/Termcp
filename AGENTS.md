@@ -49,7 +49,7 @@ without being told:
   input → execute → read → next input, with nothing in between.
   `shell_input` appends nothing: two calls with no `enter` between them reach the
   target as one line, and a half-written command is not a command. The reply
-  carries `pending_line` for exactly this reason — treat `pending_line: true` as
+  carries `line_open` for exactly this reason — treat `line_open: true` as
   "this line is still open", never as "a command was sent".
 - **Back up before a destructive write.** A mangled or truncated command still
   runs; it just runs wrong. Copy the file (`cp -a target target.bak`) before

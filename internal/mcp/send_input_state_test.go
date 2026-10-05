@@ -45,11 +45,11 @@ func sendInput(t *testing.T, s *Server, shellID, text string) map[string]any {
 	return parseResult(t, res)
 }
 
-// TestSendInputReportsPendingLine pins the reply that closes the S-6 hole: a
+// TestSendInputReportsLineOpen pins the reply that closes the S-6 hole: a
 // bare {"success":true} cannot distinguish "typed a line" from "sent a
 // command", and an agent that reads it as the latter concatenates the next
 // shell_input onto the same line on the target.
-func TestSendInputReportsPendingLine(t *testing.T) {
+func TestSendInputReportsLineOpen(t *testing.T) {
 	s := newTestServer(t)
 	shellID := startInteractiveShell(t, s)
 
@@ -57,8 +57,8 @@ func TestSendInputReportsPendingLine(t *testing.T) {
 	if m["success"] != true {
 		t.Errorf("success = %v, want true", m["success"])
 	}
-	if m["pending_line"] != true {
-		t.Errorf("after typing without enter, pending_line = %v, want true", m["pending_line"])
+	if m["line_open"] != true {
+		t.Errorf("after typing without enter, line_open = %v, want true", m["line_open"])
 	}
 	if got := m["bytes_written"]; got != float64(len("echo FIRST")) {
 		t.Errorf("bytes_written = %v, want %d", got, len("echo FIRST"))
@@ -68,8 +68,8 @@ func TestSendInputReportsPendingLine(t *testing.T) {
 	// flag cannot prevent the concatenation, but it is what lets the caller see
 	// the line is still open.
 	m = sendInput(t, s, shellID, "echo SECOND")
-	if m["pending_line"] != true {
-		t.Errorf("after a second unterminated input, pending_line = %v, want true", m["pending_line"])
+	if m["line_open"] != true {
+		t.Errorf("after a second unterminated input, line_open = %v, want true", m["line_open"])
 	}
 
 	// shell_key(enter) closes the line.
@@ -87,8 +87,8 @@ func TestSendInputReportsPendingLine(t *testing.T) {
 	// The next shell_input opens a fresh line, so the flag must be true again
 	// rather than stuck from the previous line.
 	m = sendInput(t, s, shellID, "echo THIRD")
-	if m["pending_line"] != true {
-		t.Errorf("after enter, a new input reports pending_line = %v, want true", m["pending_line"])
+	if m["line_open"] != true {
+		t.Errorf("after enter, a new input reports line_open = %v, want true", m["line_open"])
 	}
 }
 
@@ -117,8 +117,8 @@ func TestSendInputKeepsSuccessField(t *testing.T) {
 	if _, ok := m["success"]; !ok {
 		t.Error("shell_input reply dropped the success field")
 	}
-	if _, ok := m["pending_line"]; !ok {
-		t.Error("shell_input reply has no pending_line field")
+	if _, ok := m["line_open"]; !ok {
+		t.Error("shell_input reply has no line_open field")
 	}
 	if _, ok := m["bytes_written"]; !ok {
 		t.Error("shell_input reply has no bytes_written field")
