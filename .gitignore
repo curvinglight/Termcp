@@ -27,6 +27,12 @@ build/
 .claude/
 docs/superpowers/
 
+# Development process notes: design sketches, field-test findings, issue
+# summaries. They record how a problem was reached rather than what the code
+# does, so they stay local and out of history; docs/mcp-tools.md and
+# docs/api.md carry what ships.
+docs/feature/
+
 # OS
 .DS_Store
 
