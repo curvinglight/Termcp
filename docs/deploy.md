@@ -87,7 +87,7 @@ docker compose up -d --build
 
 ## 纯 API 构建
 
-不需要 Web UI 时，`-tags no_webui` 产出的是只含 REST、MCP、WebSocket 与两份 agent 文档（`/api.md`、`/skills.md`）的二进制：它既不嵌入也不服务 Web UI（`/`、`/api.html`、`/static/*` 一律 404），可与完整版并存。
+不需要 Web UI 时，`-tags no_webui` 产出的是只含 REST、MCP、WebSocket 与 agent 文档（`/api.md`）的二进制：它既不嵌入也不服务 Web UI（`/`、`/api.html`、`/static/*` 一律 404），可与完整版并存。
 
 ```bash
 make build-api    # dist/termcp-api-<os>-<arch>

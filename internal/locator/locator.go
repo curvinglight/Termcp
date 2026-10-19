@@ -148,3 +148,65 @@ func LooksLike(s string) bool {
 	s = strings.TrimSpace(s)
 	return strings.HasPrefix(s, Scheme) || strings.HasPrefix(s, "#")
 }
+
+// Handle is a caller-supplied reference to a session or one of its channels,
+// decomposed into the two things every caller actually needs: which session, and
+// which channel of it.
+//
+// This is the ONE place that knows the spellings a handle may take. Before it
+// existed, each entry point (requireShell, requireSession, the guard's resolvers,
+// transcript.Resolve, channelExitState) re-derived them on its own, and the
+// `sid:N` form ended up missing from most of them: it is what `ps`, `info` and
+// every `pty`/`pipe` reply prints, and it resolved for nothing. A spelling added
+// here is now visible to all of them at once.
+//
+// Index 0 means "no channel named": the session itself, i.e. its primary channel
+// for callers that need one. It is also what a caller that does not split handles
+// gets back, so a caller can ignore Index and still be correct.
+type Handle struct {
+	SessionID string // session id, with no "session-" prefix and no scheme
+	Index     int    // shell channel, 1-based; 0 = the session, not a channel
+}
+
+// SplitHandle decomposes a handle into its parts.
+//
+// Three spellings are accepted, and they overlap deliberately:
+//
+//	sid              a bare session id
+//
+// tsid:N            the short handle `ps`/`info`/`pty` print — channel N
+//
+//	termcp://#sid:N  the locator the Web UI copy buttons emit — channel N
+//
+// Locator syntax is recognised FIRST and handed to Parse. That order is the
+// whole trick: `termcp://#sid:2` ends in the same `:<N>` a short handle does, so
+// testing the short form first would split a locator into "termcp://#sid" and 2
+// and lose the one spelling the UI emits. Locators keep exactly one parser, and
+// they get it here.
+//
+// A colon that is not followed by a positive integer is part of the id, not a
+// channel: ids are opaque, so `a:b` is returned unchanged rather than reported as
+// a malformed handle. Callers that need the distinction between "bad index" and
+// "unknown id" get it from Parse, which is the only spelling that can express an
+// index at all.
+func SplitHandle(s string) Handle {
+	s = strings.TrimSpace(s)
+	if LooksLike(s) {
+		// Parse's error is dropped on purpose: a caller passing a malformed locator
+		// must still get the caller's own diagnostics from its own parser call, so
+		// this stays a pure decomposition and never a validator.
+		if p, err := Parse(s); err == nil && (p.Kind == KindSession || p.Kind == KindShell) {
+			return Handle{SessionID: p.SessionID, Index: p.Index}
+		}
+		return Handle{SessionID: s}
+	}
+	i := strings.LastIndex(s, ":")
+	if i <= 0 || i == len(s)-1 {
+		return Handle{SessionID: s}
+	}
+	n, err := strconv.Atoi(s[i+1:])
+	if err != nil || n < 1 {
+		return Handle{SessionID: s}
+	}
+	return Handle{SessionID: s[:i], Index: n}
+}

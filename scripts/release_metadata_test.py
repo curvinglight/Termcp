@@ -90,6 +90,21 @@ class ReleaseMetadataTest(unittest.TestCase):
         # The rc's notes moved out of Unreleased, like any release's do.
         self.assertNotIn("something worth shipping", R.changelog_parts(self.changelog())[2])
 
+    def test_prepare_writes_lf_even_on_windows(self):
+        """The repo stores LF; a CRLF rewrite hides the release change.
+
+        read_text() normalises CRLF to LF and write_text() translates back to
+        os.linesep, so on Windows `prepare` used to rewrite every line of
+        CHANGELOG.md and server.json. The diff then contained the whole file and
+        the three real lines were invisible in review. Asserting on bytes, not
+        on text: text mode is what hid the problem.
+        """
+        self.run_cli("prepare", "v0.2.8", "--date", "2026-10-15")
+        for name in ("CHANGELOG.md", "server.json"):
+            with self.subTest(file=name):
+                raw = (self.root / name).read_bytes()
+                self.assertNotIn(b"\r\n", raw, f"{name} was written with CRLF")
+
     def test_check_accepts_prepared_prerelease(self):
         self.run_cli("prepare", "v0.2.8-rc.1", "--date", "2026-10-15")
         self.assertIn("v0.2.8-rc.1", self.run_cli("check", "--expected", "v0.2.8-rc.1"))

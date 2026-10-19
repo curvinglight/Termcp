@@ -354,7 +354,7 @@ func TestMiddleware_PublicDocsNeedNoCredentials(t *testing.T) {
 	}
 	h := Middleware(v, okHandler())
 
-	for _, p := range []string{"/api.md", "/skills.md"} {
+	for _, p := range []string{"/api.md"} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, httptest.NewRequest(method, p, nil))

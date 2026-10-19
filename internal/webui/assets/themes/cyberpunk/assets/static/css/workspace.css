@@ -786,6 +786,12 @@
      it no longer consumes the header's scarce horizontal space. */
   .lang-current, .lang-caret { display: none; }
   .lang-btn { width: 32px; height: 32px; padding: 0; justify-content: center; }
+  /* The clients trigger loses its word too. It is a dropdown whose panel holds
+     the whole answer, and its glyph — the dot that is already the icon — still
+     announces "something is attached". The accessible name is unchanged: the
+     summary carries a title and the label span still exists for i18n. */
+  .clients-label { display: none; }
+  .clients-btn { width: 32px; height: 32px; padding: 0; justify-content: center; }
   /* The theme trigger joins them: its label and the current theme's name go,
      leaving the crescent. The choice is still announced by the menu it opens,
      and the summary keeps its title, so nothing is lost but the width. */

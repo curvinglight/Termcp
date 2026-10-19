@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/open-mcp-ai/termcp/internal/forward"
+	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
 // Locator acceptance across the whole tool surface.
@@ -624,9 +627,9 @@ func TestApprovalGateCannotBeBypassedByALocator(t *testing.T) {
 		if tc.spelling == "session locator" {
 			sidArg = "termcp://#" + sid + ":1"
 		}
-		res, err := s.handleFileWrite(context.Background(), makeRequest(map[string]any{
+		res, err := s.call(context.Background(), "file_write", map[string]any{
 			"session_id": sidArg, "remote_path": tc.target, "data": "gated",
-		}))
+		})
 		if err != nil {
 			t.Fatalf("%s: %v", tc.spelling, err)
 		}
@@ -644,9 +647,9 @@ func TestApprovalGateCannotBeBypassedByALocator(t *testing.T) {
 	// An ungated session must still not be gated: the check is the session's
 	// approval setting, not the presence of a locator.
 	plain, plainSid, _, _, _ := locatorFixture(t)
-	res, err := plain.handleFileWrite(context.Background(), makeRequest(map[string]any{
+	res, err := plain.call(context.Background(), "file_write", map[string]any{
 		"session_id": "termcp://#" + plainSid, "remote_path": filepath.Join(t.TempDir(), "plain.txt"), "data": "x",
-	}))
+	})
 	if err != nil || res.IsError {
 		t.Fatalf("ungated write via locator failed: %v %v", err, res)
 	}
@@ -731,6 +734,112 @@ func TestMessageSpansOnClosedSessionResolveShells(t *testing.T) {
 		}
 		if body := parseResult(t, res); body["shell_id"] == "" || body["shell_id"] == nil {
 			t.Errorf("%v: no shell resolved for a closed session", args)
+		}
+	}
+}
+
+// file_urls may be asked for response headers, and the URL it returns must carry
+// them so whoever opens it afterwards - curl, a browser, a link forwarded to
+// someone else - gets them without anything else passing them along. The
+// contract is round-trip: what the tool encoded, the download route decodes.
+func TestFileURLsCarryRequestedResponseHeaders(t *testing.T) {
+	s, sid, _, _, _ := locatorFixture(t)
+	s.baseURL = "http://127.0.0.1:0"
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "probe.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.handleGetFileURLs(context.Background(), makeRequest(map[string]any{
+		"session_id":  sid,
+		"remote_path": filepath.Join(dir, "probe.txt"),
+		"response_headers": map[string]any{
+			"Content-Disposition": `attachment; filename="probe.txt"`,
+			"Cache-Control":       "no-store",
+		},
+	}))
+	if err != nil || res.IsError {
+		t.Fatalf("file_urls with response_headers failed: %v %v", err, res)
+	}
+	raw, _ := parseResult(t, res)["download_url"].(string)
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("download_url %q does not parse: %v", raw, err)
+	}
+	// The path must still be there and still be the whole remote path: the
+	// headers are added to the query, not substituted for anything.
+	if got := u.Query().Get("path"); got != filepath.Join(dir, "probe.txt") {
+		t.Errorf("path = %q, want the remote path intact", got)
+	}
+
+	// Decoding with the route's own reader is the round trip that matters: the
+	// two ends must agree on the parameter spelling. Compare through a header to
+	// get canonical names on both sides.
+	byName, err := api.ResponseHeadersFromQuery(u.Query())
+	if err != nil {
+		t.Fatalf("the URL the tool built does not decode: %v", err)
+	}
+	hdr := http.Header{}
+	for name, values := range byName {
+		hdr[http.CanonicalHeaderKey(name)] = values
+	}
+	if got := hdr.Get("Content-Disposition"); got != `attachment; filename="probe.txt"` {
+		t.Errorf("decoded Content-Disposition = %q, want the requested value", got)
+	}
+	if got := hdr.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("decoded Cache-Control = %q, want no-store", got)
+	}
+}
+
+// Without the argument nothing changes: an unasked-for header must not appear,
+// and the URL stays byte-for-byte the shape earlier callers parsed.
+func TestFileURLsWithoutResponseHeadersAreUnchanged(t *testing.T) {
+	s, sid, _, _, _ := locatorFixture(t)
+	s.baseURL = "http://127.0.0.1:0"
+
+	res, err := s.handleGetFileURLs(context.Background(), makeRequest(map[string]any{
+		"session_id": sid, "remote_path": "/tmp/probe.txt",
+	}))
+	if err != nil || res.IsError {
+		t.Fatalf("file_urls failed: %v %v", err, res)
+	}
+	want := "http://127.0.0.1:0/api/sessions/" + sid + "/files/download?path=%2Ftmp%2Fprobe.txt"
+	if got, _ := parseResult(t, res)["download_url"].(string); got != want {
+		t.Errorf("download_url = %q, want %q", got, want)
+	}
+}
+
+// A name that is not an HTTP token, a value carrying a line break, or a value
+// that is not a string at all must fail the call rather than produce a URL that
+// means something else than it says - net/http would drop the first silently,
+// reject the second at the wire, and the third would reach the URL as a header
+// the caller asked for and did not get.
+func TestFileURLsRejectMalformedResponseHeaders(t *testing.T) {
+	s, sid, _, _, _ := locatorFixture(t)
+	s.baseURL = "http://127.0.0.1:0"
+
+	for _, tc := range []struct {
+		name    string
+		headers any
+	}{
+		{"space in name", map[string]any{"X Bad Header": "1"}},
+		{"line break in value", map[string]any{"X-Trace": "a\r\nX-Injected: yes"}},
+		{"empty name", map[string]any{"": "1"}},
+		{"non-string value", map[string]any{"X-Flag": true}},
+		{"not an object", "Content-Disposition=attachment"},
+	} {
+		res, err := s.handleGetFileURLs(context.Background(), makeRequest(map[string]any{
+			"session_id": sid, "remote_path": "/tmp/probe.txt", "response_headers": tc.headers,
+		}))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if !res.IsError {
+			t.Errorf("%s: file_urls accepted a malformed header and returned a URL", tc.name)
+			continue
+		}
+		if code, _ := decodeToolError(t, res); code != CodeInvalidArgument {
+			t.Errorf("%s: error_code = %q, want %q", tc.name, code, CodeInvalidArgument)
 		}
 	}
 }

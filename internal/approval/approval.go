@@ -100,6 +100,19 @@ const (
 	KindForwardOpen Kind = "forward_open"
 	// KindForwardClose closes one.
 	KindForwardClose Kind = "forward_close"
+	// KindExtensionCreate installs an extension template. It is gated because it
+	// changes WHAT the agent can reach from then on: an approved extension stays
+	// resident and is used without asking again, so the decision a human makes
+	// here covers every later use. Its content (command or url, allow, paths,
+	// forwards) rides in the summary — approving "an extension" without seeing
+	// what it runs would be approving a name.
+	KindExtensionCreate Kind = "ext_create"
+	// KindExtensionUpdate changes an installed template's ability list.
+	KindExtensionUpdate Kind = "ext_update"
+	// KindProfileCreate adds an SSH profile: a new host the agent may reach.
+	KindProfileCreate Kind = "profile_create"
+	// KindProfileEdit changes where an existing profile points.
+	KindProfileEdit Kind = "profile_edit"
 )
 
 // Request is one submitted operation awaiting a decision, plus its outcome.
@@ -201,4 +214,68 @@ func ShellInputSummary(text string, keys []string) string {
 	default:
 		return "(empty)"
 	}
+}
+
+// AllKinds lists every gated operation kind, in the order a UI should show them:
+// command lines first (the original case), then the file operations, then port
+// forwards. It is the authority for what a scope set may contain.
+var AllKinds = []Kind{
+	KindShellInput,
+	KindFileWrite, KindFileDelete, KindFileRename, KindFileMkdir,
+	KindFilePerm, KindFileLink, KindFileTruncate,
+	KindForwardOpen, KindForwardClose,
+	KindExtensionCreate, KindExtensionUpdate,
+	KindProfileCreate, KindProfileEdit,
+}
+
+// ValidKind reports whether kind is one this build gates.
+func ValidKind(kind Kind) bool {
+	for _, k := range AllKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeScopes turns a requested scope list into the set a session gates.
+//
+// Nil or empty means every kind: the caller asked for "review mode" without
+// narrowing it, which has always meant everything and must keep meaning that. An
+// unknown name is an error rather than a silent drop — a mistyped scope in a
+// config would otherwise leave an operation ungated while the operator believes
+// it is gated, and nothing anywhere would say so.
+func NormalizeScopes(kinds []Kind) (map[Kind]bool, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	set := make(map[Kind]bool, len(kinds))
+	for _, k := range kinds {
+		if !ValidKind(k) {
+			return nil, fmt.Errorf("unknown approval scope %q; valid scopes: %s", k, strings.Join(KindNames(), ", "))
+		}
+		set[k] = true
+	}
+	return set, nil
+}
+
+// KindNames lists every valid scope name, for an error message or a UI.
+func KindNames() []string {
+	out := make([]string, 0, len(AllKinds))
+	for _, k := range AllKinds {
+		out = append(out, string(k))
+	}
+	return out
+}
+
+// ScopeList returns the kinds in a set, in AllKinds order, so two equal sets
+// always render identically (a map's iteration order would make the UI flicker).
+func ScopeList(set map[Kind]bool) []Kind {
+	out := make([]Kind, 0, len(set))
+	for _, k := range AllKinds {
+		if set[k] {
+			out = append(out, k)
+		}
+	}
+	return out
 }

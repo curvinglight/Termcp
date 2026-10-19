@@ -221,7 +221,7 @@ vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
  // Terminal options and window controls are committed with the stylesheet,
  // including already hidden channels. Font fallback remains the shared stack.
  configs.custom = { terminal: { fontFamily: 'Theme Mono, var(--font-mono)', fontSize: 20, fontWeight: 500,
-  fontWeightBold: 700, lineHeight: 1.6, letterSpacing: 2, transparent: true, opacity: .6,
+  fontWeightBold: 700, lineHeight: 1.6, letterSpacing: 2, minimumContrastRatio: 7, transparent: true, opacity: .6,
   background: '#123456', foreground: '#ffeedd', cursor: '#aabbcc', selectionBackground: '#112233',
   colors: { brightRed: '#ff7777' }, window: { background: '#123456', borderColor: '#778899', blur: 8 } } };
  const custom = context.applyTheme('custom');
@@ -232,6 +232,9 @@ vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
  assert.equal(term.options.fontWeight, 500);
  assert.equal(term.options.lineHeight, 1.6);
  assert.equal(term.options.letterSpacing, 2);
+ /* The JSON knob reaches xterm, and the CSS default comes back when it is gone. */
+ assert.equal(term.options.minimumContrastRatio, 7);
+ assert.equal(styles['--terminal-minimum-contrast-ratio'], '7');
  assert.equal(term.options.allowTransparency, true);
  assert.equal(term.options.theme.foreground, '#ffeedd');
  assert.equal(term.options.theme.background, 'rgba(0, 0, 0, 0)');
@@ -246,14 +249,17 @@ vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
  assert.equal(await opaque, true);
  assert.equal(term.options.allowTransparency, false);
  assert.equal(term.options.fontSize, 13);
+ assert.equal(term.options.minimumContrastRatio, 4.5);
+ assert.equal(styles['--terminal-minimum-contrast-ratio'], undefined);
  assert.equal(term.options.fontFamily, 'Baseline CJK Mono');
  assert.equal(term.options.theme.background, '#ffffff');
  assert.equal(styles['--xterm-bright-red'], undefined);
  assert.equal(styles['--terminal-body-background'], undefined);
  assert.equal(attrs['data-terminal-transparent'], 'false');
- const invalid = context.normalizeThemeConfig({ terminal: { fontSize: -9, opacity: 2, lineHeight: 0, transparent: 'yes', foreground: 9 } });
+ const invalid = context.normalizeThemeConfig({ terminal: { fontSize: -9, opacity: 2, lineHeight: 0, minimumContrastRatio: 0.5, transparent: 'yes', foreground: 9 } });
  assert.equal(invalid.fontSize, undefined);
  assert.equal(invalid.opacity, undefined);
+ assert.equal(invalid.minimumContrastRatio, undefined);
  assert.equal(invalid.transparent, undefined);
  delayedConfig.custom = {};
  const oldConfig = context.applyTheme('custom');

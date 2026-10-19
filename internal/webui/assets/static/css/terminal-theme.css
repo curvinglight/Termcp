@@ -7,6 +7,16 @@
   --terminal-line-height: 1;
   --terminal-letter-spacing: 0;
   --terminal-background-opacity: 1;
+  /* Told to xterm as `minimumContrastRatio`. Eight of the sixteen ANSI slots
+     are the UI's semantic colors, and a UI pairing (text-on-surface) says
+     nothing about which of the other fifteen a program will paint them over:
+     `ls` colours an other-writable directory `34;42` — blue text on a green
+     background — and in the light theme those two tokens are a contrast ratio
+     of exactly 1.00, i.e. the same colour. xterm repairs a cell itself when
+     asked, so this is a number rather than fifteen retuned colors: 4.5 is the
+     WCAG AA floor for normal text, and the repair keeps the hue while moving
+     only lightness. 1 disables it; the option is clamped to 1..21. */
+  --terminal-minimum-contrast-ratio: 4.5;
 }
 .shell-window {
   background: var(--terminal-window-background, var(--terminal-background, var(--term-glass-frost)));

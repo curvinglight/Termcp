@@ -6,10 +6,10 @@ Termcp 在同一个端口上同时提供四种入口，它们操作**同一批�
 | --- | --- | --- |
 | Web UI | 人 | 浏览器（`/`） |
 | MCP | AI Agent | Streamable HTTP（`/stream`）、SSE（`/sse`）、stdio 桥（本地子进程） |
-| Agent Skill | AI Agent（纯 curl，无需 MCP） | 实例自带的 `/skills.md` + REST |
+| REST | AI Agent（纯 curl，无需 MCP） | `POST /api/term`（与 MCP `term` 同一套指令） |
 | REST + WebSocket | 脚本 / 程序 | `/api/*`、`/api/ui/ws` |
 
-四者共享一套会话内核，所以你在浏览器里看到的、Agent 正在驱动的、脚本在读的是同一条终端。工具面见 [`mcp-tools.md`](./mcp-tools.md)，端点见 [`api.md`](./api.md)。
+四者共享一套会话内核，所以你在浏览器里看到的、Agent 正在驱动的、脚本在读的是同一条终端。指令空间由实例自述（`help`、`help <directive>`、空 `cmd` 返回引导），端点见 [`api.md`](./api.md)。
 
 ## 按客户端接入
 
@@ -104,7 +104,7 @@ Termcp 在同一个端口上同时提供四种入口，它们操作**同一批�
 
 ## 认证
 
-单个静态 token 保护整个 HTTP 面——Web UI、REST API、MCP SSE、MCP streamable HTTP 与浏览器 WebSocket。（只读文档 `/api.md` 与 `/skills.md` 保持公开，好让 Agent 在拿到 token 之前就能取到它们。）配置是可选的，仅限 loopback 绑定时保持免配置默认；非 loopback 绑定不带 token 是启动错误。
+单个静态 token 保护整个 HTTP 面——Web UI、REST API、MCP SSE、MCP streamable HTTP 与浏览器 WebSocket。（只读文档 `/api.md` 保持公开，好让 Agent 在拿到 token 之前就能取到它。）配置是可选的，仅限 loopback 绑定时保持免配置默认；非 loopback 绑定不带 token 是启动错误。
 
 ```bash
 # 明文：flag 或环境变量
@@ -214,26 +214,35 @@ claude mcp add termcp -- termcp daemon stdio
 - stdio（本地子进程）→ `termcp daemon stdio`（什么都还没跑；它拉起实例，实例随后空闲退出），或对一个已在应答的实例跑 `termcp stdio`；加 `sse`（`termcp daemon stdio sse`、`termcp stdio sse`）改走 SSE 传输而不是 `/stream`，或给一个完整 URL 指向任意 MCP HTTP 端点
 - npm 包装器（`@open-mcp-ai/termcp`）也可当 stdio 命令：`npx -y @open-mcp-ai/termcp daemon stdio`
 
-Web UI 的 **API / MCP / SKILLS** 页面（`/api.html`）给出两种 HTTP 传输与 stdio 桥的可复制配置——地址跟随页面所在实例——外加本实例的 Agent 文档与 skill 下载地址。
+Web UI 的 **API / MCP** 页面（`/api.html`）给出两种 HTTP 传输与 stdio 桥的可复制配置——地址跟随页面所在实例——外加本实例的 Agent 文档地址。
 
-## Agent Skill（纯 curl，无需 MCP）
+## 纯 curl 驱动（无需 MCP）
 
-不想配 MCP 客户端？实例自带一份可安装的 **Agent Skill**，让任意 agent 只用 `curl` 就能驱动 Termcp——包括识别用户从 Web UI 复制的 `termcp://` 定位符。
+不想配 MCP 客户端时，用 REST 入口——**一个端点，一条指令行**，与 MCP 的 `term`
+工具是同一套指令语言、同一个信封：
 
 ```bash
-# 公开端点：下载文档本身不需要 token
-curl -fsS http://<host>:18765/skills.md -o /tmp/termcp-SKILL.md
+# 公开端点：读文档本身不需要 token
+curl -fsS http://<host>:18765/api.md
 
-# Claude Code 读取 ~/.claude/skills/<名字>/SKILL.md
-mkdir -p ~/.claude/skills/termcp && cp /tmp/termcp-SKILL.md ~/.claude/skills/termcp/SKILL.md
-
-# 其他遵循共享约定的 agent 读取 ~/.agents/skills/<名字>/SKILL.md
-mkdir -p ~/.agents/skills/termcp && cp /tmp/termcp-SKILL.md ~/.agents/skills/termcp/SKILL.md
+# 一条命令：与 MCP 的 term(cmd:"ps") 完全等价
+curl -sS -X POST http://<host>:18765/api/term -d '{"cmd":"ps"}'
 ```
 
-安装后需重启 agent 会话（skill 在会话启动时加载）。Claude Code 没有单独的 skill 子命令：安装 = 放进目录，卸载 = `rm -rf ~/.claude/skills/termcp`（以 plugin 形式分发时用 `claude plugin install/uninstall`）。
+指令空间由实例自述，不需要另写教程：
 
-装好之后，一句“打开 termcp://rock64 并执行 `uname -a`”即可端到端完成：skill 会先用 `GET /api/resolve?url=...` 解析定位符，用解析出的 `ssh_config` 建会话，发送命令并轮询输出。同一份 skill 也注册为 MCP resource `<origin>/skills.md`，`/api.html` 会给出当前实例的准确安装命令。
+```bash
+curl -sS -X POST http://<host>:18765/api/term -d '{}'              # 引导：这里有什么、我能做什么
+curl -sS -X POST http://<host>:18765/api/term -d '{"cmd":"help"}'  # 全部指令
+curl -sS -X POST http://<host>:18765/api/term -d '{"cmd":"help run"}'  # 单条指令的形状与坑
+```
+
+这三条回复都由与 MCP 工具同一张表生成，因此不会出现「文档说过时了」的情况。
+定位符（`termcp://#<会话>:2`）与短句柄（`<会话>:2`）都能直接当目标用。命令失败是
+**slot 里的失败**（HTTP 仍是 2xx），按 slot 读 `code`。
+
+端到端一句「打开 termcp://rock64 并执行 `uname -a`」即可完成：`{"cmd":"pty
+termcp://rock64"}` 建会话，然后 `{"cmd":"run <handle> uname -a"}` 发命令并读回输出。
 
 ## 接入脚本 / 程序（REST API）
 
@@ -273,13 +282,10 @@ claude mcp add --transport http termcp http://your-server:18765/stream --header 
 
 不要把 Token 放进 URL，也不要贴进共享配置或截图。
 
-## 工具懒加载
+## 工具面：一个入口
 
-MCP 客户端会在 `tools/list` 里取回每个工具的 JSON schema，所以工具多的服务端要在上下文预算里为它付账。MCP 规范给了个逃生口：给低频工具打 `defer_loading` 标记，客户端按需加载它们的 schema。Termcp 的 31 个工具分成热路径 **12** 个（会话生命周期 + shell 输入输出——永远列出）与低频宽面 **19** 个（11 个 SFTP `file_*` 工具、`forward`、`shell_resize`/`shell_detect`/`shell_notify`、`shell_reader_register`/`shell_reader_unregister`、`message`、`ssh_config`）。
+`tools/list` 只有一个工具 `term`（约 2.0 KB），参数是 `cmd` 加九个窗口参数。与上下文预算相关的三件事因此都不再是问题：
 
-`--mcp-defer-tools` 打开这个标记，且**默认关闭**：
-
-- **默认**——31 个工具全部带着完整 schema 立即列出。这是所有不实现按需加载的客户端所需要的——包括经 AxonHub 这类网关与 Termcp 对话的 Codex，网关可能丢掉 `defer_loading` 标记。标记一丢，那些工具就无法按需重新加载，只会从模型视野里消失。
-- **`--mcp-defer-tools`**——19 个低频工具带 `defer_loading`；12 个核心工具保持立即加载，所以 `session_start → shell_input → shell_output` 这个循环永远不需要一次搜索往返。支持按需加载的客户端（基于 mcp-go 的客户端、Claude Code）只为它们真正用到的 schema 付账。
-
-两种模式都是同样的 31 个工具：打开该 flag 从不删除工具，只是从首次列表里扣下 schema。分类表在 `internal/mcp/toolopts.go` 的 `deferredTools`。
+- **不再需要 `defer_loading`。** 那个机制解决的是「工具太多，先别给 schema」；一个工具没有可延后加载的部分。`--mcp-defer-tools` 与分类表已删除。
+- **客户端不必理解任何标记。** 丢掉未知字段的网关（实测某些 Codex 链路会丢掉 `defer_loading`）只会丢掉一个不存在的字段，不会丢工具。
+- **能力不随工具数增长。** 装一个 MCP server、一条技能扩展、十条别名之后，`tools/list` 逐字节不变；差异只出现在 `cmd` 的返回内容里（`ext list` / `ps` 不同），不在工具面。

@@ -1,12 +1,14 @@
 package sshserver
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +18,13 @@ import (
 	"github.com/pkg/sftp"
 )
 
+// CommandHandler runs one session in-process instead of spawning a process. args
+// are the argv the client sent after the command name, and the returned code is
+// the session's exit status. sess carries the channel's stdio, and its context
+// is canceled when the client goes away — a handler that blocks must select on
+// it or on a read returning EOF.
+type CommandHandler func(ctx context.Context, sess ssh.Session, args []string) int
+
 // Server wraps an internal SSH server.
 type Server struct {
 	server   *ssh.Server
@@ -24,7 +33,42 @@ type Server struct {
 	mu       sync.Mutex
 	// pending maps one-time username -> password. A successful password auth removes the entry.
 	pending map[string]string
+	// builtins maps a command name to the in-process handler that serves it. Read
+	// through a mutex rather than atomically because registration happens at
+	// startup, before Start, and a map is not a value an atomic can hold.
+	builtins map[string]CommandHandler
 }
+
+// RegisterCommand teaches the server a command it serves in-process: a session
+// whose first argv word is name is handed to h instead of being exec'd. It is
+// how the extension layer carries an HTTP MCP server over the in-memory channel
+// without starting a second process, and it is deliberately an explicit
+// registration rather than a name the server knows on its own — the sshserver
+// stays a transport, and the thing being carried stays in the package that owns
+// it.
+func (s *Server) RegisterCommand(name string, h CommandHandler) {
+	if strings.TrimSpace(name) == "" || h == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.builtins == nil {
+		s.builtins = make(map[string]CommandHandler)
+	}
+	s.builtins[name] = h
+}
+
+// builtin returns the handler for a command name, or nil when the name is not a
+// built-in and must be exec'd normally.
+func (s *Server) builtin(name string) CommandHandler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.builtins[name]
+}
+
+// BuiltinForTest exposes builtin to package-external tests, which need to assert
+// what a registration did (or did not) install. It has no production caller.
+func (s *Server) BuiltinForTest(name string) CommandHandler { return s.builtin(name) }
 
 // ptyContextKey is the per-session context key under which the PTY allocated
 // for a session is handed from the session request goroutine to the session
@@ -234,6 +278,16 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if len(cmdArgs) == 0 {
 		sh, shArgs := shell.NewDetector().Argv()
 		cmdArgs = append([]string{sh}, shArgs...)
+	}
+
+	// A built-in command is served in this process: no fork, no PATH lookup, and
+	// the handler owns the channel for as long as the client keeps it open. It
+	// needs none of the machinery below — there is no child to signal or to reap,
+	// and the session's own context is what ends it.
+	if h := s.builtin(cmdArgs[0]); h != nil {
+		code := h(sess.Context(), sess, cmdArgs[1:])
+		_ = sess.Exit(code)
+		return
 	}
 
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)

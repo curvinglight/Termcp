@@ -29,6 +29,10 @@ type approvalState struct {
 	queue  *approval.Queue
 	need   int
 	window time.Duration
+	// scopes is the set of operation kinds this session gates. Nil means every
+	// gated kind (see approval.AllKinds), which is what review mode has always
+	// done and what an empty scope list in an old manifest resolves to.
+	scopes map[approval.Kind]bool
 	// pending holds text that has been submitted but not yet ended, keyed by
 	// shell. An agent types a line and then presses enter, and those are two MCP
 	// calls; holding the text until the newline arrives is what lets a reviewer
@@ -126,14 +130,33 @@ type approvalConfig struct {
 // request approved under the previous threshold must not be replayed under a
 // different one.
 func (s *Session) EnableApproval(need int, timeout time.Duration) error {
+	return s.EnableApprovalScoped(need, timeout, nil)
+}
+
+// EnableApprovalScoped is EnableApproval with an explicit set of gated kinds.
+//
+// A nil or empty set means every gated kind, which is the original behaviour and
+// the default: review started as "hold everything the agent does to this host",
+// and a caller that names no scopes is asking for exactly that. Naming a subset
+// is the finer control issue #75 asks for — a session where the agent may read
+// and write files but not open a tunnel, or one where only commands are held.
+//
+// Unknown kinds are refused rather than ignored: a typo in a config would
+// otherwise silently drop a scope the operator believed was on, which is the one
+// failure mode a gate must not have. The refusal names the valid set.
+func (s *Session) EnableApprovalScoped(need int, timeout time.Duration, scopes []approval.Kind) error {
 	if need < 1 {
 		return fmt.Errorf("approval threshold must be at least 1, got %d", need)
 	}
 	if timeout < 0 {
 		return fmt.Errorf("approval timeout cannot be negative, got %s", timeout)
 	}
+	set, err := approval.NormalizeScopes(scopes)
+	if err != nil {
+		return err
+	}
 
-	st := &approvalState{need: need, window: timeout, onChange: s.approvalSink}
+	st := &approvalState{need: need, window: timeout, onChange: s.approvalSink, scopes: set}
 	// The queue's change hook re-reads the session's current state rather than
 	// capturing the event sink here: the sink is installed by main and can be
 	// replaced between enable and use.
@@ -184,11 +207,63 @@ func (s *Session) DisableApproval() {
 	}
 }
 
-// ApprovalEnabled reports whether this session gates input.
+// ApprovalEnabled reports whether this session gates anything at all.
 func (s *Session) ApprovalEnabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.approval != nil
+}
+
+// GatesKind reports whether this session holds operations of this kind.
+//
+// It is the question every gate has to ask, and it is separate from
+// ApprovalEnabled because a session can be in review mode for one kind and not
+// another: with scopes set to file writes, a port forward must go straight
+// through. A caller that only checked ApprovalEnabled would hold the wrong
+// things — which is the whole point of #75.
+func (s *Session) GatesKind(kind approval.Kind) bool {
+	s.mu.RLock()
+	st := s.approval
+	s.mu.RUnlock()
+	if st == nil {
+		return false
+	}
+	return st.gates(kind)
+}
+
+// ApprovalScopes lists the kinds this session holds, or nil when it gates
+// everything. Reported so the UI can show what the switch currently covers
+// instead of a bare on/off.
+func (s *Session) ApprovalScopes() []approval.Kind {
+	s.mu.RLock()
+	st := s.approval
+	s.mu.RUnlock()
+	if st == nil {
+		return nil
+	}
+	return st.scopeList()
+}
+
+// gates answers the per-kind question for one state, reading scopes under its own
+// lock (EnableApproval swaps the whole state in, so the set never changes under a
+// live pointer, but the lock keeps the read explicit).
+func (st *approvalState) gates(kind approval.Kind) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.scopes == nil {
+		return true
+	}
+	return st.scopes[kind]
+}
+
+// scopeList returns the gated kinds in a stable order, or nil for "everything".
+func (st *approvalState) scopeList() []approval.Kind {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.scopes == nil {
+		return nil
+	}
+	return approval.ScopeList(st.scopes)
 }
 
 // ApprovalQueue returns the active queue, or nil when approval mode is off.
@@ -269,14 +344,15 @@ var ErrApprovalOff = fmt.Errorf("approval mode is off")
 // whose policy could apply.
 func (cs *ChildShell) RequiresApproval() bool {
 	p := cs.parentSession()
-	return p != nil && p.ApprovalEnabled()
+	// A command line is KindShellInput, so a session scoped to file operations
+	// only must let typing through. Reading it as "is review mode on" would hold
+	// the operator's own commands under a policy that never mentioned them.
+	return p != nil && p.GatesKind(approval.KindShellInput)
 }
 
-// parentSession reads the parent pointer under the shell lock.
+// parentSession reads the parent pointer.
 func (cs *ChildShell) parentSession() *Session {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	return cs.parent
+	return cs.parent.Load()
 }
 
 // SubmitForApproval queues a command line addressed to this shell and returns

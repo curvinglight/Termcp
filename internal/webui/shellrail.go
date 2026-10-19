@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/open-mcp-ai/termcp/internal/capability"
 )
 
 // GET /api/shells/{id}/rail: which bytes of a shell's log sit on which terminal row.
@@ -105,7 +107,7 @@ const (
 // `ESC[H ESC[2J`, then erased a screenful-sized region from the wrong origin.
 func (h *Handler) handleShellRail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	sessionID, shellID, ok := h.marksTarget(w, id, "shell_output")
+	sessionID, shellID, ok := h.marksTarget(w, id, capability.ShellOutput)
 	if !ok {
 		http.Error(w, "shell not found: "+id, http.StatusNotFound)
 		return

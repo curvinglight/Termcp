@@ -38,6 +38,8 @@ func (s *Server) handleShellNotifyOps(ctx context.Context, request mcpgo.CallToo
 			channel = notify.ChannelResource
 		case "sampling":
 			channel = notify.ChannelSampling
+		case "":
+			channel = defaultNotifyChannel(ctx)
 		default:
 			return toolError(CodeInvalidArgument, "%s", "channel must be resource or sampling"), nil
 		}
@@ -178,4 +180,17 @@ func (s *Server) handleNotifyUser(ctx context.Context, request mcpgo.CallToolReq
 		out["hint"] = "no Web UI tab is open; the notification was not displayed"
 	}
 	return jsonResult(out), nil
+}
+
+// defaultNotifyChannel picks the transport when the caller omitted --channel:
+// sampling when the client declared support for it, resource otherwise. This
+// is what makes the documented "omit it and the server decides" a default
+// instead of an error.
+func defaultNotifyChannel(ctx context.Context) notify.Channel {
+	if cs := mcpserver.ClientSessionFromContext(ctx); cs != nil {
+		if ci, ok := cs.(mcpserver.SessionWithClientInfo); ok && ci.GetClientCapabilities().Sampling != nil {
+			return notify.ChannelSampling
+		}
+	}
+	return notify.ChannelResource
 }

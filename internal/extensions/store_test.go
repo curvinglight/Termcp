@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/open-mcp-ai/termcp/internal/capability"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -177,14 +179,14 @@ func TestPresetFillsShape(t *testing.T) {
 		if e.Mode != "pipe" || e.Command == "" {
 			t.Errorf("mcp preset = %+v, wants a pipe with a command", e)
 		}
-		for _, tool := range []string{"shell_input", "shell_key", "shell_output"} {
-			if !contains(e.Allow, tool) {
-				t.Errorf("mcp preset must allow %s", tool)
+		for _, id := range []string{capability.ShellInput, capability.ShellKey, capability.ShellOutput} {
+			if !contains(e.Allow, id) {
+				t.Errorf("mcp preset must allow %s", id)
 			}
 		}
-		for _, tool := range []string{"file_write", "session_delete", "forward"} {
-			if contains(e.Allow, tool) {
-				t.Errorf("mcp preset must not allow %s", tool)
+		for _, id := range []string{capability.FileWrite, capability.SessionDelete, capability.ForwardOpen} {
+			if contains(e.Allow, id) {
+				t.Errorf("mcp preset must not allow %s", id)
 			}
 		}
 	})
@@ -194,7 +196,7 @@ func TestPresetFillsShape(t *testing.T) {
 			t.Errorf("skill preset Mode = %q, want no shell", e.Mode)
 		}
 		if len(e.Allow) != 2 {
-			t.Errorf("skill preset Allow = %v, want exactly file_read and file_stat", e.Allow)
+			t.Errorf("skill preset Allow = %v, want exactly %s and %s", e.Allow, capability.FileRead, capability.FileStat)
 		}
 	})
 	t.Run("prompt is an unrestricted terminal", func(t *testing.T) {

@@ -1,6 +1,7 @@
 package locator
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -140,5 +141,85 @@ func TestParseResourceURL(t *testing.T) {
 				t.Errorf("index = %d, want %d", p.Index, tc.index)
 			}
 		})
+	}
+}
+
+// TestSplitHandleAgreesWithParseOnLocators is the guard on the Web UI's copy
+// buttons, restated for the single-splitter design.
+//
+// `termcp://#sid:2` and `sid:2` are the same channel written two ways: the first
+// is what the copy buttons emit, the second is what `ps` prints. They must
+// decompose identically, because a caller that gets one and a resolver that
+// understands the other is exactly how a whitelist gets bypassed by punctuation
+// (see TestGuardGatesEveryHandleSpelling).
+//
+// So SplitHandle now reads locator syntax through Parse rather than refusing it.
+// Two properties replace the old "survive untouched" one:
+//   - agreement: for every locator, SplitHandle == Parse;
+//   - no drift: a locator Parse rejects is not silently turned into an id.
+func TestSplitHandleAgreesWithParseOnLocators(t *testing.T) {
+	for _, raw := range []string{
+		"termcp://#abc123", "termcp://#abc123:2", "termcp://#abc123:1",
+		"#abc123", "#abc123:2", "termcp://mac#abc123:3",
+		"termcp://#session-abc123:2",
+	} {
+		p, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("Parse(%q) broke: %v", raw, err)
+		}
+		if p.Kind == KindEntry {
+			continue
+		}
+		h := SplitHandle(raw)
+		if h.SessionID != p.SessionID || h.Index != p.Index {
+			t.Errorf("SplitHandle(%q) = (%q, %d), Parse says (%q, %d): the two spellings must agree",
+				raw, h.SessionID, h.Index, p.SessionID, p.Index)
+		}
+		// The short spelling of the same handle must agree as well, except when the
+		// session id itself carries a colon (then the short form is ambiguous, and
+		// only the locator can say where the id ends).
+		if !strings.Contains(p.SessionID, ":") {
+			short := p.SessionID
+			if p.Index > 0 {
+				short = fmt.Sprintf("%s:%d", p.SessionID, p.Index)
+			}
+			if hs := SplitHandle(short); hs.SessionID != p.SessionID || hs.Index != p.Index {
+				t.Errorf("SplitHandle(%q) = (%q, %d) disagrees with the locator's (%q, %d)",
+					short, hs.SessionID, hs.Index, p.SessionID, p.Index)
+			}
+		}
+	}
+
+	// An entry name carrying a shell index is malformed for Parse. SplitHandle must
+	// not quietly accept the tail as an index: the id is returned whole, so the
+	// caller's own Parse call is still the one that reports it.
+	schemeWithIndex := "termcp://session-abc123:2"
+	if _, err := Parse(schemeWithIndex); err == nil {
+		t.Errorf("Parse(%q) accepted an entry name carrying a shell index", schemeWithIndex)
+	}
+	if h := SplitHandle(schemeWithIndex); h.SessionID != schemeWithIndex || h.Index != 0 {
+		t.Errorf("SplitHandle(%q) = (%q, %d), want it left alone", schemeWithIndex, h.SessionID, h.Index)
+	}
+
+	// The short handle is split; a bare id is passed through.
+	for _, tc := range []struct {
+		raw   string
+		id    string
+		index int
+	}{
+		{"abc123", "abc123", 0},
+		{"abc123:2", "abc123", 2},
+		{"abc123:1", "abc123", 1},
+		{"session-abc123:3", "session-abc123", 3},
+		// Not a handle: the suffix is not a positive integer.
+		{"abc:0", "abc:0", 0},
+		{"abc:", "abc:", 0},
+		{"a:b:c", "a:b:c", 0},
+		{"", "", 0},
+	} {
+		h := SplitHandle(tc.raw)
+		if h.SessionID != tc.id || h.Index != tc.index {
+			t.Errorf("SplitHandle(%q) = (%q, %d), want (%q, %d)", tc.raw, h.SessionID, h.Index, tc.id, tc.index)
+		}
 	}
 }

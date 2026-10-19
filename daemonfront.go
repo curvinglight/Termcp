@@ -7,19 +7,22 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/config"
 	"github.com/open-mcp-ai/termcp/internal/daemon"
+	mcpmod "github.com/open-mcp-ai/termcp/internal/mcp"
 	"github.com/open-mcp-ai/termcp/internal/mcpbridge"
+	"github.com/open-mcp-ai/termcp/internal/ns"
 )
 
 // runDaemonFront implements `daemon start`, `daemon stdio` and the stdio
 // subcommand: ensure the background instance if asked, then optionally relay
 // stdio to it. In the bridge forms all status lines go to stderr, because
 // stdout carries MCP messages only.
-func runDaemonFront(cfg *config.Config, ensureDaemon, stdio bool, idleTimeoutArg string, idleTimeout time.Duration, target bridgeTarget) {
+func runDaemonFront(cfg *config.Config, ensureDaemon, stdio bool, idleTimeoutArg string, idleTimeout time.Duration, target bridgeTarget, namespace string) {
 	out := io.Writer(os.Stdout)
 	if stdio {
 		out = os.Stderr
@@ -103,7 +106,7 @@ func runDaemonFront(cfg *config.Config, ensureDaemon, stdio bool, idleTimeoutArg
 				keepAlive = keepAliveFor(rep.Info.IdleTimeout())
 			}
 		}
-		if err := stdioBridge(ctx, cfg, target, keepAlive); err != nil && !errors.Is(err, context.Canceled) {
+		if err := stdioBridge(ctx, cfg, target, keepAlive, namespace); err != nil && !errors.Is(err, context.Canceled) {
 			fmt.Fprintf(os.Stderr, "stdio bridge: %v\n", err)
 			os.Exit(1)
 		}
@@ -113,11 +116,26 @@ func runDaemonFront(cfg *config.Config, ensureDaemon, stdio bool, idleTimeoutArg
 // stdioBridge relays the process's stdio MCP stream to the target endpoint,
 // presenting whichever credential the configuration holds (see
 // daemon.Credential).
-func stdioBridge(ctx context.Context, cfg *config.Config, target bridgeTarget, keepAlive time.Duration) error {
+//
+// namespace, when set, is the caller namespace the bridge claims on every
+// request: it is what makes two bridges to one instance separate agents rather
+// than two callers of the same global view. An invalid name is refused here, at
+// startup, rather than left for the instance to reject one request at a time — a
+// bridge that fails on its first call is much harder to diagnose than a flag.
+func stdioBridge(ctx context.Context, cfg *config.Config, target bridgeTarget, keepAlive time.Duration, namespace string) error {
+	nsName := strings.TrimSpace(namespace)
+	if err := ns.ValidCallerName(nsName); err != nil {
+		return fmt.Errorf("--namespace: %w", err)
+	}
+	var headers map[string]string
+	if nsName != "" {
+		headers = map[string]string{mcpmod.NamespaceHeader: nsName}
+	}
 	return mcpbridge.Run(ctx, mcpbridge.Config{
 		URL:       target.URL,
 		SSE:       target.SSE,
 		Token:     daemon.Credential(cfg),
+		Headers:   headers,
 		KeepAlive: keepAlive,
 		In:        os.Stdin,
 		Out:       os.Stdout,

@@ -35,7 +35,7 @@ build:
 
 # 纯 API 构建：-tags no_webui 令二进制不嵌入 Web UI 静态资源、也不注册其路由
 # （`/`、`/api.html`、`/static/*` 一律 404），只保留 REST/MCP/WS 与 /api.md、
-# /skills.md 两份文档。产物带 api 后缀，可与完整版并存于 dist/。
+# /SKILL.md 两份文档。产物带 api 后缀，可与完整版并存于 dist/。
 build-api:
 	mkdir -p dist
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -tags no_webui -trimpath -ldflags "$(LDFLAGS_RELEASE) $(LDFLAGS_VERSION)" -o dist/$(HBIN) .
@@ -100,5 +100,11 @@ dist: clean build
 # 同步对外服务的文档副本：assets/api.md 通过 HTTP（/api.md）与 MCP resource 对外
 # 发布，TestSyncedDocsMatchSource 会拦住漂移；MCP 工具参数由 tools/list schema
 # 自描述，因此不再同步 docs/mcp-tools.md。
+# 生成 docs/api.md 里由代码派生的块（term 的参数表）。参数是唯一还手抄
+# 描述的地方，而它已经漂移过一次：structured_only 进了 schema 却没进文档。
+# TestTermDocsAreGenerated 会在忘记跑这个目标时失败。
+termdoc:
+	go run ./cmd/termdoc
+
 sync-assets:
 	cp docs/api.md internal/webui/assets/api.md

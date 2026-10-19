@@ -13,17 +13,26 @@ import (
 type toolHandler = func(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)
 
 func withLogging(name string, h toolHandler, s *Server) toolHandler {
-	guard := toolGuard{server: s}
 	return func(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		// The restriction gate runs before anything else and before the handler
-		// is even entered: a call that a session's whitelist refuses must not
-		// reach the tool at all. Guarding here rather than in each handler means
-		// every tool that acts on an existing session is covered by construction,
-		// including ones added later.
-		if bad := guard.check(name, request); bad != nil {
-			slog.DebugContext(ctx, "tool refused by session restriction",
-				append([]any{"tool", name}, restrictionAttrs(request)...)...)
-			return bad, nil
+		// The admission decision runs before anything else and before the handler
+		// is even entered: a call that a session's capability list — or another
+		// caller's namespace — refuses must not reach the tool at all, and one that
+		// review mode holds must be queued instead of run. Answering all of it here
+		// rather than in each handler is what makes a reviewable operation covered
+		// by its capability row instead of by someone remembering to guard the
+		// handler: the file and forward handlers no longer call the gate, and the
+		// shell handlers no longer ask RequiresApproval.
+		//
+		// A nil server means there is nothing to admit against (a logging-only test
+		// harness), so the wrapper passes the call through.
+		if s != nil {
+			if bad, held := s.checkAdmission(ctx, name, request); bad != nil || held {
+				if bad != nil {
+					slog.DebugContext(ctx, "tool refused by session restriction",
+						append([]any{"tool", name}, restrictionAttrs(request)...)...)
+				}
+				return bad, nil
+			}
 		}
 
 		start := time.Now()

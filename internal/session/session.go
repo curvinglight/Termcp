@@ -263,13 +263,13 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		execSession: execSession,
 		buf:         buf,
 		done:        make(chan struct{}),
-		Status:      api.SessionRunning,
-		Rows:        cfg.Rows,
-		Cols:        cfg.Cols,
 		CreatedAt:   clock.Now(),
 		enterCRLF:   enterCRLF,
 		mode:        cfg.Mode,
 	}
+	root.setStatus(api.SessionRunning)
+	root.rows.Store(int32(cfg.Rows))
+	root.cols.Store(int32(cfg.Cols))
 
 	// "Process started" is a session lifecycle event, not shell output. It used to
 	// be stored as a system message; the new layout has no message records, so it
@@ -279,7 +279,7 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	// Attach the root to the session BEFORE starting its readers so the output
 	// pipe and exit watcher see a live parent + message manager from the first
 	// byte. Starting readers first used to drop early output (never persisted).
-	root.parent = s
+	root.parent.Store(s)
 	s.shells.Store(root.ID, root)
 	s.shellHistory.Store(root.ID, root.Info())
 	root.startReaders()
@@ -522,10 +522,7 @@ func (s *Session) closeIfLastShellEnded() {
 	live := false
 	s.shells.Range(func(_, v any) bool {
 		cs := v.(*ChildShell)
-		cs.mu.RLock()
-		running := cs.Status == api.SessionRunning
-		cs.mu.RUnlock()
-		if running {
+		if cs.statusValue() == api.SessionRunning {
 			live = true
 			return false
 		}
@@ -685,10 +682,7 @@ func (s *Session) beginClosing() {
 	}
 	s.closing = true
 	s.shells.Range(func(_, v any) bool {
-		cs := v.(*ChildShell)
-		cs.mu.Lock()
-		cs.deliberateClose = true
-		cs.mu.Unlock()
+		v.(*ChildShell).deliberateClose.Store(true)
 		return true
 	})
 	s.shellStateMu.Unlock()
@@ -739,9 +733,15 @@ func (s *Session) Info() api.Session {
 	if approvalState != nil {
 		cp.ApprovalMode = true
 		cp.ApprovalNeed = approvalState.queue.Need()
+		// Empty for "every kind": the JSON key is omitted then, so an older
+		// reader sees exactly the manifest it always did.
+		for _, k := range approvalState.scopeList() {
+			cp.ApprovalScopes = append(cp.ApprovalScopes, string(k))
+		}
 	} else {
 		cp.ApprovalMode = false
 		cp.ApprovalNeed = 0
+		cp.ApprovalScopes = nil
 	}
 	return cp
 }

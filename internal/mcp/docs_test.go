@@ -15,6 +15,7 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/open-mcp-ai/termcp/internal/locator"
+	"github.com/open-mcp-ai/termcp/internal/ns"
 	"github.com/open-mcp-ai/termcp/internal/webui"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
@@ -116,9 +117,10 @@ func TestResourcesListAndRead(t *testing.T) {
 	if err := json.Unmarshal(callMCP(t, s, "resources/list", nil), &list); err != nil {
 		t.Fatal(err)
 	}
+	// api.md is the only served document now: the extension guide moved into
+	// `help ext`, where it cannot drift from the flags it describes.
 	want := map[string]bool{
-		"http://127.0.0.1:18765/api.md":    false,
-		"http://127.0.0.1:18765/skills.md": false,
+		"http://127.0.0.1:18765/api.md": false,
 	}
 	for _, r := range list.Resources {
 		if _, ok := want[r.URI]; ok {
@@ -197,7 +199,11 @@ func TestLearnAPIPrompt(t *testing.T) {
 		t.Fatalf("prompts/get returned no messages: %s", get)
 	}
 	text := got.Messages[0].Content.Text
-	for _, want := range []string{"http://127.0.0.1:18765/api.md", "http://127.0.0.1:18765/skills.md", "restart nginx on prod"} {
+	// The prompt used to hand the agent a written curl skill. It now points at the
+	// instance's own command space instead, so what it must contain is the entrance
+	// and the self-describing calls — a written tutorial is exactly the thing that
+	// goes stale.
+	for _, want := range []string{"http://127.0.0.1:18765/api.md", "/api/term", `{"cmd":"help"}`, "restart nginx on prod"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("learn-api prompt misses %q:\n%s", want, text)
 		}
@@ -302,41 +308,49 @@ func listTools(t *testing.T, s *Server, ctx context.Context) []mcpgo.Tool {
 // receive it under ctx, and fails if the tool is missing from the listing at all.
 func notifyDescription(t *testing.T, s *Server, ctx context.Context) string {
 	t.Helper()
-	for _, tool := range listTools(t, s, ctx) {
-		if tool.Name == "notify_user" {
-			return tool.Description
-		}
-	}
-	t.Fatal("notify_user missing from tools/list")
-	return ""
+	return directiveHelpText(t, s, "notify")
 }
 
-// TestNotifyUserDescriptionRequiresProactiveHumanAlert keeps the behavioral rule in
-// the compact, model-facing description. The longer registration text is replaced
-// by compactToolDescriptions before tools/list is sent, so testing tools.go alone
-// would miss a regression that silently removes the instruction from the model.
-func TestNotifyUserDescriptionRequiresProactiveHumanAlert(t *testing.T) {
+// directiveHelpText is the model-facing rule text for one directive. It replaces
+// the per-tool description the specialised surface used to carry: with one tool
+// the rule lives in `help <directive>`, reached at the moment of use instead of
+// paid for on every tools/list.
+func directiveHelpText(t *testing.T, s *Server, op string) string {
+	t.Helper()
+	text := toolResultText(termCall(t, s, map[string]any{"cmd": "help " + op}))
+	if !strings.Contains(text, "TERM/1 200 OK") {
+		t.Fatalf("help %s failed: %s", op, text)
+	}
+	return text
+}
+
+// TestNotifyHelpRequiresProactiveHumanAlert keeps the behavioral rule in the
+// text a caller reads when it looks the directive up.
+//
+// The carrier changed with issue #117: there is one tool, so there is no
+// per-operation description left to hang a rule on. It lives in `help notify`,
+// reached at the moment of use instead of paid for on every tools/list. The
+// assertions are on the RULE, not its old wording.
+func TestNotifyHelpRequiresProactiveHumanAlert(t *testing.T) {
 	desc := notifyDescription(t, docsTestServer(t), originContext("http://127.0.0.1:18765"))
 	for _, want := range []string{
-		"CALL IT BEFORE ASKING THE HUMAN FOR ANYTHING",
-		"password/sudo/MFA/passphrase",
-		"confirmation, approval",
-		"duration_seconds=0",
+		"BEFORE asking the human for anything",
+		"password", "sudo", "MFA", "passphrase",
+		"confirmation", "approval",
+		"--sticky",
 		"long task ends or fails",
-		"delivered=0",
-		// The asking half of the rule is stating the ask; the other half is not
-		// inventing the answer while it is missing. A held review request relies on
-		// this one too: the review replies only forbid retrying a REVIEWED call.
-		"Once you have asked, WAIT",
+		"never poll",
+		// The await rule is useless without knowing what not to do while waiting.
+		"never poll",
 	} {
 		if !strings.Contains(desc, want) {
-			t.Errorf("notify_user model-facing description misses %q:\n%s", want, desc)
+			t.Errorf("help notify misses %q: "+want, desc)
 		}
 	}
 	if !strings.Contains(mcpServerInstructions, "before any password/sudo/passphrase/MFA") ||
-		!strings.Contains(mcpServerInstructions, "notify_user FIRST") ||
+		!strings.Contains(mcpServerInstructions, "notify FIRST") ||
 		!strings.Contains(mcpServerInstructions, "HARD BOUNDARY") {
-		t.Errorf("initialize instructions no longer require notify_user before human input:\n%s", mcpServerInstructions)
+		t.Errorf("initialize instructions no longer require notify before human input:%s", mcpServerInstructions)
 	}
 }
 
@@ -355,7 +369,7 @@ func TestInstructionsCarryReviewPendingRule(t *testing.T) {
 	desc := notifyDescription(t, docsTestServer(t), originContext("http://127.0.0.1:18765"))
 	for _, gone := range []string{"review_pending", "resubmit"} {
 		if strings.Contains(desc, gone) {
-			t.Errorf("the notify_user description repeats the review-mode rule %q; it belongs in the instructions and the tool result", gone)
+			t.Errorf("help notify repeats the review-mode rule %q; it belongs in the instructions and the tool result", gone)
 		}
 	}
 }
@@ -395,22 +409,20 @@ func TestReviewPendingRepliesStateTheNextStep(t *testing.T) {
 
 // The tool listing is the one channel guaranteed to reach the model: a client
 // that drops it cannot call any tool. So the instance address rides on the
-// description of the tool that exists to reach the human -- unlike the
-// instructions, which are optional in MCP and routinely discarded.
+// description of the single entry -- unlike the instructions, which are optional
+// in MCP and routinely discarded.
 func TestToolListingCarriesInstanceAddress(t *testing.T) {
 	const origin = "http://10.1.2.3:18994"
 	s := New(nil, nil, nil, nil, "test")
 
-	for _, tool := range listTools(t, s, originContext(origin)) {
-		if tool.Name == "notify_user" {
-			continue
-		}
-		if strings.Contains(tool.Description, origin) {
-			t.Errorf("tool %s carries the address; only notify_user should:\n%s", tool.Name, tool.Description)
-		}
+	// There is one tool, so "only this one carries the address" is checked as
+	// "exactly one tool, and it carries it": the decoration must not spread.
+	tools := listTools(t, s, originContext(origin))
+	if len(tools) != 1 {
+		t.Fatalf("%d tools; the surface is one entry", len(tools))
 	}
-	if notify := notifyDescription(t, s, originContext(origin)); !strings.Contains(notify, origin) {
-		t.Errorf("notify_user description misses the address %q:\n%s", origin, notify)
+	if !strings.Contains(tools[0].Description, origin) {
+		t.Errorf("the %s description misses the address %q:\n%s", tools[0].Name, origin, tools[0].Description)
 	}
 }
 
@@ -419,15 +431,19 @@ func TestToolListingCarriesInstanceAddress(t *testing.T) {
 func TestToolListingAddressIsPerRequestAndNotAccumulated(t *testing.T) {
 	s := New(nil, nil, nil, nil, "test")
 	for _, origin := range []string{"http://a.example:1", "http://b.example:2", "http://a.example:1"} {
-		notify := notifyDescription(t, s, originContext(origin))
-		if n := strings.Count(notify, "This instance's Web UI:"); n != 1 {
-			t.Fatalf("address appended %d times for %s:\n%s", n, origin, notify)
+		tools := listTools(t, s, originContext(origin))
+		if len(tools) != 1 {
+			t.Fatalf("%d tools", len(tools))
 		}
-		if !strings.Contains(notify, origin+"/") {
-			t.Errorf("listing for %s carries the wrong address:\n%s", origin, notify)
+		desc := tools[0].Description
+		if n := strings.Count(desc, "This instance's Web UI:"); n != 1 {
+			t.Fatalf("address appended %d times for %s:\n%s", n, origin, desc)
 		}
-		if strings.Contains(notify, "a.example") && strings.Contains(notify, "b.example") {
-			t.Errorf("listing mixes two origins:\n%s", notify)
+		if !strings.Contains(desc, origin+"/") {
+			t.Errorf("listing for %s carries the wrong address:\n%s", origin, desc)
+		}
+		if strings.Contains(desc, "a.example") && strings.Contains(desc, "b.example") {
+			t.Errorf("listing mixes two origins:\n%s", desc)
 		}
 	}
 }
@@ -439,24 +455,34 @@ func TestToolListingFallsBackToBindAddress(t *testing.T) {
 	s := New(nil, nil, nil, nil, "test")
 	s.baseURL = "http://127.0.0.1:18765"
 
-	if notify := notifyDescription(t, s, nil); !strings.Contains(notify, "http://127.0.0.1:18765/") {
-		t.Errorf("description misses the bind address:\n%s", notify)
+	if desc := termDescriptionFor(t, s, nil); !strings.Contains(desc, "http://127.0.0.1:18765/") {
+		t.Errorf("description misses the bind address:\n%s", desc)
 	}
+}
+
+// termDescriptionFor is the single tool's description as the model receives it.
+func termDescriptionFor(t *testing.T, s *Server, ctx context.Context) string {
+	t.Helper()
+	tools := listTools(t, s, ctx)
+	if len(tools) != 1 {
+		t.Fatalf("%d tools; the surface is one entry", len(tools))
+	}
+	return tools[0].Description
 }
 
 // No address at all (no host to answer, no bind address yet) must leave the
 // description exactly as written rather than gain a dangling label.
 func TestToolListingUnchangedWithoutOrigin(t *testing.T) {
 	s := New(nil, nil, nil, nil, "test")
-	if notify := notifyDescription(t, s, nil); strings.Contains(notify, "This instance's Web UI:") {
-		t.Errorf("description advertises an address that was never set:\n%s", notify)
+	if desc := termDescriptionFor(t, s, nil); strings.Contains(desc, "This instance's Web UI:") {
+		t.Errorf("description advertises an address that was never set:\n%s", desc)
 	}
 }
 
 // The instructions are the fixed rule set and must NOT carry the instance
 // address: they are optional in MCP, frequently dropped, and a per-request value
 // baked into them would be a second source of truth. The address lives on the
-// notify_user description (see the tests above) and nowhere else.
+// `term` description (see the tests above) and nowhere else.
 func TestInstructionsDoNotCarryInstanceAddress(t *testing.T) {
 	for _, want := range []string{"This instance:", "http://127.0.0.1", "http://localhost"} {
 		if strings.Contains(mcpServerInstructions, want) {
@@ -520,6 +546,227 @@ func TestStreamableTransportAdvertisesRequestHost(t *testing.T) {
 	if !strings.Contains(listing, "This instance's Web UI: http://termcp.lan.example:9000/") {
 		t.Errorf("tools/list does not carry the address the client dialed:\n%s", listing)
 	}
+}
+
+// The unit tests above exercise the rule directly; this one holds the wire it
+// hangs on. A transport that never installed the namespace hook would keep every
+// other test green while no real client was ever scoped — and the failure mode is
+// the worst kind: isolation that silently is not one, because every caller keeps
+// seeing and reaching everything.
+func TestStreamableTransportScopesByNamespaceHeader(t *testing.T) {
+	s, _, _, _ := newTestServerWithHistory(t)
+	ts := httptest.NewServer(s.StreamableHTTPHandler())
+	defer ts.Close()
+
+	// One MCP session per caller, each carrying its own header. The header is what
+	// a client sets once and expects to hold for the whole conversation, so a test
+	// that varies it per request would not be measuring the thing that matters.
+	caller := func(name string) *mcpSession {
+		t.Helper()
+		return openMCPSession(t, ts, name)
+	}
+
+	alice := caller("alice")
+	bob := caller("bob")
+	owner := openMCPSession(t, ts, "")
+
+	aliceSid := alice.startSession(t)
+	bobSid := bob.startSession(t)
+
+	// Each caller lists its own and only its own.
+	t.Run("listings are disjoint", func(t *testing.T) {
+		got := alice.listSessions(t)
+		if !got[aliceSid] || got[bobSid] {
+			t.Errorf("alice's list = %v, want exactly %s", got, aliceSid)
+		}
+		got = bob.listSessions(t)
+		if !got[bobSid] || got[aliceSid] {
+			t.Errorf("bob's list = %v, want exactly %s", got, bobSid)
+		}
+	})
+
+	// The owner sees both: an agent's session is an ordinary session with a tag,
+	// and the person running the instance is not a tenant in it.
+	t.Run("the owner sees both", func(t *testing.T) {
+		got := owner.listSessions(t)
+		if !got[aliceSid] || !got[bobSid] {
+			t.Errorf("the owner's list = %v, want both agent sessions", got)
+		}
+	})
+
+	t.Run("a peer cannot drive the other's session", func(t *testing.T) {
+		res := bob.callTerm(t, "type "+aliceSid+" echo pwned")
+		if !res.IsError {
+			t.Fatal("bob wrote to alice's session")
+		}
+		text := res.Content[0].(mcpgo.TextContent).Text
+		if !strings.Contains(text, "ns:bob") && !strings.Contains(text, "namespace bob") {
+			t.Errorf("refusal does not name the caller's namespace: %s", text)
+		}
+	})
+
+	t.Run("the owner may drive either", func(t *testing.T) {
+		res := owner.callTerm(t, "info "+aliceSid)
+		if res.IsError {
+			t.Fatalf("the owner was refused: %+v", res)
+		}
+	})
+}
+
+// mcpSession is one caller's conversation with the instance: its own HTTP client
+// state (the MCP session id) and its own namespace header.
+type mcpSession struct {
+	t       *testing.T
+	ts      *httptest.Server
+	session string
+	name    string
+	lastID  int
+}
+
+func openMCPSession(t *testing.T, ts *httptest.Server, name string) *mcpSession {
+	t.Helper()
+	c := &mcpSession{t: t, ts: ts, name: name}
+	r := c.request(map[string]any{
+		"jsonrpc": "2.0", "id": c.nextID(), "method": "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "nstest", "version": "1"},
+		},
+	})
+	resp, err := ts.Client().Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.session = resp.Header.Get("Mcp-Session-Id")
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if c.session == "" {
+		t.Fatal("initialize returned no session id")
+	}
+	if name != "" {
+		// The claim has to be accepted on the FIRST request too, or the namespace a
+		// caller asked for would apply only from its second message — and the session
+		// it started while unnamed would be somebody else's.
+		if err := ns.ValidCallerName(name); err != nil {
+			t.Fatalf("test asked for an invalid namespace %q: %v", name, err)
+		}
+	}
+	return c
+}
+
+func (c *mcpSession) nextID() int {
+	c.lastID++
+	return c.lastID
+}
+
+// request builds one JSON-RPC POST with this caller's namespace header, exactly
+// as the stdio bridge and an SDK client do.
+func (c *mcpSession) request(payload map[string]any) *http.Request {
+	c.t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	r, err := http.NewRequest(http.MethodPost, c.ts.URL, strings.NewReader(string(body)))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json, text/event-stream")
+	if c.session != "" {
+		r.Header.Set("Mcp-Session-Id", c.session)
+	}
+	if c.name != "" {
+		r.Header.Set(NamespaceHeader, c.name)
+	}
+	return r
+}
+
+// callTool performs one tool call and returns the parsed result. Only the
+// JSON-body reply shape is handled: these tests never register a notification,
+// so the transport has no reason to answer in SSE.
+func (c *mcpSession) callTool(tool string, args map[string]any) *mcpgo.CallToolResult {
+	c.t.Helper()
+	r := c.request(map[string]any{
+		"jsonrpc": "2.0", "id": c.nextID(), "method": "tools/call",
+		"params": map[string]any{"name": tool, "arguments": args},
+	})
+	resp, err := c.ts.Client().Do(r)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	var envelope struct {
+		Result *mcpgo.CallToolResult      `json:"result"`
+		Error  *mcpgo.JSONRPCErrorDetails `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		c.t.Fatalf("decoding %s reply: %v (%s)", tool, err, body)
+	}
+	if envelope.Error != nil {
+		c.t.Fatalf("%s failed at the JSON-RPC level: %s", tool, envelope.Error.Message)
+	}
+	if envelope.Result == nil {
+		c.t.Fatalf("%s returned no result: %s", tool, body)
+	}
+	return envelope.Result
+}
+
+func (c *mcpSession) startSession(t *testing.T) string {
+	t.Helper()
+	res := c.callTerm(t, "pipe internal --argv "+quoteArgv(append([]any{testShell()}, testShellIdleArgs()...)))
+	if res.IsError {
+		t.Fatalf("pipe failed: %+v", res)
+	}
+	// The handle is <session> when the session's primary shell is the channel, so
+	// the reply's Handle header is the id these tests scope by.
+	text := res.Content[0].(mcpgo.TextContent).Text
+	for _, line := range strings.Split(text, "\n") {
+		if h, ok := strings.CutPrefix(line, "Handle: "); ok {
+			return h
+		}
+	}
+	t.Fatalf("pipe reply carries no Handle:\n%s", text)
+	return ""
+}
+
+// listSessions returns the set of session ids this caller can see, read from the
+// `ps` listing (one handle per line, first column).
+func (c *mcpSession) listSessions(t *testing.T) map[string]bool {
+	t.Helper()
+	res := c.callTerm(t, "ps")
+	if res.IsError {
+		t.Fatalf("ps failed: %+v", res)
+	}
+	text := res.Content[0].(mcpgo.TextContent).Text
+	out := map[string]bool{}
+	body := text
+	if i := strings.Index(text, "\n\n"); i >= 0 {
+		body = text[i+2:]
+	}
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		h := fields[0]
+		if sid, _, ok := strings.Cut(h, ":"); ok {
+			h = sid
+		}
+		out[h] = true
+	}
+	return out
+}
+
+// callTerm drives the single tool through the wire.
+func (c *mcpSession) callTerm(t *testing.T, cmd string) *mcpgo.CallToolResult {
+	t.Helper()
+	return c.callTool(termToolName, map[string]any{"cmd": cmd})
 }
 
 // The resource listing travels the same wire as the tool listing, so it must
@@ -659,7 +906,7 @@ func TestResourcesFollowRequestOrigin(t *testing.T) {
 		t.Fatalf("prompts/get returned nothing: %s", get)
 	}
 	text := got.Messages[0].Content.Text
-	for _, want := range []string{origin + "/api.md", origin + "/skills.md"} {
+	for _, want := range []string{origin + "/api.md", "/api/term"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("learn-api prompt misses %s:\n%s", want, text)
 		}
@@ -701,74 +948,59 @@ func listResourcesRaw(t *testing.T, s *Server, ctx context.Context) json.RawMess
 // receives it, failing if the tool is missing from the listing.
 func shellNotifyDescription(t *testing.T, s *Server, ctx context.Context) string {
 	t.Helper()
-	for _, tool := range listTools(t, s, ctx) {
-		if tool.Name == "shell_notify" {
-			return tool.Description
-		}
-	}
-	t.Fatal("shell_notify missing from tools/list")
-	return ""
+	return directiveHelpText(t, s, "watch")
 }
 
 // Issue #82: the agent held a terminal at a sudo prompt and had no rule telling
-// it that shell_notify is how it waits for the human, so it polled shell_output
-// in a loop instead. The tool description is where the rule has to live — it is
-// what the model reads when it considers the tool — and the payload is asserted
-// through tools/list because compactToolDescriptions replaces the long-form text
-// in tools.go before it reaches the wire, so checking either source file alone
-// would pass while the model saw nothing.
+// it that waiting on a human is a supported move, so it polled read in a loop
+// instead. The rule lives in `help watch`, reached at the moment of use: there is
+// one tool, so there is no per-operation description left to carry it.
 func TestShellNotifyDescriptionTeachesWaitingOnAHuman(t *testing.T) {
 	desc := shellNotifyDescription(t, docsTestServer(t), originContext("http://127.0.0.1:18765"))
 	for _, want := range []string{
 		// The situation: a prompt the human, not the agent, has to answer.
-		"sudo/password",
-		// The order notify_user and shell_notify stand in: tell the human it is
-		// their turn first, then arm the wake-up. Selecting the wrong event is the
-		// same trap the silence event sets (it fires on nobody speaking, which is
-		// exactly the state the agent is in while it waits).
-		"notify_user",
-		"event=output",
+		"sudo", "password",
+		// The order notify and watch stand in: tell the human it is their turn
+		// first, then arm the wake-up. Selecting the wrong event is the same trap
+		// the silence event sets (it fires on nobody speaking, which is exactly the
+		// state the agent is in while it waits).
+		"notify the human FIRST",
+		"--event output",
 		// Without this the agent still has a reason to keep polling.
 		"stop polling",
 		// The rule must not become permanent: the wake-up is one task's, not the
-		// shell's.
-		"unregister",
+		// handle's.
+		"watch --off",
 	} {
 		if !strings.Contains(desc, want) {
-			t.Errorf("shell_notify model-facing description misses %q:\n%s", want, desc)
+			t.Errorf("help watch misses %q:\n%s", want, desc)
 		}
 	}
 }
 
 // The initialize instructions carry the same rule in one line, because a model
-// that never opens the shell_notify description still has to know that waiting
-// on a human is a supported move rather than a hang. Rule 5 states the asking
-// half (notify_user first); this asserts the answering half is next to it.
-func TestInstructionsPairWaitingOnAHumanWithNotifyUser(t *testing.T) {
-	for _, want := range []string{"Human at a prompt", "notify_user", "event=output"} {
+// that never opens `help watch` still has to know that waiting on a human is a
+// supported move rather than a hang. Rule 7 states the asking half (notify
+// first); this asserts the answering half is next to it.
+func TestInstructionsPairWaitingOnAHumanWithNotify(t *testing.T) {
+	for _, want := range []string{"Human at a prompt", "notify", "--event output"} {
 		if !strings.Contains(mcpServerInstructions, want) {
 			t.Errorf("initialize instructions no longer tell the agent how to wait on a human: missing %q", want)
 		}
 	}
-	// Both halves must be in rule 5's neighbourhood: the waking rule is only
-	// correct when it follows the notification, and an agent reading one without
-	// the other would either poll or stay silent.
+	// Both halves must be in the boundary rule's neighbourhood: the waking rule is
+	// only correct when it follows the notification, and an agent reading one
+	// without the other would either poll or stay silent.
 	if strings.Index(mcpServerInstructions, "Human at a prompt") < strings.Index(mcpServerInstructions, "HARD BOUNDARY") {
-		t.Error("the wait-on-a-human rule moved above the notify_user boundary it depends on")
+		t.Error("the wait-on-a-human rule moved above the notify boundary it depends on")
 	}
 }
 
-// messageDescription returns the message tool description as the model receives
-// it, failing if the tool is missing from the listing.
+// messageDescription returns the span directive's rule text, which now decodes
+// the letters: there is one tool, so the decoding lives in `help span`.
 func messageDescription(t *testing.T, s *Server, ctx context.Context) string {
 	t.Helper()
-	for _, tool := range listTools(t, s, ctx) {
-		if tool.Name == "message" {
-			return tool.Description
-		}
-	}
-	t.Fatal("message missing from tools/list")
-	return ""
+	return directiveHelpText(t, s, "span")
 }
 
 // Issue #87: the agent can only tell whether a human has touched the terminal by
@@ -791,13 +1023,14 @@ func TestMessageDescriptionDecodesTheStatusLetters(t *testing.T) {
 		"i human input",
 		// The reading the issue is about: which spans prove a person operated
 		// the terminal, given that both sources echo identically.
-		"i/q = human operated",
+		"mean a person operated",
 		// Zero-length marks: an agent that expects bytes here would read the
-		// wrong span for the input it is looking for.
-		"Bytes via shell_output",
+		// wrong span for the input it is looking for. The pointer is now a directive
+		// with a range flag, not a per-tool parameter.
+		"--cursor",
 	} {
 		if !strings.Contains(desc, want) {
-			t.Errorf("message model-facing description misses %q:\n%s", want, desc)
+			t.Errorf("help span misses %q:\n%s", want, desc)
 		}
 	}
 

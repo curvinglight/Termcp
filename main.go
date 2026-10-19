@@ -27,6 +27,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/logansi"
 	mcpmod "github.com/open-mcp-ai/termcp/internal/mcp"
+	"github.com/open-mcp-ai/termcp/internal/mcpbridge"
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
@@ -98,18 +99,18 @@ func main() {
 	flag.StringVar(&cfg.AssetsDir, "assets", cfg.AssetsDir, "External static assets directory: files there override the embedded Web UI and docs; missing files fall back to the embed (default: $TERMCP_ASSETS_DIR or ~/.termcp/assets)")
 	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log verbosity: debug|info|warn|error")
 	flag.BoolVar(&cfg.NoInternal, "no-internal", cfg.NoInternal, "Disable the built-in loopback SSH profile (no internal connection)")
-	flag.BoolVar(&cfg.MCPManageSSHConfigs, "mcp-manage-ssh-configs", cfg.MCPManageSSHConfigs, "Enable MCP tools to create/edit/delete SSH configs (off by default; passwords/keys are never exposed)")
+	flag.BoolVar(&cfg.MCPManageSSHConfigs, "mcp-manage-ssh-configs", cfg.MCPManageSSHConfigs, "Enable the profile write actions of the `profile` directive (create/edit/copy/delete) over MCP (off by default; passwords/keys are never exposed)")
 	flag.StringVar(&cfg.AuthToken, "auth-token", cfg.AuthToken, "HTTP authentication token (or $TERMCP_AUTH_TOKEN)")
 	flag.StringVar(&cfg.AuthHash, "auth-hash", cfg.AuthHash, "Salted SHA-256 HTTP token hash (or $TERMCP_AUTH_HASH; generate with 'termcp --gen-auth-hash')")
 	flag.BoolVar(&cfg.DisableAuth, "disable-auth", cfg.DisableAuth, "Disable HTTP authentication entirely, even on non-loopback binds (or TERMCP_DISABLE_AUTH_TOKEN=1). Errors out if a token or hash is also configured.")
-	flag.BoolVar(&cfg.MCPDeferTools, "mcp-defer-tools", cfg.MCPDeferTools, "Mark low-frequency MCP tools with defer_loading so clients fetch them on demand. Off by default: every tool is listed eagerly, which is what clients without deferred-tool support (e.g. Codex behind a gateway) need.")
-	flag.StringVar(&cfg.MCPDeferToolsLevel, "mcp-defer-tools-level", cfg.MCPDeferToolsLevel, "MCP defer_loading level: off (every tool eager, default), partial (driving loop eager, low-frequency surfaces deferred), all (only session_start/shell_input/shell_key/shell_output eager). Overrides --mcp-defer-tools.")
 	var genAuthHash bool
 	flag.BoolVar(&genAuthHash, "gen-auth-hash", false, "Generate the salted SHA-256 hash of a token for --auth-hash / $TERMCP_AUTH_HASH, then exit (token from an argument, or from stdin without echo on a terminal)")
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "Print version, commit, and build date, then exit")
 	var idleTimeoutArg string
 	flag.StringVar(&idleTimeoutArg, "idle-timeout", "", "How long a daemon instance may stay fully idle before it exits on its own (e.g. 10m; 0 disables). Defaults: 30s for termcp daemon stdio, none for termcp daemon start. Only meaningful when a daemon instance is launched.")
+	var bridgeNamespace string
+	flag.StringVar(&bridgeNamespace, "namespace", "", "stdio bridge: claim a caller namespace (letters/digits/-_. up to 64). The instance then lists and accepts only sessions in it, so several agents bridging to the same instance do not collide. Empty = the instance owner's view, which is the default.")
 	flag.Usage = usage
 	// The subcommand leads the command line and is picked off before flag
 	// parsing, which stops at the first positional argument.
@@ -283,7 +284,7 @@ func main() {
 	}
 
 	if ensure || bridging {
-		runDaemonFront(cfg, ensure, bridging, idleTimeoutArg, idleTimeout, target)
+		runDaemonFront(cfg, ensure, bridging, idleTimeoutArg, idleTimeout, target, bridgeNamespace)
 		return
 	}
 	runServer(cfg, idleTimeoutArg, idleTimeout, isDaemonChild)
@@ -316,6 +317,11 @@ func runServer(cfg *config.Config, idleTimeoutArg string, idleTimeout time.Durat
 	var sshSrv *sshserver.Server
 	if !cfg.NoInternal {
 		sshSrv = sshserver.New()
+		// The in-process MCP bridge is a command the internal server serves
+		// itself: an extension template reaches an HTTP MCP server over its own
+		// channel with no second binary and no PATH lookup (see
+		// internal/mcpbridge.RegisterBuiltin).
+		mcpbridge.RegisterBuiltin(sshSrv)
 		if err := sshSrv.Start(); err != nil {
 			slog.Error("failed to start SSH server", "err", err)
 			os.Exit(1)
@@ -366,33 +372,22 @@ func runServer(cfg *config.Config, idleTimeoutArg string, idleTimeout time.Durat
 	}
 
 	mcpOpts := []mcpmod.Option{mcpmod.WithHTTPServer(mainSrv)}
-	// defer_loading level: the graded flag wins; the legacy bool maps to the
-	// partial level. Off by default because clients that drop the marker (any
-	// Codex talking through a gateway, for instance) would lose deferred tools
-	// entirely rather than merely load them later.
-	deferLevel := cfg.MCPDeferToolsLevel
-	if deferLevel == "" && cfg.MCPDeferTools {
-		deferLevel = mcpmod.DeferPartial
-	}
-	switch deferLevel {
-	case "", mcpmod.DeferOff, mcpmod.DeferPartial, mcpmod.DeferAll:
-	default:
-		slog.Error("invalid --mcp-defer-tools-level", "level", deferLevel, "valid", "off|partial|all")
-		os.Exit(2)
-	}
-	if deferLevel != "" && deferLevel != mcpmod.DeferOff {
-		mcpOpts = append(mcpOpts, mcpmod.DeferLevel(deferLevel))
-	}
 	mcpSrv := mcpmod.New(sessMgr, msgMgr, sshStore, forwardMgr, versionString(), mcpOpts...)
 	// Same embedded docs the Web UI serves over HTTP become MCP resources/prompts.
 	mcpSrv.SetDocsFS(webui.Assets())
 	mcpSrv.NoInternal = cfg.NoInternal
-	if cfg.MCPManageSSHConfigs {
-		mcpSrv.RegisterSSHConfigWriteTools()
-	}
+	mcpSrv.ManageSSHConfigs = cfg.MCPManageSSHConfigs
 	mux.Handle("GET /sse", mcpSrv.SSEHandler())
 	mux.Handle("POST /message", mcpSrv.MessageHandler())
 	mux.Handle("/stream", mcpSrv.StreamableHTTPHandler())
+	// The REST entrance to the same command space: POST /api/term takes the term
+	// tool's argument object and answers the same envelope. Mounted here rather
+	// than by webuiH because admission and the namespace claim live in internal/mcp
+	// — a second copy on the other side of the import cycle would be a second
+	// place to get admission wrong. A pattern the Web UI owns wins over this one
+	// (it registers later, and ServeMux refuses overlaps rather than overriding),
+	// so no existing route can be shadowed by it.
+	mux.Handle("POST /api/term", mcpSrv.TermHandler())
 	webuiH := &webui.Handler{Sessions: sessMgr, MsgMgr: msgMgr, SSH: sshStore, ForwardMgr: forwardMgr, NotifyMgr: mcpSrv.NotifyManager(), Extensions: extReconciler, NoInternal: cfg.NoInternal, Version: versionString(), Daemon: isDaemonChild, StartedAt: time.Now().UTC().Format(time.RFC3339)}
 	// The effective countdown is published at GET /api/daemon so the stdio
 	// bridge can ping faster than it (see daemon.InstanceInfo.IdleTimeoutMS).
@@ -412,6 +407,18 @@ func runServer(cfg *config.Config, idleTimeoutArg string, idleTimeout time.Durat
 	// Bridge the MCP notify_user tool to the browser UI (toast/highlight push).
 	mcpSrv.SetExtensionReconciler(extReconciler)
 	mcpSrv.SetUINotifier(webuiH.BroadcastUINotify)
+	// Who is attached: the Web UI lists MCP clients from the MCP server and its
+	// own tabs from its own registry. The listener wakes the same broadcast the
+	// session list uses, so a client connecting shows up without a poll.
+	webuiH.MCPConnections = func() []any {
+		conns := mcpSrv.Connections()
+		out := make([]any, len(conns))
+		for i, c := range conns {
+			out[i] = c
+		}
+		return out
+	}
+	mcpSrv.SetConnectionsListener(webuiH.NotifyClientsChanged)
 
 	// An approval decision must also wake an agent parked on shell_notify, so it
 	// learns the outcome without polling. Fan-out stays in one place: the web UI

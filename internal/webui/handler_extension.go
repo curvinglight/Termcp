@@ -22,6 +22,10 @@ type extensionSummary struct {
 	Description string `json:"description,omitempty"`
 	Enabled     bool   `json:"enabled"`
 	Status      string `json:"status"`
+	// URL is set for a template that names an HTTP MCP endpoint instead of a
+	// program: the card shows what it talks to, which is the one field that says
+	// which of the two shapes this is.
+	URL string `json:"url,omitempty"`
 	// SessionID/ShellID are the handles a click opens. Empty when the extension
 	// is not available, which is exactly the case the card has to explain.
 	SessionID string `json:"session_id,omitempty"`
@@ -48,6 +52,7 @@ func summarizeExtension(ext *extensions.Extension, st extensions.Status) extensi
 		Description: ext.Description,
 		Enabled:     ext.IsEnabled(),
 		Status:      st.Status,
+		URL:         ext.URL,
 		SessionID:   st.SessionID,
 		ShellID:     st.ShellID,
 		Forwards:    st.Forwards,

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
@@ -88,9 +89,20 @@ type uiWS struct {
 	send   chan []byte
 	mu     sync.Mutex
 	watch  map[string]*wsWatchEntry
+	// viewerID is this tab's own row in the viewer registry. Each frame marks it
+	// so the page can count the clients besides itself — every open page is a
+	// viewer, so without the mark a lone tab always counted as one client.
+	viewerID uint64
 }
 
 var errWSSessionNotFound = errors.New("session not found")
+
+// watchCount reports how many sessions this tab is currently streaming.
+func (c *uiWS) watchCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.watch)
+}
 
 // getTerminalShell looks up a shell channel by shell_id.
 //
@@ -124,6 +136,16 @@ func (h *Handler) handleWebUIWS(w http.ResponseWriter, r *http.Request) {
 		send:   make(chan []byte, wsSendBuf),
 		watch:  make(map[string]*wsWatchEntry),
 	}
+	// Who is watching: the tab is registered for the life of its socket, and its
+	// watched-session count is read at list time rather than captured here.
+	viewerID := c.h.viewerHub().add(r.RemoteAddr, r.UserAgent(), c.watchCount)
+	c.viewerID = viewerID
+	defer c.h.viewerHub().remove(viewerID)
+	// The panel is pushed, not polled: an arrival or departure is a change to a
+	// list the page is already showing, exactly like the session list.
+	c.h.sessionHub().broadcast()
+	defer c.h.sessionHub().broadcast()
+
 	go c.writePump()
 	go c.sessionLoop()
 	// Subscribe to UI notification broadcasts (notify_user tool); deliveries land
@@ -166,6 +188,14 @@ func (c *uiWS) enqueueSessions() {
 			}
 			payload["connections"] = conns
 		}
+	}
+	/* Who is attached rides the same frame as the session list. It changes when a
+	   tab opens or closes, or when an MCP client connects or drops — all of which
+	   already wake this loop through the session hub, so there is no second timer
+	   and no polling. */
+	payload["clients"] = c.h.viewerHub().list(c.viewerID)
+	if c.h.MCPConnections != nil {
+		payload["mcp_clients"] = c.h.MCPConnections()
 	}
 	if c.h.Extensions != nil {
 		// The right panel renders from the same frame, so a status transition is
@@ -268,7 +298,7 @@ func (c *uiWS) handleWSInput(msg *wsClientMsg) {
 	// A refusal is silent here because a stream has no response to carry an error:
 	// the frame is dropped and the reason is logged. The REST endpoint is where a
 	// caller gets told why.
-	if c.refuseWSCapability(shell, "shell_input") {
+	if c.refuseWSCapability(shell, capability.ShellInput) {
 		return
 	}
 	// msg.D is the JSON string xterm produced, not base64: the frame is standard
@@ -291,7 +321,7 @@ func (c *uiWS) handleWSResize(msg *wsClientMsg) {
 	if shell.Info().Status != api.SessionRunning {
 		return
 	}
-	if c.refuseWSCapability(shell, "shell_resize") {
+	if c.refuseWSCapability(shell, capability.ShellResize) {
 		return
 	}
 	if err := shell.ResizePty(msg.Rows, msg.Cols); err != nil {

@@ -193,8 +193,6 @@ func (cs *ChildShell) IsBufferClosed() bool {
 
 // OutputByteRange returns a copy of retained raw output bytes [start, start+max) and total retained length.
 func (cs *ChildShell) OutputByteRange(start int64, max int) ([]byte, int64, error) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
 	if cs.buf == nil {
 		return nil, 0, fmt.Errorf("output buffer unavailable")
 	}
@@ -204,8 +202,6 @@ func (cs *ChildShell) OutputByteRange(start int64, max int) ([]byte, int64, erro
 
 // OutputBaseOffset is the absolute offset of the earliest retained byte.
 func (cs *ChildShell) OutputBaseOffset() int64 {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
 	if cs.buf == nil {
 		return 0
 	}
@@ -214,8 +210,6 @@ func (cs *ChildShell) OutputBaseOffset() int64 {
 
 // BufferLen returns retained raw output length in bytes.
 func (cs *ChildShell) BufferLen() int64 {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
 	if cs.buf == nil {
 		return 0
 	}
@@ -243,7 +237,7 @@ const pipeDrainGrace = 2 * time.Second
 // trailing stdout may still be sitting unread in the channel buffer — bailing
 // out on cs.done truncated the tail of fast commands.
 func (cs *ChildShell) pipeToBuffer(r io.Reader, stderr bool) {
-	p := cs.parent
+	p := cs.parent.Load()
 	if p != nil {
 		p.doneWG.Add(1)
 	}
@@ -356,49 +350,49 @@ func (cs *ChildShell) startReaders() {
 	cs.pipeToBuffer(cs.execSession.Stdout, false)
 	cs.pipeToBuffer(cs.execSession.Stderr, true)
 
-	if p := cs.parent; p != nil {
+	if p := cs.parent.Load(); p != nil {
 		p.watchWG.Add(1)
 	}
 	go func() {
-		if p := cs.parent; p != nil {
+		if p := cs.parent.Load(); p != nil {
 			defer p.watchWG.Done()
 		}
 		<-cs.execSession.Done()
-		cs.closeOnce.Do(func() { close(cs.done) })
-		cs.mu.Lock()
-		cs.Status = api.SessionExited
+		// Drain the output still buffered in the transport (exit-status can
+		// arrive ahead of the last stdout bytes) and seal the buffer BEFORE
+		// publishing the exit. "exited" is the caller's signal that the stream
+		// is complete: a read that sees it must find every byte, including the
+		// tail of a command that ended as fast as it started.
+		cs.drainPipes()
+		cs.buf.Close()
 		code := cs.execSession.ExitCode()
-		cs.ExitCode = &code
-		cs.mu.Unlock()
+		// Exit code first: a reader that observes "exited" must also observe the
+		// code, so the two stores cannot be seen in the wrong order.
+		cs.setExitCode(code)
+		cs.setStatus(api.SessionExited)
+		// Done is the finalization signal, not the process-exit signal: it
+		// closes only after the output is drained and the exit code published,
+		// so a waiter that wakes on it can read both without racing the watcher.
+		cs.closeOnce.Do(func() { close(cs.done) })
 		// Retain this shell's final metadata for the retained per-shell tabs —
 		// unless the user explicitly closed it. Store-then-recheck: a manual close
 		// racing this store re-deletes the entry below, so a closed shell can
 		// never survive in the retained snapshot (no lock needed: CloseChildShell
 		// always sets closed before its purge).
-		if p := cs.parent; p != nil {
+		if p := cs.parent.Load(); p != nil {
 			cs.retainHistory(p)
 			if cs.closed.Load() {
 				p.shellHistory.Delete(cs.ID)
 			}
 		}
-		// Drain the output still buffered in the transport (exit-status can
-		// arrive ahead of the last stdout bytes) before sealing the buffer.
-		cs.drainPipes()
-		cs.buf.Close()
 		// Keep the exited ChildShell in the parent map until explicit close/Delete.
 		// This preserves its closed buffer so shell_output and WebUI can drain
 		// final output after a fast pipe command has already exited.
-		cs.mu.RLock()
-		deliberate := cs.deliberateClose
-		reparent := cs.parent
-		// Snapshot the exit code under the lock: a concurrent
-		// CloseChildShell/TerminateShell writes cs.ExitCode while the watcher runs.
-		var exitCode *int
-		if cs.ExitCode != nil {
-			v := *cs.ExitCode
-			exitCode = &v
-		}
-		cs.mu.RUnlock()
+		deliberate := cs.deliberateClose.Load()
+		reparent := cs.parent.Load()
+		// Snapshot the exit code: a concurrent CloseChildShell/TerminateShell may
+		// publish its own while this watcher runs.
+		exitCode := cs.exitCodeValue()
 		if reparent != nil {
 			if fn := reparent.onShellExit.Load(); fn != nil {
 				(*fn)(cs.ID, exitCode)

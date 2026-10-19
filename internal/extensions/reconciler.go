@@ -14,6 +14,7 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/clock"
 	"github.com/open-mcp-ai/termcp/internal/forward"
+	"github.com/open-mcp-ai/termcp/internal/mcpbridge"
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/ns"
 	"github.com/open-mcp-ai/termcp/internal/session"
@@ -463,14 +464,22 @@ func (r *Reconciler) reconcileAll(ctx context.Context) error {
 		case StatusAvailable:
 			sess := r.attachedSession(st)
 			if sess == nil {
+				// The connection is gone. Forget the handle before recording the
+				// failure, or the state keeps advertising a channel that cannot be
+				// driven.
+				r.detach(st)
 				r.fail(st, "session", "session is no longer running")
 				continue
 			}
 			if ch := liveShell(sess, st.shellOf()); m.ext.Mode != "" && ch == nil {
 				// The channel the extension runs on ended by itself: its process is
 				// gone while the connection it shares is not, so the retry opens a
-				// channel instead of redialing the host.
-				r.fail(st, "session", r.channelEndReason(sess, st))
+				// channel instead of redialing the host. Read the exit line before
+				// detach closes the channel, then drop the handle so the recorded
+				// failure does not carry a dead one.
+				reason := r.channelEndReason(sess, st)
+				r.detach(st)
+				r.fail(st, "session", reason)
 				continue
 			}
 			if err := r.ensureForwards(m.ext, st); err != nil {
@@ -646,6 +655,20 @@ func (r *Reconciler) resolve(ext *Extension) (hostPlan, error) {
 	}
 
 	cmd, args := sshconfig.EffectiveCommand(ent, ext.Command, ext.Args)
+	if ext.URL != "" {
+		// The endpoint form runs the in-process relay instead of a program: the
+		// template names a server, and what executes on the channel is termcp's own
+		// bridge (see internal/mcpbridge).
+		//
+		// That relay is termcp's own process, so the channel has to be the in-memory
+		// one: on a remote target this command would be looked up on the far host,
+		// where it does not exist. Refusing here rather than at dial is what turns
+		// "command not found" into a sentence about the template.
+		if ent.Kind != sshconfig.KindInternal {
+			return hostPlan{}, fmt.Errorf("url requires target = \"internal\": the bridge runs inside termcp, so the endpoint is reached from this host (not from %q)", ext.Target)
+		}
+		cmd, args = bridgeCommand(ext)
+	}
 	mode := sshconfig.EffectiveMode(ent, ext.Mode)
 	rows, cols := ext.Rows, ext.Cols
 	if rows == 0 {
@@ -693,6 +716,18 @@ func (r *Reconciler) resolve(ext *Extension) (hostPlan, error) {
 	}, nil
 }
 
+// bridgeCommand renders a URL template as the argv that carries it: the built-in
+// relay's name, then the endpoint and its headers. Rendering happens here rather
+// than being stored because a stored argv is a second copy of the URL that can
+// drift from it — an edit would have to remember to rewrite both.
+func bridgeCommand(ext *Extension) (string, []string) {
+	args := []string{ext.URL}
+	for _, name := range sortedKeys(ext.Headers) {
+		args = append(args, "--header", name+"="+ext.Headers[name])
+	}
+	return mcpbridge.BuiltinCommand, args
+}
+
 // groupKey is the identity of the connection an extension is served by: the host
 // it dials, and the capability set it was granted. Extensions that agree on both
 // are served by one session — the second one adds a channel to a connection that
@@ -718,6 +753,18 @@ func restrictionKey(allow, paths []string) string {
 	b.WriteByte('\x01')
 	writeSet(&b, paths)
 	return b.String()
+}
+
+// sortedKeys returns a map's keys in order, so a rendering that walks them is
+// deterministic (two runs of one template must produce one argv, and a
+// fingerprint over it must not depend on map iteration order).
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func writeSet(b *strings.Builder, list []string) {
@@ -1077,6 +1124,13 @@ func fingerprint(ext *Extension) string {
 	fmt.Fprintf(&b, "%s|%s|%s|%q|", ext.Kind, ext.Target, ext.Mode, ext.Command)
 	for _, a := range ext.Args {
 		fmt.Fprintf(&b, "%q,", a)
+	}
+	// The endpoint and its headers describe what reaches the channel as much as the
+	// command does — the URL form's argv is derived from them, so an edit here is
+	// an edit to what runs.
+	fmt.Fprintf(&b, "|%q|", ext.URL)
+	for _, name := range sortedKeys(ext.Headers) {
+		fmt.Fprintf(&b, "%q=%q,", name, ext.Headers[name])
 	}
 	b.WriteByte('|')
 	for _, a := range ext.Allow {

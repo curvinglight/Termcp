@@ -178,12 +178,9 @@ func credentials(r *http.Request) []candidate {
 // publicPaths are static, secret-free documentation documents served from the
 // embedded assets. They are readable without credentials so a fresh client (an
 // agent before MCP setup, a script, a human with a browser) can read the API
-// reference and download the skill; every data/action surface still requires
-// the token.
+// reference; every data/action surface still requires the token.
 var publicPaths = map[string]struct{}{
-	"/api.md":        {},
-	"/skills.md":     {},
-	"/extensions.md": {},
+	"/api.md": {},
 }
 
 // isPublicDoc reports whether the request targets one of the credential-free

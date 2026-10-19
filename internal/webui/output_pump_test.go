@@ -18,10 +18,10 @@ import (
 //
 // So the pump must keep BOTH properties, and each is pinned separately below:
 //
-//	1. a batch leaves as soon as there is no backlog to merge into it, so an
-//	   interactive echo is never held for the sake of a bound it will not reach;
-//	2. a batch is still bounded, so a producer that never leaves a backlog cannot
-//	   expand the frame rate without limit.
+//  1. a batch leaves as soon as there is no backlog to merge into it, so an
+//     interactive echo is never held for the sake of a bound it will not reach;
+//  2. a batch is still bounded, so a producer that never leaves a backlog cannot
+//     expand the frame rate without limit.
 func TestTerminalOutputPumpCoalescesWithoutHoldingAnEcho(t *testing.T) {
 	pump := readGoSource(t, "wswatch.go")
 	body := between(t, pump, "func (c *uiWS) runWatch(", "\n}\n")
@@ -78,7 +78,7 @@ func TestTerminalOutputPumpCoalescesWithoutHoldingAnEcho(t *testing.T) {
 	if i < 0 {
 		t.Fatal("ws.go no longer declares terminalFlushMinGap")
 	}
-	line := ws[i:strings.Index(ws[i:], "\n")+i]
+	line := ws[i : strings.Index(ws[i:], "\n")+i]
 	if !strings.Contains(line, "Millisecond") {
 		t.Errorf("the min-gap should be sub-frame; got %q", line)
 	}

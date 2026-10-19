@@ -22,7 +22,7 @@ var extensionActions = []string{"list", "get", "create", "update", "delete", "re
 // halves: what the layer is, and how a listed extension is actually driven.
 const extensionToolDescription = `Extensions: named, pinned sessions whose capabilities are trimmed to what their template allows — an MCP server driven over a pipe shell, a read-only window onto remote files, or an interactive terminal with instructions attached. Every enabled extension on a host shares one connection with the others that were granted the same capabilities, each driving its own shell_id in it.
 
-action=list returns every extension with its status and, when available, the session_id/shell_id you drive it through — several extensions can report the same session_id, so address work by shell_id. action=get returns one template in full, including the notes that are its operating instructions: read them before first use, they are the extension's own documentation. create and update author templates: kind + target is enough to start, every other field is an override, an omitted field keeps its stored value and an empty array clears it. delete removes a template (and the connection it kept warm, when nothing else is left on it). retry asks termcp to reconnect an unavailable extension now instead of waiting out its backoff.
+action=list returns every extension with its status and, when available, the session_id/shell_id you drive it through — several extensions can report the same session_id, so address work by shell_id. action=get returns one template in full, including the notes that are its operating instructions: read them before first use, they are the extension's own documentation. create and update author templates: kind + target is enough to start, every other field is an override, an omitted field keeps its stored value and an empty array clears it. An MCP template names either command/args (a stdio server to run) or url (an HTTP endpoint to relay, with headers) — the two are alternatives. delete removes a template (and the connection it kept warm, when nothing else is left on it). retry asks termcp to reconnect an unavailable extension now instead of waiting out its backoff.
 
 An available extension is an ordinary session: call shell_input/shell_output (or file_read/file_stat) against its handles. A call the template did not whitelist is genuinely refused — the refusal is the template doing its job, not a bug. Extension sessions are infrastructure: they are not listed by session_list and stay warm for reuse, so never terminate or delete them. If one has died, it reports unavailable and is restarted — wait for it, then take the new handle from action=list.`
 
@@ -255,6 +255,12 @@ func extensionConfigMap(ext *extensions.Extension) map[string]any {
 		"allow":       ext.Allow,
 		"paths":       ext.Paths,
 		"notes":       ext.Notes,
+	}
+	if ext.URL != "" {
+		entry["url"] = ext.URL
+	}
+	if len(ext.Headers) > 0 {
+		entry["headers"] = ext.Headers
 	}
 	if len(ext.Args) > 0 {
 		entry["args"] = ext.Args

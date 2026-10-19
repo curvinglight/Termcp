@@ -53,6 +53,8 @@ func newTestServer(t *testing.T) *Server {
 	msgMgr := message.NewManager(store)
 	sessMgr := session.NewManager(msgMgr, store, srv)
 	cleanupTestRuntime(t, sessMgr, srv)
+	// The specialised surface is opt-in (issue #117); these tests drive its
+	// handlers directly, so they ask for it explicitly.
 	s := New(sessMgr, msgMgr, sshconfig.NewStore(dir), nil, "test")
 	return s
 }
@@ -999,13 +1001,15 @@ func TestGroupDispatch(t *testing.T) {
 		}
 	}
 
-	// ssh_config write actions gated behind RegisterSSHConfigWriteTools
+	// Profile writes are gated behind ManageSSHConfigs (--mcp-manage-ssh-configs);
+	// the listing is always available, because a model that is refused a write
+	// still needs to know which profile names exist.
 	req := makeRequest(map[string]any{"action": "create"})
 	res, _ := s.handleSSHConfigOps(context.Background(), req)
 	if !res.IsError {
-		t.Fatal("expected create to be rejected before RegisterSSHConfigWriteTools")
+		t.Fatal("expected create to be rejected while ManageSSHConfigs is off")
 	}
-	s.RegisterSSHConfigWriteTools()
+	s.ManageSSHConfigs = true
 	req = makeRequest(map[string]any{"action": "list"})
 	res, err := s.handleSSHConfigOps(context.Background(), req)
 	if err != nil {

@@ -1,10 +1,12 @@
 package mcp
 
 import (
-	"strings"
+	"context"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/open-mcp-ai/termcp/internal/locator"
+	"github.com/open-mcp-ai/termcp/internal/ns"
 	"github.com/open-mcp-ai/termcp/internal/session"
 )
 
@@ -14,6 +16,11 @@ import (
 // arguments, so the twenty-odd handlers do not each re-implement the check —
 // and a tool added later is covered by construction instead of by memory.
 //
+// What it enforces comes from the call's capability row (internal/capability),
+// not from a table in this package: the operation's id decides the whitelist
+// entry, and its row decides which arguments carry a path. That is why there is
+// no global path-argument list here any more — a capability declares its own.
+//
 // An ordinary session has an unrestricted (zero-value) Restriction and the guard
 // never fires, so the cost for the common path is one map lookup per argument
 // name. A restricted session is a strict subset of that surface.
@@ -22,7 +29,8 @@ type toolGuard struct {
 }
 
 // check returns a tool error result when the call must be refused, or nil when
-// it may proceed. toolName is the registered tool name; request carries the
+// it may proceed. toolName is the registered tool name; g is its capability row
+// (g.known is false for a name this build does not describe); request carries the
 // arguments the guard resolves the target from.
 //
 // The target is resolved with the same set of spellings the handlers accept —
@@ -33,52 +41,44 @@ type toolGuard struct {
 // first version of this file did (it handled a raw shell id only, while
 // requireShell also accepts a session id and a locator).
 //
-// Only arguments that actually name the target are consulted, and a tool that
+// Only arguments that actually name the target are consulted, and a call that
 // takes neither session_id nor shell_id passes through untouched — some tools
 // (session_start, shell_detect, the extension tools themselves) legitimately
 // operate outside any existing session, and gating them would have nothing to
 // gate against.
-func (g toolGuard) check(toolName string, request mcpgo.CallToolRequest) *mcpgo.CallToolResult {
+//
+// ctx carries the caller's namespace (see namespace.go). It is a second, coarser
+// gate than the Restriction: a Restriction trims what a session may do, and this
+// decides whether the caller may reach the session at all. Both live here rather
+// than in the handlers so every tool that names a session is covered by
+// construction, including one added later.
+func (g toolGuard) check(ctx context.Context, toolName string, c gate, request mcpgo.CallToolRequest) *mcpgo.CallToolResult {
 	args := request.GetArguments()
 	if args == nil || g.server == nil {
 		return nil
 	}
+	callerNS := callerNamespace(ctx)
 
 	// A shell-addressed tool resolves through its parent session, since the
 	// restriction is a property of the container the shell was created under.
+	//
+	// Both arguments take a comma-separated batch, and the HANDLERS split it
+	// themselves (session_terminate/session_delete for session_id, shell_input /
+	// shell_key for shell_id). The guard therefore has to split it with the same
+	// helper before it resolves anything: resolving the raw string "a,b" finds no
+	// session, and "no session" is the one answer that means "nothing to
+	// gate" — so the whole batch reached the handler unchecked and every entry in
+	// it was acted on, including a session whose whitelist forbids the tool and a
+	// session in another caller's namespace. A single id splits to itself, so the
+	// ordinary case is the same loop of one.
 	if shellID := getString(args, "shell_id", ""); shellID != "" {
-		sess := g.sessionForShellID(shellID)
-		if sess == nil {
-			return nil // an unresolvable id is the handler's error to report
-		}
-		return g.checkSession(sess, toolName, args)
+		ids, _ := splitBatchIDs(shellID)
+		return g.checkEach(ids, g.sessionForShellID, callerNS, toolName, c, args)
 	}
 
 	if sessionID := getString(args, "session_id", ""); sessionID != "" {
-		// A batch (comma-separated ids) is refused wholesale when any entry is
-		// restricted: running part of a batch against a session the caller may not
-		// touch would make the refusal partial and the outcome confusing.
-		if strings.Contains(sessionID, ",") {
-			for _, id := range strings.Split(sessionID, ",") {
-				id = strings.TrimSpace(id)
-				if id == "" {
-					continue
-				}
-				sess := g.sessionForSessionID(id)
-				if sess == nil {
-					continue
-				}
-				if bad := g.checkSession(sess, toolName, args); bad != nil {
-					return bad
-				}
-			}
-			return nil
-		}
-		sess := g.sessionForSessionID(sessionID)
-		if sess == nil {
-			return nil
-		}
-		return g.checkSession(sess, toolName, args)
+		ids, _ := splitBatchIDs(sessionID)
+		return g.checkEach(ids, g.sessionForSessionID, callerNS, toolName, c, args)
 	}
 
 	// Two tools name what they act on by the RESOURCE's own id rather than by the
@@ -90,15 +90,66 @@ func (g toolGuard) check(toolName string, request mcpgo.CallToolRequest) *mcpgo.
 	// same managers the handlers use.
 	if id := getString(args, "forward_id", ""); id != "" {
 		if sess := g.sessionForForwardID(id); sess != nil {
-			return g.checkSession(sess, toolName, args)
+			if bad := refuseForeignNamespace(sess, callerNS); bad != nil {
+				return bad
+			}
+			return g.checkSession(sess, toolName, c, args)
 		}
 	}
 	if id := getString(args, "rule_id", ""); id != "" {
 		if sess := g.sessionForRuleID(id); sess != nil {
-			return g.checkSession(sess, toolName, args)
+			if bad := refuseForeignNamespace(sess, callerNS); bad != nil {
+				return bad
+			}
+			return g.checkSession(sess, toolName, c, args)
 		}
 	}
 	return nil
+}
+
+// checkEach applies both gates — reachability, then the session's own whitelist —
+// to every id a call names.
+//
+// A batch is refused WHOLESALE when any entry fails: running part of a batch
+// against a session the caller may not touch would make the refusal partial and
+// the outcome confusing, and a caller that asked for ten things would have to
+// read ten results to learn which two were allowed.
+//
+// An id that resolves to nothing is skipped rather than refused: that is the
+// handler's not-found error to report, with its own code and its own wording.
+func (g toolGuard) checkEach(ids []string, resolve func(string) *session.Session, callerNS, toolName string, c gate, args map[string]any) *mcpgo.CallToolResult {
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		sess := resolve(id)
+		if sess == nil {
+			continue
+		}
+		if bad := refuseForeignNamespace(sess, callerNS); bad != nil {
+			return bad
+		}
+		if bad := g.checkSession(sess, toolName, c, args); bad != nil {
+			return bad
+		}
+	}
+	return nil
+}
+
+// refuseForeignNamespace is the isolation gate: a caller that claimed a namespace
+// may only touch resources carrying it. It is a separate function from
+// checkSession because the two answer different questions — "may this caller
+// reach it" and "may this session do it" — and because the answer for a refusal
+// must not depend on the session's whitelist, which is somebody else's business.
+//
+// The message names what the caller is, not what the resource is: an id it was
+// handed once must not become a way to enumerate other namespaces by reading
+// error text.
+func refuseForeignNamespace(sess *session.Session, callerNS string) *mcpgo.CallToolResult {
+	if sess == nil || ns.Reachable(sess.Namespace, callerNS) {
+		return nil
+	}
+	return nsRefusal(callerNS)
 }
 
 // sessionForForwardID resolves the session a forward belongs to: a forward is
@@ -137,11 +188,16 @@ func (g toolGuard) sessionForRuleID(id string) *session.Session {
 }
 
 // sessionForShellID resolves a shell_id argument the way requireShell does: a
-// live or retained shell id, a raw session id (its primary channel), or a
-// termcp:// locator naming either. It deliberately does not apply
-// requireShell's status check — a closed session's retained shell is still the
-// container whose whitelist governs a read of its output, and letting the guard
-// skip it would leave that path ungated.
+// live or retained shell id, a raw session id (its primary channel), a
+// termcp:// locator naming either, or the short `sid:N` handle `ps` prints. It
+// deliberately does not apply requireShell's status check — a closed session's
+// retained shell is still the container whose whitelist governs a read of its
+// output, and letting the guard skip it would leave that path ungated.
+//
+// Recognising every spelling requireShell recognises is a SECURITY requirement,
+// not a convenience: checkEach SKIPS an id that resolves to nothing (that is the
+// handler's not-found error to report), so any spelling the handler accepts but
+// this function does not is a hole straight through the whitelist.
 func (g toolGuard) sessionForShellID(shellID string) *session.Session {
 	if cs := g.server.sessMgr.GetChildShell(shellID); cs != nil {
 		return g.server.sessMgr.Get(cs.ParentSessionID())
@@ -156,7 +212,9 @@ func (g toolGuard) sessionForShellID(shellID string) *session.Session {
 }
 
 // sessionForSessionID resolves a session_id argument the way requireSession
-// does: a raw session id, a shell id belonging to it, or a termcp:// locator.
+// does: a raw session id, a shell id belonging to it, a termcp:// locator, or the
+// short `sid:N` handle. The same security note applies: a spelling the resolver
+// misses is a spelling the guard does not gate.
 func (g toolGuard) sessionForSessionID(id string) *session.Session {
 	if sess := g.server.sessMgr.Get(id); sess != nil {
 		return sess
@@ -169,21 +227,36 @@ func (g toolGuard) sessionForSessionID(id string) *session.Session {
 		if err == nil && p.Kind != resourceURLEntry {
 			return g.server.sessMgr.Get(p.SessionID)
 		}
+		return nil
+	}
+	// The short handle from ps. Without this, `shell_id: "sid:2"` resolved here to
+	// nothing, checkEach skipped it as "no session to gate", and the call went on
+	// to a handler that DOES understand the spelling — the whitelist bypassed by
+	// punctuation.
+	if h := locator.SplitHandle(id); h.Index > 0 {
+		return g.server.sessMgr.Get(h.SessionID)
 	}
 	return nil
 }
 
-// checkSession applies one session's whitelist to the call: the tool itself,
-// then every path argument the file tools carry.
-func (g toolGuard) checkSession(sess *session.Session, toolName string, args map[string]any) *mcpgo.CallToolResult {
-	r := sess.Restriction()
-	if !r.AllowsTool(toolName) {
-		return toolError(CodeForbidden, "%s", session.ForbiddenTool(toolName))
+// checkSession applies one session's whitelist to the call: the capability
+// itself, then every path argument that capability declares.
+//
+// The namespace check is separate and comes first: a caller that may not reach
+// the session at all is not told what the session's whitelist says.
+func (g toolGuard) checkSession(sess *session.Session, toolName string, c gate, args map[string]any) *mcpgo.CallToolResult {
+	if !c.known {
+		// An operation with no capability row has no entry a whitelist could
+		// name, so a restricted session cannot reach it.
+		return refuseSession(sess, "\x00unknown", toolName)
 	}
-	// Path arguments come in several names across the file tools (remote_path,
-	// from_path/to_path, local_path), and reading is as gated as writing: the
-	// whitelist is about reachability, not direction.
-	for _, key := range pathArgKeys {
+	if bad := refuseSession(sess, c.ID, toolName); bad != nil {
+		return bad
+	}
+	r := sess.Restriction()
+	// Path arguments are declared per capability; reading is as gated as writing,
+	// because the whitelist is about reachability, not direction.
+	for _, key := range c.PathArgs {
 		path := getString(args, key, "")
 		if path == "" {
 			continue
@@ -193,27 +266,4 @@ func (g toolGuard) checkSession(sess *session.Session, toolName string, args map
 		}
 	}
 	return nil
-}
-
-// pathArgKeys are the argument names that name a path. The guard checks each one
-// a tool happens to carry, so a new file tool is covered by naming its path
-// argument the same way. Every path argument of every file tool is here: file_link
-// alone carries three (target, link_path, existing_path, new_path).
-//
-// local_path is in the list because it names a path too, and the one on THIS
-// host: file_read(mode=file) writes it and file_write streams from it, so leaving
-// it out let a template's paths whitelist be walked around entirely — an
-// extension granted file_read on one remote tree could read any file the termcp
-// process can open, including the deployment's own credentials. Gating it costs
-// an author one entry in paths to allow a local download directory, which is the
-// fail-closed reading of "the paths this session may reach".
-var pathArgKeys = []string{
-	"remote_path",
-	"from_path",
-	"to_path",
-	"link_path",
-	"existing_path",
-	"new_path",
-	"local_path",
-	"target",
 }

@@ -22,7 +22,6 @@ import (
 // no-MCP integration path.
 var staticDocPaths = []string{
 	"/api.md",
-	"/skills.md",
 }
 
 // TestStaticDocsServed verifies the embedded docs are reachable at their paths.
@@ -74,49 +73,6 @@ func TestMarkdownContentTypeIsPlatformIndependent(t *testing.T) {
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/index.html", nil))
 	if ct := rr.Header().Get("Content-Type"); strings.HasPrefix(ct, "text/markdown") {
 		t.Errorf("GET /index.html Content-Type = %q, want the wrapper to leave non-.md assets untouched", ct)
-	}
-}
-
-// TestSkillFrontmatter validates the downloadable skill file against the Agent
-// Skills requirements (name + description in YAML frontmatter).
-func TestSkillFrontmatter(t *testing.T) {
-	b, err := readAsset("skills.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A Windows checkout (core.autocrlf) hands go:embed CRLF; the frontmatter
-	// delimiter is defined as a line, so normalize before checking it.
-	b = strings.ReplaceAll(b, "\r\n", "\n")
-	if !strings.HasPrefix(b, "---\n") {
-		t.Fatal("SKILL.md must start with YAML frontmatter")
-	}
-	end := strings.Index(b[4:], "\n---")
-	if end < 0 {
-		t.Fatal("SKILL.md frontmatter is not terminated")
-	}
-	front := b[4 : 4+end]
-	for _, field := range []string{"name: termcp", "description:"} {
-		if !strings.Contains(front, field) {
-			t.Errorf("SKILL.md frontmatter misses %q", field)
-		}
-	}
-	// The description decides whether an agent loads the skill, so it must name
-	// the locator syntax users paste ("open termcp://rock64").
-	if !strings.Contains(front, "termcp://") {
-		t.Error("SKILL.md description must mention termcp:// locators")
-	}
-	// The body must teach how to act on a locator over plain HTTP.
-	for _, want := range []string{"termcp://", "/api/resolve"} {
-		if !strings.Contains(b, want) {
-			t.Errorf("SKILL.md body misses %q", want)
-		}
-	}
-	// Install instructions must name the directory Claude Code actually reads
-	// (it does not read ~/.agents/skills) plus the shared convention.
-	for _, want := range []string{"~/.claude/skills/termcp/SKILL.md", "~/.agents/skills/termcp/SKILL.md"} {
-		if !strings.Contains(b, want) {
-			t.Errorf("SKILL.md install note misses %q", want)
-		}
 	}
 }
 
@@ -205,23 +161,26 @@ func TestShellIORoutes(t *testing.T) {
 
 // TestApiPageShowsSkillDownload keeps the Web UI's API/MCP page pointing at the
 // skill download address: users should not have to assemble the URL by hand.
-func TestApiPageShowsSkillDownload(t *testing.T) {
+func TestApiPageShowsTermEntrance(t *testing.T) {
 	b, err := readAsset("api.html")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`id="url-skill"`,         // skill URL element (filled from origin by the page script)
-		`id="cfg-skill-install"`, // copy-ready install command
-		`href="/skills.md"`,      // direct download link
-		`href="/api.md"`,         // document link
-		`var skill = origin + '/skills.md'`,
-		`~/.claude/skills/`,      // Claude Code's skills dir (the only one CC actually reads)
-		`~/.agents/skills/`,      // shared convention for other agents
-		`"$DIR/termcp/SKILL.md"`, // install target: folder name = skill name
+		`href="/api.md"`,           // the surviving document link
+		`/api/term`,                // the one REST entrance to the command space
+		`REST API is one endpoint`, // and the page says why no skill is served
+		`{"cmd":""}`,               // the guide call an agent learns from
 	} {
 		if !strings.Contains(b, want) {
 			t.Errorf("api.html misses %s", want)
+		}
+	}
+	// The skill download is gone: it taught an HTTP flow the term entrance
+	// replaced, and a stale tutorial is worse than none.
+	for _, unwanted := range []string{`/SKILL.md`, `skills/termcp`, `id="url-skill"`} {
+		if strings.Contains(b, unwanted) {
+			t.Errorf("api.html still advertises %s", unwanted)
 		}
 	}
 }

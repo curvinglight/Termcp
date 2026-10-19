@@ -144,11 +144,13 @@ the secret in the browser, where it stays out of the model's context.
 | **Output** | Byte-cursor reads (tail / offset / live reader), paged from disk and replayable after a restart; per-line timeline of who wrote what. |
 | **Files** | SFTP browse, read, write, rename, delete, mkdir, permissions, links — plus HTTP URLs with Range resume. |
 | **Forwarding** | `-L` local, `-R` remote, `-D` SOCKS5, over ProxyJump bastion chains. |
-| **Notifications** | `shell_notify` wakes the agent on exit / silence / new output; `notify_user` toasts the human with the instance URL. |
+| **Notifications** | `shell_notify` wakes the agent on exit / silence / new output; `notify_user` toasts the human with the instance URL, plays a short tone and raises a desktop notification. |
 | **SSH profiles** | A central TOML store with batch import/export, in-memory temporary hosts, connection testing, and edit/copy/rename. |
 | **Review mode** | Per-session approval gate: every agent write waits for a human decision. |
+| **Connected clients** | The header lists who is attached: MCP clients with the name they announced and their namespace, plus Web UI tabs with their address and what they are watching. |
+| **Update notice** | The header tells you when a newer release exists — only for real `vX.Y.Z` builds, never for a local `dev-<sha>`. |
 | **Discovery** | `shell_detect` finds the target's interactive shell instead of guessing from the local `PATH`. |
-| **Agent Skill** | Instances serve `/skills.md`, so an agent drives everything with plain `curl`. |
+| **One REST entrance** | `POST /api/term` speaks the same command language as the MCP tool, so an agent drives everything with plain `curl`. |
 
 ## Security Model
 
@@ -165,7 +167,6 @@ the secret in the browser, where it stays out of the model's context.
 | [`docs/cli.md`](./docs/cli.md) | Every flag and subcommand, capability gates, authentication. |
 | [`docs/clients.md`](./docs/clients.md) | All entrances end to end: MCP transports, the stdio bridge, Skill install, REST examples. |
 | [`docs/deploy.md`](./docs/deploy.md) | Docker, multi-stage builds, Compose, pure-API build. |
-| [`docs/mcp-tools.md`](./docs/mcp-tools.md) | All 31 MCP tools: parameters, return shapes, error codes. |
 | [`docs/api.md`](./docs/api.md) | REST endpoints, WebSocket frames, locator resolution. |
 | [`docs/architecture.md`](./docs/architecture.md) | Session kernel, entrances, storage. |
 | [`docs/design/`](./docs/design) | Design records: Web UI, resource model, session storage, font stack, mobile terminal. |

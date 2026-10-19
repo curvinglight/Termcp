@@ -5,6 +5,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/open-mcp-ai/termcp/internal/capability"
 )
 
 // Restriction trims what may act on a session, across every surface that can
@@ -14,13 +16,19 @@ import (
 // handle handed to an agent can only do what the extension's author decided —
 // and nothing the author did not list is silently reachable.
 //
+// The allow list holds CAPABILITY ids ("shell.input", "file.read"), not tool
+// names. A tool name is one surface's spelling of an operation; the capability
+// is the operation, so a template that grants "file.read" grants it on the MCP
+// tool, the REST route and the WebSocket alike without the author naming three
+// things. internal/capability owns the name → id mapping in both directions.
+//
 // Enforcing it on one transport only would make the whitelist a matter of which
 // door the caller picked, so each surface asks these same questions rather than
-// restating the rule: internal/mcp's toolGuard and internal/webui's
-// restRefuseTool/restRefusePaths are thin wrappers over AllowsTool/AllowsPath.
+// restating the rule. internal/mcp's guard and internal/webui's REST and
+// WebSocket refusals are thin wrappers over Allows/AllowsPath.
 //
 // Both halves are whitelists and the zero value means unrestricted: an ordinary
-// session carries a Restriction{} and every tool behaves exactly as before.
+// session carries a Restriction{} and every operation behaves exactly as before.
 // Building one through NewRestriction is the only supported route, because path
 // patterns must be validated once, at extension-load time, rather than failing
 // mid-conversation on a pattern nobody has looked at.
@@ -29,9 +37,17 @@ type Restriction struct {
 	paths []pathRule
 }
 
-// NewRestriction copies the tool whitelist and compiles every path pattern so a
-// malformed one is reported when an extension is saved, not when an agent first
-// reaches for a file. Blank patterns are dropped rather than counted as rules.
+// NewRestriction copies the capability whitelist and compiles every path pattern
+// so a malformed one is reported when an extension is saved, not when an agent
+// first reaches for a file. Blank patterns are dropped rather than counted as
+// rules.
+//
+// An entry that is neither a capability id nor a name the capability table can
+// resolve is kept as written and matches only that exact string. The reason is
+// compatibility, not leniency: extensions saved before the switch hold tool
+// names, and a manifest on disk outlives the process that wrote it. Allows
+// translates a tool name onto its capability id, so those templates keep
+// granting exactly what they always granted.
 func NewRestriction(allow []string, paths []string) (Restriction, error) {
 	r := Restriction{allow: append([]string(nil), allow...)}
 	for _, p := range paths {
@@ -48,19 +64,44 @@ func NewRestriction(allow []string, paths []string) (Restriction, error) {
 	return r, nil
 }
 
-// AllowsTool reports whether a tool may run against this session. An empty allow
-// list is the unrestricted default; any other list is an exact-name whitelist,
-// so a restricted session is a strict subset of an unrestricted one.
-func (r Restriction) AllowsTool(name string) bool {
+// Allows reports whether a capability may run against this session. An empty
+// allow list is the unrestricted default; any other list is an exact-id
+// whitelist, so a restricted session is a strict subset of an unrestricted one.
+//
+// id is normally a capability id. A tool name is accepted as well and translated
+// first, and an entry that holds a tool name (a template written before the
+// switch, which is what is on disk on an upgraded instance) matches the
+// capability that name belongs to. Both spellings resolve to the same operation,
+// so a template grants exactly what it always granted — see NewRestriction.
+func (r Restriction) Allows(id string) bool {
 	if len(r.allow) == 0 {
 		return true
 	}
+	canonical, toolName := id, id
+	if mapped, ok := capability.IDForTool(id); ok {
+		canonical, toolName = mapped, id
+	} else {
+		toolName = capability.ToolForID(id)
+	}
 	for _, a := range r.allow {
-		if a == name {
+		if a == canonical || a == toolName {
 			return true
 		}
 	}
 	return false
+}
+
+// AllowsTool reports whether the capability behind an MCP tool name may run
+// against this session. It is Allows with the name resolved first, kept as a
+// separate call because the surfaces hold different things: internal/mcp has a
+// tool name in hand, internal/webui has a route shape.
+func (r Restriction) AllowsTool(toolName string) bool {
+	if id, ok := capability.IDForTool(toolName); ok {
+		return r.Allows(id)
+	}
+	// An unknown tool has no capability, so a whitelist cannot name it; only an
+	// unrestricted session lets it through.
+	return len(r.allow) == 0
 }
 
 // AllowsPath reports whether a remote path is inside the whitelist. An empty rule
@@ -94,9 +135,14 @@ func (r Restriction) AllowsPath(p string) bool {
 }
 
 // ForbiddenTool renders the refusal for a tool a session's whitelist does not
-// carry. Both surfaces that can act on a session — the MCP tool guard and the
-// REST handlers — answer with this text, so a caller who meets the whitelist on
+// carry. Both surfaces that can act on a session — the MCP guard and the REST
+// handlers — answer with this text, so a caller who meets the whitelist on
 // either one reads the same sentence and is pointed at the same remedy.
+//
+// The wording is unchanged from when the whitelist held tool names: it is part of
+// the contract an extension's author and an agent both read, and a refactor that
+// silently reworded a refusal would make two otherwise identical deployments
+// disagree in their logs.
 func ForbiddenTool(toolName string) string {
 	return "tool " + toolName + " is not permitted on this session: it is an extension session whose capability list does not include it. Use extension(action=get) to see what this session was created to allow."
 }

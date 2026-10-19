@@ -13,5 +13,5 @@ const uiEmbedded = false
 // — only the browser UI is dropped. Selected by `go build -tags no_webui`
 // (make build-api).
 //
-//go:embed assets/api.md assets/skills.md assets/extensions.md
+//go:embed assets/api.md
 var embeddedAssets embed.FS

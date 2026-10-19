@@ -3,6 +3,7 @@ package webui
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -32,6 +33,10 @@ type approvalModeBody struct {
 	// accepted but not recommended: a request that never expires keeps holding a
 	// waiter and a queue entry.
 	TimeoutSeconds int `json:"timeout_seconds"`
+	// Scopes narrows what review holds. Omitted or empty means every gated kind,
+	// which is the default and the original behaviour; naming a subset is the
+	// finer control of issue #75 (hold file writes but let port forwards through).
+	Scopes []string `json:"scopes"`
 }
 
 type approvalDecisionBody struct {
@@ -56,6 +61,9 @@ func (h *Handler) handleSessionApproval(w http.ResponseWriter, r *http.Request) 
 		payload := map[string]any{
 			"session_id":    sess.ID,
 			"approval_mode": sess.ApprovalEnabled(),
+			// What the switch currently covers. "all" is the default and reads as
+			// "every gated kind" rather than listing ten names that all mean yes.
+			"scopes":        approvalScopesJSON(sess.ApprovalScopes()),
 			"pending_count": 0,
 			"requests":      []any{},
 			// Always true: review gates the AI's MCP surface, never the operator's
@@ -106,7 +114,12 @@ func (h *Handler) handleSessionApproval(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "timeout_seconds cannot be negative", http.StatusBadRequest)
 			return
 		}
-		if err := h.Sessions.EnableApproval(id, body.Need, time.Duration(body.TimeoutSeconds)*time.Second); err != nil {
+		scopes, err := parseApprovalScopes(body.Scopes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := h.Sessions.EnableApprovalScoped(id, body.Need, time.Duration(body.TimeoutSeconds)*time.Second, scopes); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -115,6 +128,7 @@ func (h *Handler) handleSessionApproval(w http.ResponseWriter, r *http.Request) 
 			"approval_mode":   true,
 			"need":            body.Need,
 			"timeout_seconds": body.TimeoutSeconds,
+			"scopes":          approvalScopesJSON(scopes),
 			"websocket_input": true,
 		})
 
@@ -341,4 +355,41 @@ func (h *Handler) BroadcastApproval(sessionID string, req approval.Request) {
 // instead of surfacing it. Submit's error is the place that case is caught.
 func approvalSummary(req approval.Request) string {
 	return req.Summary
+}
+
+// parseApprovalScopes validates what the PATCH body asked to hold.
+//
+// An empty list means "every gated kind" and stays nil, which is what the session
+// layer reads as the default. Valid names are refused by the session layer rather
+// than filtered here, so a typo is an error with the valid set named — a gate must
+// never quietly narrow itself.
+func parseApprovalScopes(names []string) ([]approval.Kind, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	out := make([]approval.Kind, 0, len(names))
+	for _, n := range names {
+		kind := approval.Kind(n)
+		if !approval.ValidKind(kind) {
+			return nil, fmt.Errorf("unknown approval scope %q; valid scopes: %s",
+				n, strings.Join(approval.KindNames(), ", "))
+		}
+		out = append(out, kind)
+	}
+	return out, nil
+}
+
+// approvalScopesJSON renders a scope set for the API: the string "all" when the
+// session gates every kind, otherwise the list. A client that has to tell "every
+// kind" from "these three" needs the difference to be visible rather than
+// inferred from a list that happens to be complete.
+func approvalScopesJSON(scopes []approval.Kind) any {
+	if len(scopes) == 0 {
+		return "all"
+	}
+	names := make([]string, 0, len(scopes))
+	for _, k := range scopes {
+		names = append(names, string(k))
+	}
+	return names
 }

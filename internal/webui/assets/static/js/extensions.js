@@ -747,6 +747,9 @@ function paintExtensionWindow(win, name) {
   if (grid) {
     var rows = '';
     if (row.description) rows += extStatusRow(t('ext.modal.description'), row.description, false);
+    /* A url template's endpoint is what it talks to, and the one field that says
+       which of the two mcp shapes this is; the kind label alone cannot. */
+    if (row.url) rows += extStatusRow(t('ext.status.url'), row.url, false);
     rows += extStatusRow(t('ext.status.session'), row.session_id, true);
     rows += extStatusRow(t('ext.status.shell'), row.shell_id, true);
     (row.forwards || []).forEach(function (f) {
@@ -924,6 +927,13 @@ function extTomlSeed() {
     'mode = "pipe"',
     'command = "npx"',
     'args = ["-y", "example-mcp-server"]',
+    '',
+    '# Or a remote MCP server reached over HTTP instead of a program to run: the',
+    '# relay runs inside termcp, so nothing is installed anywhere and target must be',
+    '# "internal". A path ending in /sse selects the SSE transport. `url` replaces',
+    '# `command`/`args` — set one or the other, not both.',
+    '# url = "https://mcp.example.com/mcp"',
+    '# headers = { X-Api-Key = "..." }',
     '',
     '# What the agent driving it may call (a whitelist; empty = the full surface).',
     'allow = ["shell_input", "shell_key", "shell_output"]',

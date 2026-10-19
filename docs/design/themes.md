@@ -123,6 +123,7 @@ Each package may provide `theme.json`, served as an ordinary static asset:
 | `fontSize` | Pixels, 6–72; defaults to 13. |
 | `fontWeight`, `fontWeightBold` | `normal`, `bold`, or a numeric weight from 100–900. |
 | `lineHeight`, `letterSpacing` | Line-height multiplier (1–3) and additional character spacing in pixels (0–10). |
+| `minimumContrastRatio` | Minimum WCAG contrast ratio (1–21) xterm enforces between a glyph and the background it is drawn on, moving only the text colour's lightness. Defaults to 4.5 (WCAG AA) from `terminal-theme.css`; `1` disables the repair. |
 | `background`, `foreground` | Terminal surface and text colors; CSS color values and `var(...)` are supported. |
 | `cursor`, `cursorAccent`, `selectionBackground` | Cursor, cursor text and selection colors. |
 | `colors` | Any of the 16 xterm ANSI color keys: `black` through `white`, plus `brightBlack` through `brightWhite`. |
@@ -190,6 +191,7 @@ also refresh. Other static resources retain the existing cache policy.
 - Theme copy and language changes, default fallback, plain-text rendering and
   late JSON responses from cancelled selections.
 - Opaque default backgrounds, transparent custom surfaces, font changes and
-  refitting, ANSI colors, configuration hot reload and restoration of defaults.
+  refitting, ANSI colors, minimum-contrast repair for a foreground painted on a
+  different ANSI background, configuration hot reload and restoration of defaults.
 - Theme restoration, discovery, switching and assets under a proxy sub-path,
   with the current dev's connecting cards, batch stop and window layout fixes.

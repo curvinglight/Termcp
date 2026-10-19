@@ -222,47 +222,27 @@ func TestEditSSHConfigRejectsAMissingName(t *testing.T) {
 // here is the one the hint tells the model to produce, and the jump case is
 // asserted by presence because a dropped bastion is the specific silent failure
 // the hint exists to prevent.
-func TestSSHConfigDescriptionAdvertisesTheFormatTheStoreAccepts(t *testing.T) {
-	// What the model is told, in both listings: the read-only one and the
-	// write-enabled one RegisterSSHConfigWriteTools installs, which REPLACES the
-	// description rather than extending it. Only the second is on the wire when
-	// -mcp-manage-ssh-configs is set, which is exactly the deployment where an
-	// agent is allowed to write profiles at all.
-	for _, tc := range []struct {
-		name string
-		w    bool
-	}{
-		{"read-only listing", false},
-		{"write-enabled listing", true},
+func TestProfileHelpAdvertisesTheFormatTheStoreAccepts(t *testing.T) {
+	// The file format is knowledge the agent needs to PRODUCE an importable file,
+	// and the tool description that used to carry it is gone with the specialised
+	// surface. It now lives in `help profile`, reached on request: it is a page of
+	// text, not a rule the model needs before every call.
+	s := newTestServer(t)
+	help := termText(t, s, map[string]any{"cmd": "help profile"})
+	for _, want := range []string{
+		"[[connections]]",
+		`kind = "remote"`,
+		"password", "private_key",
+		// The trap: the nested spelling the parser reads, and the flat one it
+		// ignores.
+		"[connections.jump]",
+		"jump-host",
+		// The two import rules an agent-generated file depends on.
+		`"internal" is reserved`,
+		"name-2",
 	} {
-		s := newTestServer(t)
-		if tc.w {
-			s.RegisterSSHConfigWriteTools()
-		}
-		desc := ""
-		for _, tool := range listTools(t, s, context.Background()) {
-			if tool.Name == "ssh_config" {
-				desc = tool.Description
-			}
-		}
-		if desc == "" {
-			t.Fatalf("%s: ssh_config missing from tools/list", tc.name)
-		}
-		for _, want := range []string{
-			"[[connections]]",
-			`kind="remote"`,
-			"password or private_key",
-			// The trap: the nested spelling the parser reads, and the flat one it
-			// ignores.
-			"[connections.jump]",
-			"jump_host",
-			// The two import rules an agent-generated file depends on.
-			"internal\" is reserved",
-			"name-2",
-		} {
-			if !strings.Contains(desc, want) {
-				t.Errorf("%s: ssh_config description misses %q:\n%s", tc.name, want, desc)
-			}
+		if !strings.Contains(help, want) {
+			t.Errorf("help profile misses %q: %s", want, help)
 		}
 	}
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/open-mcp-ai/termcp/internal/configcrypt"
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
@@ -187,8 +188,30 @@ func (h *Handler) handleExportConnections(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/toml; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="termcp-connections.toml"`)
+
+	/* An export leaves the machine, so it can be sealed with a password the
+	   operator types (issue #108, item 3). The password arrives in a header, not
+	   the query: a URL ends up in shell history, proxy logs and browser history,
+	   and a password in one of those is a password leaked. Absent header = the
+	   plain export this route has always produced, so existing scripts keep
+	   working and an operator who does not ask for encryption gets a file they
+	   can see is unencrypted. */
+	filename := "termcp-connections.toml"
+	if password := r.Header.Get(EncryptHeader); password != "" {
+		sealed, err := configcrypt.Encrypt(data, password)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data = sealed
+		// The extension says what the file is: an operator who finds it later
+		// knows it needs termcp, not a TOML editor.
+		filename = "termcp-connections.enc"
+		w.Header().Set("Content-Type", "application/x-termcp-encrypted")
+	} else {
+		w.Header().Set("Content-Type", "application/toml; charset=utf-8")
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -212,6 +235,26 @@ func (h *Handler) handleImportConnections(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	/* An encrypted export is opened here, before the TOML parser sees it. The
+	   header carries the password for the same reason the export takes it there:
+	   it must not be in a URL. A plain document needs no password and is passed
+	   through untouched — the old format stays importable forever. */
+	if configcrypt.IsEncrypted(body) {
+		password := r.Header.Get(EncryptHeader)
+		if password == "" {
+			http.Error(w, "this configuration export is encrypted: send the password in the "+
+				EncryptHeader+" header", http.StatusUnauthorized)
+			return
+		}
+		plain, err := configcrypt.Decrypt(body, password)
+		if err != nil {
+			// 400 for a wrong password or a damaged file: both are "the bytes you
+			// sent cannot be opened", and the message distinguishes them.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body = plain
 	}
 	result, err := h.SSH.ImportBatch(body, temporary)
 	if err != nil {
@@ -362,3 +405,13 @@ func (h *Handler) resolveSSH(name string) (cfgName string, ent *sshconfig.Entry,
 	}
 	return name, ent, r, nil
 }
+
+// EncryptHeader carries the password for an encrypted configuration export or
+// import.
+//
+// A header rather than a query parameter or a body field, for two reasons. A URL
+// lands in shell history, proxy logs and browser history, so a password there is
+// leaked by the same act that used it. And an import body is the document itself
+// — TOML or the sealed envelope — so there is nowhere in it to put a password
+// without inventing a second format for the same file.
+const EncryptHeader = "X-Termcp-Password"

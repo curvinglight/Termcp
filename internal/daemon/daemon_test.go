@@ -137,7 +137,7 @@ func TestChildArgs(t *testing.T) {
 
 	full := &config.Config{
 		Host: "0.0.0.0", Port: 19000, DataDir: "/d", AssetsDir: "/a", LogLevel: "debug",
-		NoInternal: true, MCPManageSSHConfigs: true, MCPDeferTools: true,
+		NoInternal: true, MCPManageSSHConfigs: true,
 		AuthToken: "sekret-token", AuthHash: "deadbeef",
 	}
 	got = ChildArgs(full, "30s")
@@ -145,7 +145,7 @@ func TestChildArgs(t *testing.T) {
 	for _, want := range []string{
 		" --host 0.0.0.0 ", " --port 19000 ", " --data-dir /d ", " --assets /a ",
 		" --log-level debug ", " --no-internal ", " --mcp-manage-ssh-configs ",
-		" --mcp-defer-tools ", " --idle-timeout 30s ",
+		" --idle-timeout 30s ",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args %v lack %q", got, strings.TrimSpace(want))

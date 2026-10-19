@@ -81,15 +81,15 @@ func TestGatedToolsAllHoldUnderReview(t *testing.T) {
 	// Reads must not be gated: approving a directory listing trains a reviewer to
 	// click without reading.
 	before := len(q.List())
-	// Called directly: gatedHandler only knows the gated tools, which is itself
-	// the point — the reads are absent from that table.
-	if _, err := s.handleFileRead(context.Background(), makeRequest(map[string]any{"session_id": sessionID, "remote_path": "/etc/hostname"})); err != nil {
+	// Called through the same entry an agent uses: the reads are absent from the
+	// review gate, which is the point.
+	if _, err := s.call(context.Background(), "file_read", map[string]any{"session_id": sessionID, "remote_path": "/etc/hostname"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.handleFileStat(context.Background(), makeRequest(map[string]any{"session_id": sessionID, "remote_path": "/etc/hostname"})); err != nil {
+	if _, err := s.call(context.Background(), "file_stat", map[string]any{"session_id": sessionID, "remote_path": "/etc/hostname"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.handleFileGetwd(context.Background(), makeRequest(map[string]any{"session_id": sessionID})); err != nil {
+	if _, err := s.call(context.Background(), "file_getwd", map[string]any{"session_id": sessionID}); err != nil {
 		t.Fatal(err)
 	}
 	if after := len(q.List()); after != before {
@@ -102,14 +102,10 @@ func TestGatedToolsAllHoldUnderReview(t *testing.T) {
 	}
 }
 
-// dispatch calls the tool's handler the way the MCP server would.
+// dispatch calls the tool the way the MCP server would, admission included.
 func dispatch(t *testing.T, s *Server, tool string, args map[string]any) *mcpgo.CallToolResult {
 	t.Helper()
-	h := s.gatedHandler(tool)
-	if h == nil {
-		t.Fatalf("no handler for %s", tool)
-	}
-	res, err := h(context.Background(), makeRequest(args))
+	res, err := s.call(context.Background(), tool, args)
 	if err != nil {
 		t.Fatalf("%s: %v", tool, err)
 	}

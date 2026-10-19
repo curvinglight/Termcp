@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/pkg/api"
@@ -63,7 +64,7 @@ func (h *Handler) handleDeleteNotification(w http.ResponseWriter, r *http.Reques
 		if rule.ID != id {
 			continue
 		}
-		if restRefuseTool(w, h.sessionOwning(rule.SessionID, rule.ShellID), "shell_notify") {
+		if restRefuseTool(w, h.sessionOwning(rule.SessionID, rule.ShellID), capability.ShellNotify) {
 			return
 		}
 		break
@@ -93,7 +94,7 @@ func (h *Handler) handleDeleteForward(w http.ResponseWriter, r *http.Request) {
 	// because the route names the forward, not the session.
 	for _, fw := range h.ForwardMgr.List() {
 		if fw.ForwardID == id {
-			if restRefuseTool(w, h.sessionOwning(fw.SessionID, ""), "forward") {
+			if restRefuseTool(w, h.sessionOwning(fw.SessionID, ""), capability.ForwardClose) {
 				return
 			}
 			break
@@ -144,7 +145,7 @@ func (h *Handler) handleCreateForward(w http.ResponseWriter, r *http.Request) {
 	// A tunnel is a capability of the session it rides: an extension whose template
 	// granted no forwards must not have one opened on its connection by REST, and
 	// the ports it names are subject to the same whitelist rule as everything else.
-	if restRefuseTool(w, sess, "forward") {
+	if restRefuseTool(w, sess, capability.ForwardOpen) {
 		return
 	}
 	// A forward needs a live transport; a closed (DEAD) session must not mint a

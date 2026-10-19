@@ -30,7 +30,7 @@
 
 ## 一、整体分层
 
-Termcp 是平台型架构：**一个会话内核（session/message/sshclient/sshserver）支撑四个平行入口**——Web UI（人）、AI Agent 的两种接入方式——MCP 与 Agent Skill（实例自带 `/skills.md`，安装一次后用 curl 走 REST 面，并用 `GET /api/resolve` 解析 `termcp://` 定位符）、REST/WebSocket（脚本程序）。它们操作同一批会话，互不冲突。
+Termcp 是平台型架构：**一个会话内核（session/message/sshclient/sshserver）支撑四个平行入口**——Web UI（人）、AI Agent 的两种接入方式——MCP 与 REST（两者是同一套 `term` 指令空间的两种传输，实例自带 `{}` 引导与 `help` 表，不需要另写教程）、WebSocket（实时终端 I/O）。它们操作同一批会话，互不冲突。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -46,7 +46,7 @@ Termcp 是平台型架构：**一个会话内核（session/message/sshclient/ssh
 │  /                → Web UI（internal/webui）                    │
 │  /api/*           → REST（internal/webui/handler.go）            │
 │  /api/ui/ws       → WebSocket 终端 I/O                          │
-│  /skills.md /api.md → Agent Skill + 文档（无 MCP 的 curl 路径） │
+│  /api.md → agent 文档（无 MCP 也能读）                          │
 │  /sse /message/stream → internal/mcp（工具面不变）               │
 └──────┬──────────────────────────────────┬──────────────────────┘
        │                                  │

@@ -164,8 +164,16 @@ def main():
             manifest["version"] = version
             manifest["packages"][0]["identifier"] = f"{IMAGE}:{version}"
         validate(text, manifest, version)
-        changelog_path.write_text(text, encoding="utf-8")
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # newline="\n" is load-bearing on Windows: read_text() normalised the
+        # file to LF, and write_text() would translate it back to os.linesep,
+        # turning a three-line release commit into a whole-file rewrite that
+        # hides the real change from review. The repo stores LF everywhere.
+        changelog_path.write_text(text, encoding="utf-8", newline="\n")
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         print(f"prepared v{version}; review the release notes before merging")
         return
 

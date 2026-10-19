@@ -74,6 +74,11 @@ type Session struct {
 	// ApprovalNeed is the number of distinct approvers required while
 	// ApprovalMode is on.
 	ApprovalNeed int `json:"approval_need,omitempty"`
+	// ApprovalScopes is what review holds: empty means every gated kind (the
+	// default), otherwise the narrowed set (issue #75). Derived from live state
+	// like the two fields above, so a manifest cannot claim a scope the session
+	// does not enforce.
+	ApprovalScopes []string `json:"approval_scopes,omitempty"`
 	// Namespace marks a session as infrastructure rather than something a user
 	// asked for: the extension layer keeps one session warm per host and
 	// capability set, and those belong to the extension column rather than on the

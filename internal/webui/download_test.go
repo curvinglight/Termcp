@@ -3,6 +3,7 @@ package webui
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -326,4 +327,147 @@ func TestDownloadRangeHelper(t *testing.T) {
 			t.Errorf("got offset=%d length=%d isRange=%v, want zeros", offset, length, isRange)
 		}
 	})
+}
+
+// A download URL may name the response headers it must be answered with
+// (?h.<Name>=<value>), which is how file_urls hands a caller's headers to
+// whoever opens the URL later. These tests pin both halves: the header actually
+// arrives on the response, and the framing headers the stream owns cannot be
+// taken over by a caller.
+func TestDownloadFileAppliesRequestedResponseHeaders(t *testing.T) {
+	e := newDownloadEnv(t)
+	src := e.file(t, "payload.bin", downloadPayload)
+
+	rr := e.get(t, src, "h.Content-Disposition=attachment%3B+filename%3D%22x.png%22&h.X-Trace=abc", "")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+	// The requested header must REPLACE the default one, not join it: a
+	// Content-Disposition carrying two dispositions names nothing.
+	if cd := rr.Header().Get("Content-Disposition"); cd != `attachment; filename="x.png"` {
+		t.Errorf("Content-Disposition = %q, want the requested one", cd)
+	}
+	if got := rr.Header().Values("X-Trace"); len(got) != 1 || got[0] != "abc" {
+		t.Errorf("X-Trace = %v, want [abc]", got)
+	}
+	// The body is untouched: the headers are an addition, not a redirect.
+	if got := rr.Body.String(); got != downloadPayload {
+		t.Errorf("body = %q, want the whole file", got)
+	}
+}
+
+// The framing headers belong to the stream being sent. A caller-set
+// Content-Length describes a different body than the one arriving, which
+// truncates the download or hangs the client, so it must be dropped rather than
+// trusted - including when it is spelled in lowercase.
+func TestDownloadFileRefusesFramingResponseHeaders(t *testing.T) {
+	e := newDownloadEnv(t)
+	src := e.file(t, "payload.bin", downloadPayload)
+
+	for _, query := range []string{
+		"h.Content-Length=1",
+		"h.content-length=1",
+		"h.Content-Range=bytes+0-0/1",
+	} {
+		rr := e.get(t, src, query, "")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200 (body: %s)", query, rr.Code, rr.Body.String())
+		}
+		if cl := rr.Header().Get("Content-Length"); cl != "26" {
+			t.Errorf("%s: Content-Length = %q, want the real 26", query, cl)
+		}
+		if cr := rr.Header().Get("Content-Range"); cr != "" {
+			t.Errorf("%s: Content-Range = %q, want it absent on a 200", query, cr)
+		}
+		if got := rr.Body.String(); got != downloadPayload {
+			t.Errorf("%s: body = %q, want the whole file", query, got)
+		}
+	}
+}
+
+// A malformed name or a value carrying a line break is a 400, not a silently
+// dropped header: net/http would drop both, leaving the caller with a download
+// that quietly lacks what it asked for.
+func TestDownloadFileRejectsMalformedResponseHeaders(t *testing.T) {
+	e := newDownloadEnv(t)
+	src := e.file(t, "payload.bin", downloadPayload)
+
+	for _, query := range []string{
+		"h.X+Bad=1",                        // space is not a token character
+		"h.X-Trace=a%0D%0AX-Injected:+yes", // header injection
+	} {
+		rr := e.get(t, src, query, "")
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 (body: %s)", query, rr.Code, rr.Body.String())
+		}
+		if got := rr.Header().Get("X-Injected"); got != "" {
+			t.Errorf("%s: injected header reached the response: %q", query, got)
+		}
+	}
+}
+
+// The local branch (a session with no SSH transport) is not reached by the
+// env tests above, which all take the SFTP path, so it is driven directly here:
+// a requested header must survive http.ServeFile, which sets the framing headers
+// it owns.
+func TestServeLocalFileAppliesRequestedResponseHeaders(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "payload.bin")
+	if err := os.WriteFile(src, []byte(downloadPayload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("GET", "/x", nil)
+	hdr, err := requestResponseHeaders(url.Values{"h.Content-Disposition": {`attachment; filename="x.png"`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	serveLocalFile(rr, r, src, 0, 0, false, hdr)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+	if cd := rr.Header().Get("Content-Disposition"); cd != `attachment; filename="x.png"` {
+		t.Errorf("Content-Disposition = %q, want the requested one", cd)
+	}
+	if got := rr.Body.String(); got != downloadPayload {
+		t.Errorf("body = %q, want the whole file", got)
+	}
+}
+
+// A name that is not a token is refused, and the framing headers are dropped
+// rather than written: both are decided in the helper, before any file is opened.
+func TestRequestResponseHeadersValidation(t *testing.T) {
+	if _, err := requestResponseHeaders(url.Values{"h.X Bad": {"1"}}); err == nil {
+		t.Error("a header name with a space must be refused")
+	}
+	if _, err := requestResponseHeaders(url.Values{"h.X-Trace": {"a\r\nX-Injected: yes"}}); err == nil {
+		t.Error("a value carrying a line break must be refused")
+	}
+
+	// Non-header parameters are simply not headers.
+	hdr, err := requestResponseHeaders(url.Values{"path": {"/tmp/x"}, "offset": {"3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hdr) != 0 {
+		t.Errorf("got %v, want no headers from ordinary parameters", hdr)
+	}
+
+	// Framing headers parse fine and are dropped at write time.
+	hdr, err = requestResponseHeaders(url.Values{"h.Content-Length": {"1"}, "h.content-range": {"bytes 0-0/1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	rr.Header().Set("Content-Length", "26")
+	applyResponseHeaders(rr, hdr)
+	if got := rr.Header().Get("Content-Length"); got != "26" {
+		t.Errorf("Content-Length = %q, want the server's 26", got)
+	}
+	if got := rr.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range = %q, want it dropped", got)
+	}
 }

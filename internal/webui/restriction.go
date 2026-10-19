@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/session"
 )
@@ -21,19 +22,31 @@ import (
 // template's whitelist has to be enforced here as well, with the same names and
 // the same refusal text.
 //
-// These are deliberately thin: the decisions live in internal/session
-// (AllowsTool / AllowsPath / ForbiddenTool / ForbiddenPath), so the two surfaces
-// cannot drift into disagreeing about what a template permits.
+// Why this is still a whitelist check and nothing else: review mode never gates
+// the operator's own REST calls (capability.GateOperator / GateDevice), so the
+// only admission question left on this surface is whether the template granted
+// the capability. That answer lives in internal/session (Allows); this file just
+// renders it.
+//
+// These are deliberately thin: the decisions live in internal/session and
+// internal/capability, so the surfaces cannot drift into disagreeing about what
+// a template permits.
 
-// restRefuseTool answers the request when sess's whitelist does not carry tool,
-// and reports whether it did. A nil session (or an unrestricted one) passes.
-func restRefuseTool(w http.ResponseWriter, sess *session.Session, tool string) bool {
-	if sess == nil || sess.Restriction().AllowsTool(tool) {
+// restRefuseTool answers the request when sess's whitelist does not carry the
+// capability capID, and reports whether it did. A nil session (or an
+// unrestricted one) passes.
+//
+// capID is a capability id (capability.FileWrite, …), not a tool name: the
+// template's allow list and this check speak the same vocabulary, and the
+// refusal is rendered from the capability table rather than from a string a
+// handler happened to spell.
+func restRefuseTool(w http.ResponseWriter, sess *session.Session, capID string) bool {
+	if sess == nil || sess.Restriction().Allows(capID) {
 		return false
 	}
 	writeJSON(w, http.StatusForbidden, map[string]any{
 		"error_code": "forbidden",
-		"error":      session.ForbiddenTool(tool),
+		"error":      session.ForbiddenTool(capability.ToolForID(capID)),
 	})
 	return true
 }
@@ -43,7 +56,7 @@ func restRefuseTool(w http.ResponseWriter, sess *session.Session, tool string) b
 // MCP guard resolves one — a raw id, or a termcp:// locator — so a caller cannot
 // walk around the refusal by spelling the id differently. Ids that resolve to
 // nothing are left to the handler's own not-found handling.
-func (h *Handler) restRefuseSessionIDs(w http.ResponseWriter, raw, tool string) bool {
+func (h *Handler) restRefuseSessionIDs(w http.ResponseWriter, raw, capID string) bool {
 	for _, id := range strings.Split(raw, ",") {
 		id = strings.TrimSpace(id)
 		if id == "" {
@@ -55,7 +68,7 @@ func (h *Handler) restRefuseSessionIDs(w http.ResponseWriter, raw, tool string) 
 				sess = h.Sessions.Get(p.SessionID)
 			}
 		}
-		if restRefuseTool(w, sess, tool) {
+		if restRefuseTool(w, sess, capID) {
 			return true
 		}
 	}

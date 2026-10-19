@@ -13,6 +13,7 @@ package extensions
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -26,7 +27,7 @@ import (
 // extension always remains one shape — a trimmed session — whatever it is
 // called; the kind only says which common shape it started from.
 const (
-	KindMCP    = "mcp"    // a stdio MCP server driven over a pipe shell
+	KindMCP    = "mcp"    // an MCP server driven over a pipe shell (stdio command, or an HTTP endpoint bridged in-process)
 	KindSkill  = "skill"  // a read-only window onto remote files via SFTP
 	KindPrompt = "prompt" // an interactive terminal with instructions attached
 	KindCustom = "custom" // everything by hand
@@ -92,6 +93,23 @@ type Extension struct {
 	Allow []string `toml:"allow,omitempty"`
 	Paths []string `toml:"paths,omitempty"`
 
+	// URL is an HTTP MCP endpoint (streamable HTTP, or SSE when the path ends in
+	// /sse). It is the alternative to Command/Args for kind=mcp: instead of a
+	// program to run, the template names a server to speak to, and the session
+	// carries the in-process relay rather than a process. The relay runs inside
+	// termcp (see internal/mcpbridge), so this needs no second binary on the
+	// target and no PATH lookup — the channel is the pipe, and termcp is both ends
+	// of it.
+	//
+	// Target is still the profile the channel is opened on, so an HTTP MCP server
+	// only reachable from a given host is pinned by naming that host.
+	URL string `toml:"url,omitempty"`
+	// Headers are extra request headers for that endpoint (e.g. a credential the
+	// server wants outside the Authorization header). They belong with URL: a
+	// template that names a server without saying how to authenticate to it is
+	// only half a template.
+	Headers map[string]string `toml:"headers,omitempty"`
+
 	// Notes are the agent's operating instructions — the recipe the reconciler
 	// hands out with the session handle. For an extension this is the product
 	// documentation an agent can actually act on.
@@ -137,6 +155,24 @@ func (e *Extension) Normalize() {
 	if e.Kind == "" {
 		e.Kind = KindCustom
 	}
+	e.URL = strings.TrimSpace(e.URL)
+	// An empty headers map is the same as none, and a header name is an HTTP
+	// token: a blank one is dropped rather than sent as a request line nobody can
+	// parse.
+	for name, value := range e.Headers {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			delete(e.Headers, name)
+			continue
+		}
+		if trimmed != name {
+			delete(e.Headers, name)
+			e.Headers[trimmed] = value
+		}
+	}
+	if len(e.Headers) == 0 {
+		e.Headers = nil
+	}
 	for i := range e.Args {
 		e.Args[i] = strings.TrimSpace(e.Args[i])
 	}
@@ -180,8 +216,32 @@ func (e *Extension) Validate() error {
 	}
 	// A pipe has no login shell to fall back to, so a commandless pipe would
 	// start a channel that can do nothing — refuse it here rather than at dial.
-	if e.Mode == "pipe" && e.Command == "" {
+	// An HTTP endpoint is the one exception: there the relay IS the command, and
+	// the template names a server instead of a program.
+	if e.Mode == "pipe" && e.Command == "" && e.URL == "" {
 		return fmt.Errorf("mode=pipe requires a command (a pipe channel has no fallback shell)")
+	}
+	// URL and Command are two answers to one question — what runs on the channel
+	// — so a template carrying both would have to pick one silently.
+	if e.URL != "" && e.Command != "" {
+		return fmt.Errorf("url and command are alternatives: set one, not both")
+	}
+	if e.URL != "" {
+		if err := validEndpointURL(e.URL); err != nil {
+			return err
+		}
+		// The relay runs inside termcp, so the endpoint is reached from this host
+		// and the channel has to be the in-memory one. On a remote target the name
+		// would be looked up on a machine that has never heard of it, and the
+		// failure would read as a missing command rather than as a template asking
+		// the wrong host to do the work.
+		if !sshconfig.IsInternalName(e.Target) {
+			return fmt.Errorf("url requires target = \"internal\": the relay runs inside termcp, so the endpoint is reached from this host (not from %q)", e.Target)
+		}
+		// The relay speaks HTTP; there is no channel for a pty to own.
+		if e.Mode != "" && e.Mode != "pipe" {
+			return fmt.Errorf("url requires mode=pipe (the bridge speaks a line protocol, not a terminal)")
+		}
 	}
 	for _, b := range [2]int{e.Rows, e.Cols} {
 		if b < 0 || b > 1000 {
@@ -239,6 +299,24 @@ func (f *ForwardDecl) Validate() error {
 // may leave for the runtime to pick.
 func validPort(p, lo int) bool {
 	return p >= lo && p <= 65535
+}
+
+// validEndpointURL checks an HTTP MCP endpoint the bridge will be pointed at. It
+// is a shape check, not a reachability one: what it refuses is a value that
+// cannot be a URL at all, so the author learns at save time instead of from a
+// failure three walks later.
+func validEndpointURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid url %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("url %q must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("url %q names no host", raw)
+	}
+	return nil
 }
 
 // Parse decodes TOML bytes into an Extension without validating. Callers that

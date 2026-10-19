@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/approval"
@@ -97,6 +98,22 @@ type Handler struct {
 
 	sessHub   *sessionListHub
 	notifyHub *uiNotifyHub
+
+	// viewers tracks the Web UI tabs currently attached (see viewers.go), so the
+	// page can show who is watching. Created on first use.
+	viewers    *viewerRegistry
+	viewerOnce sync.Once
+
+	// MCPConnections lists the MCP clients attached to the MCP server (see
+	// internal/mcp/connections.go). Wired by main to server.Connections; nil when
+	// no MCP server exists, in which case GET /api/clients returns no MCP rows.
+	//
+	// It returns []any rather than []mcp.Connection so this package does not
+	// import internal/mcp: that package's tests load this one's embedded assets
+	// (internal/mcp/docs_test.go), and an import in this direction would close a
+	// cycle Go rejects. The values are still mcp.Connection — the page sees JSON
+	// either way.
+	MCPConnections func() []any
 }
 
 // Register mounts /api/... and / (HTML/CSS/JS via embed.FS + http.FileServer).
@@ -133,6 +150,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	}
 	// Build metadata
 	mux.HandleFunc("GET /api/version", h.handleVersion)
+	// Who is attached to this instance: MCP clients and Web UI tabs. Not the SSH
+	// profiles of GET /api/connections — those are hosts to connect to.
+	mux.HandleFunc("GET /api/clients", h.handleListClients)
+	// Recent agent and human actions across every session, newest first. Derived
+	// from the per-shell marks the terminal timeline already reads.
+	mux.HandleFunc("GET /api/activity", h.handleActivity)
 	// Daemon management (`termcp daemon status|start|stop`): an instance is
 	// found and stopped purely over HTTP, wherever it listens.
 	mux.HandleFunc("GET /api/daemon", h.handleDaemonInfo)
@@ -235,15 +258,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		mux.Handle("/", embeddedStaticServer())
 	} else {
 		// Pure-API build (go build -tags no_webui): the browser UI is neither
-		// embedded nor routed. The three agent documents stay, each on its own
-		// path; everything else under / is a 404. The extension guide is one of
-		// them because the extension tool is always registered — a build that
-		// hands out the tool but not its guide is telling an agent to read a
-		// document it cannot fetch.
+		// embedded nor routed. The one agent document stays on its own path;
+		// everything else under / is a 404. The extension guide is deliberately NOT
+		// a document any more — `help ext` carries it, and a guide the tool can
+		// reach cannot go stale against the tool it describes.
 		docs := embeddedStaticServer()
 		mux.Handle("/api.md", docs)
-		mux.Handle("/skills.md", docs)
-		mux.Handle("/extensions.md", docs)
 	}
 }
 

@@ -42,6 +42,16 @@ func withRequestOrigin(ctx context.Context, r *http.Request) context.Context {
 	return ctx
 }
 
+// withRequestContext is what both transports install: the request's origin and
+// its namespace claim, in one function. mcp-go's context hook is a single slot
+// per transport (WithHTTPContextFunc replaces rather than stacks), so the two
+// derivations are composed here instead of being passed one after the other —
+// the second call would silently drop the first, which is a failure mode with no
+// symptom until a caller asks where this instance is or which namespace it owns.
+func withRequestContext(ctx context.Context, r *http.Request) context.Context {
+	return withCallerNamespace(withRequestOrigin(ctx, r), r)
+}
+
 // originFor resolves the origin to advertise to this particular caller: the
 // address of the request being answered, else the bind address as a last resort.
 // Resolution happens per call because the right answer is "wherever this client
@@ -55,22 +65,22 @@ func (s *Server) originFor(ctx context.Context) string {
 	return strings.TrimSuffix(s.baseURL, "/")
 }
 
-// decorateTools adds this instance's address to the description of the tool that
-// exists to reach the human. This is the one channel guaranteed to arrive: a tool
-// description that never reaches the model means the tool can never be called,
-// so no client can drop it -- unlike `instructions` (see mcpServerInstructions).
-// Only notify_user carries it, keeping tools/list from growing by more than that
-// one line. The result is per-request, so the decoration never accumulates on
-// the stored tool.
+// decorateTools adds this instance's address to the description of the single
+// entry. This is the one channel guaranteed to arrive: a tool description that
+// never reaches the model means the tool can never be called, so no client can
+// drop it -- unlike `instructions` (see mcpServerInstructions). It rides on
+// `term` because that is the only tool there is, and it is the one whose
+// `notify` directive reaches the human. The result is per-request, so the
+// decoration never accumulates on the stored tool.
 func (s *Server) decorateTools(ctx context.Context, result *mcpgo.ListToolsResult) {
 	origin := s.originFor(ctx)
 	if origin == "" {
 		return
 	}
 	for i := range result.Tools {
-		switch result.Tools[i].Name {
-		case "notify_user":
-			result.Tools[i].Description = strings.TrimSuffix(result.Tools[i].Description, " ") + " This instance's Web UI: " + origin + "/"
+		if result.Tools[i].Name != termToolName {
+			continue
 		}
+		result.Tools[i].Description = strings.TrimSuffix(result.Tools[i].Description, " ") + " This instance's Web UI: " + origin + "/"
 	}
 }

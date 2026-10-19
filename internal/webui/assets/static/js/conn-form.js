@@ -1073,11 +1073,16 @@ startUIWebSocket();
 
 // The header labels the build (the string `termcp -version` prints first). The
 // page is static, so the number is fetched once; a failure just leaves it blank.
+// The update check rides the same fetch: it needs the version, and a separate
+// request for a number this build already has would be a second source of truth
+// that could disagree with the label.
 fetch(apiPath('/api/version'))
   .then(function (r) { return r.ok ? r.json() : null; })
   .then(function (j) {
+    var version = j && j.version ? j.version : '';
     var el = document.getElementById('app-version');
-    if (el && j && j.version) el.textContent = j.version;
+    if (el && version) el.textContent = version;
+    if (typeof checkForUpdate === 'function') checkForUpdate(version);
   })
   .catch(function () {});
 

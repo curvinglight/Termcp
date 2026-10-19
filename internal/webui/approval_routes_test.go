@@ -589,3 +589,68 @@ func TestApprovedShellInputStillUsesTheShellPath(t *testing.T) {
 		t.Errorf("ExecuteOperation was called %d time(s) for a command line; it must go to the shell", ops)
 	}
 }
+
+// Review can be narrowed to particular kinds (issue #75), and the narrowing has
+// to be visible on both sides of the wire: the response says what was applied,
+// the GET report says what is in force, and the session itself refuses to gate
+// anything outside it. A scope the operator cannot confirm is a gate they cannot
+// trust.
+func TestApprovalModeScopesRoundTrip(t *testing.T) {
+	e := newApprovalEnv(t)
+
+	rr := e.do(t, http.MethodPatch, "/api/sessions/"+e.sess.ID+"/approval",
+		`{"enabled":true,"scopes":["file_write","file_delete"]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PATCH scoped enable = %d: %s", rr.Code, rr.Body.String())
+	}
+	m := e.decode(t, rr)
+	if m["approval_mode"] != true {
+		t.Fatalf("approval_mode = %v, want true", m["approval_mode"])
+	}
+	// The response echoes the applied set, so the caller does not have to re-read.
+	got, _ := m["scopes"].([]any)
+	if len(got) != 2 {
+		t.Fatalf("scopes = %v, want the two named kinds", m["scopes"])
+	}
+
+	// The session enforces exactly that.
+	if !e.sess.GatesKind(approval.KindFileWrite) || !e.sess.GatesKind(approval.KindFileDelete) {
+		t.Error("the named kinds must be held")
+	}
+	for _, k := range []approval.Kind{approval.KindShellInput, approval.KindForwardOpen} {
+		if e.sess.GatesKind(k) {
+			t.Errorf("%q was not scoped but is still held", k)
+		}
+	}
+
+	// And the GET report carries it, so a reloaded page draws the same lock.
+	rr = e.do(t, http.MethodGet, "/api/sessions/"+e.sess.ID+"/approval", "")
+	m = e.decode(t, rr)
+	got, _ = m["scopes"].([]any)
+	if len(got) != 2 {
+		t.Fatalf("GET scopes = %v, want the two named kinds", m["scopes"])
+	}
+
+	// Unscoped reports "all" rather than a full list: a client has to be able to
+	// tell "everything" from "these ten names, which happen to be everything".
+	rr = e.do(t, http.MethodPatch, "/api/sessions/"+e.sess.ID+"/approval", `{"enabled":true}`)
+	m = e.decode(t, rr)
+	if m["scopes"] != "all" {
+		t.Errorf("unscoped scopes = %v, want \"all\"", m["scopes"])
+	}
+}
+
+// A misspelled scope must be an error, not a silent no-op: a gate that quietly
+// narrows itself to nothing is worse than one that refuses the configuration.
+func TestApprovalModeRejectsUnknownScope(t *testing.T) {
+	e := newApprovalEnv(t)
+
+	rr := e.do(t, http.MethodPatch, "/api/sessions/"+e.sess.ID+"/approval",
+		`{"enabled":true,"scopes":["file_writes"]}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH with a bad scope = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+	if e.sess.ApprovalEnabled() {
+		t.Error("a refused configuration must not leave the session in review mode")
+	}
+}

@@ -103,17 +103,17 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 		ID:          id,
 		Index:       index,
 		Name:        name,
-		parent:      s,
 		execSession: execSession,
 		buf:         buf,
 		done:        make(chan struct{}),
-		Status:      api.SessionRunning,
 		CreatedAt:   clock.Now(),
-		Rows:        rows,
-		Cols:        cols,
 		enterCRLF:   s.enterCRLF,
 		mode:        mode,
 	}
+	cs.parent.Store(s)
+	cs.setStatus(api.SessionRunning)
+	cs.rows.Store(int32(rows))
+	cs.cols.Store(int32(cols))
 
 	s.shells.Store(id, cs)
 	s.shellHistory.Store(id, cs.Info())

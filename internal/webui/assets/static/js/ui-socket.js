@@ -151,6 +151,10 @@ function connectUIWebSocket() {
            branch is guarded on the key rather than the panel, so a frame that
            carries no extensions leaves a panel that is already hidden alone. */
         if (j.extensions) renderExtensionGrid(j.extensions);
+        /* Who is attached. Both lists ride this frame because both change for the
+           same reason a session does — a client attached, a tab opened — and the
+           server already wakes this loop for those. */
+        if (j.clients || j.mcp_clients) renderClients(j.mcp_clients, j.clients);
       }
       else if (j.type === 'terminal') {
         /* One window lookup per frame, not two: this branch runs once per output

@@ -42,6 +42,13 @@ type Config struct {
 	Out   io.Writer // MCP stdio output: MCP messages only
 	Err   io.Writer // diagnostics; never carries protocol messages
 
+	// Headers are extra request headers sent on every request. Token is the
+	// conventional Authorization: Bearer case and stays a field of its own
+	// because the command line has a flag for it; this is for the servers that
+	// want something else (X-Api-Key, a tenant header). A name given here is
+	// applied after the transport's own headers, so an explicit value wins.
+	Headers map[string]string
+
 	// KeepAlive, when > 0 on the streamable transport, is how often the bridge
 	// pings the instance while it has no MCP session yet. The bridge process
 	// itself is a client presence: an instance behind an idle countdown must
@@ -315,6 +322,9 @@ func (b *bridge) getMessageURL() string {
 func (b *bridge) authorize(req *http.Request) {
 	if b.cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+b.cfg.Token)
+	}
+	for name, value := range b.cfg.Headers {
+		req.Header.Set(name, value)
 	}
 }
 

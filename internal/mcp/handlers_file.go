@@ -9,6 +9,7 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
 func (s *Server) handleFileRead(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -45,9 +46,6 @@ func (s *Server) handleFileRead(ctx context.Context, request mcpgo.CallToolReque
 func (s *Server) handleFileWrite(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
-	if res, held := s.gateOperation(ctx, request, "file_write", sessionID); held {
-		return res, nil
-	}
 	remotePath := getString(args, "remote_path", "")
 	offset := int64(getFloat64(args, "offset", 0))
 	data := getString(args, "data", "")
@@ -115,9 +113,6 @@ func (s *Server) handleFileDelete(ctx context.Context, request mcpgo.CallToolReq
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
 	remotePath := getString(args, "remote_path", "")
-	if res, held := s.gateOperation(ctx, request, "file_delete", sessionID); held {
-		return res, nil
-	}
 	if sessionID == "" {
 		return toolError(CodeInvalidArgument, "%s", "session_id required"), nil
 	}
@@ -139,9 +134,6 @@ func (s *Server) handleFileRename(ctx context.Context, request mcpgo.CallToolReq
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
 	fromPath := getString(args, "from_path", "")
-	if res, held := s.gateOperation(ctx, request, "file_rename", sessionID); held {
-		return res, nil
-	}
 	toPath := getString(args, "to_path", "")
 	if sessionID == "" {
 		return toolError(CodeInvalidArgument, "%s", "session_id required"), nil
@@ -164,9 +156,6 @@ func (s *Server) handleFileMakeDir(ctx context.Context, request mcpgo.CallToolRe
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
 	remotePath := getString(args, "remote_path", "")
-	if res, held := s.gateOperation(ctx, request, "file_mkdir", sessionID); held {
-		return res, nil
-	}
 	if sessionID == "" {
 		return toolError(CodeInvalidArgument, "%s", "session_id required"), nil
 	}
@@ -203,12 +192,49 @@ func (s *Server) handleGetFileURLs(_ context.Context, request mcpgo.CallToolRequ
 	}
 	// sess.ID, not the argument: these URLs are meant to be opened, and a locator
 	// would put '#' and '://' into the path.
+	//
+	// Requested response headers ride inside the download URL (see
+	// api.AppendResponseHeaders): the caller's list is folded into the query, so
+	// whoever opens it later — curl, a browser — gets the headers without
+	// anything else passing them along.
+	q := url.Values{"path": {remotePath}}
+	headers, bad := responseHeadersArg(args)
+	if bad != nil {
+		return bad, nil
+	}
+	if err := api.AppendResponseHeaders(q, headers); err != nil {
+		return toolError(CodeInvalidArgument, "%s", err.Error()), nil
+	}
 	return jsonResult(map[string]any{
-		"download_url": s.baseURL + "/api/sessions/" + sess.ID + "/files/download?path=" + url.QueryEscape(remotePath),
+		"download_url": s.baseURL + "/api/sessions/" + sess.ID + "/files/download?" + q.Encode(),
 		"upload_url":   s.baseURL + "/api/sessions/" + sess.ID + "/files/upload",
 		"session_id":   sess.ID,
 		"remote_path":  remotePath,
 	}), nil
+}
+
+// responseHeadersArg reads the response_headers argument: a map of header name
+// to value, the shape an MCP client sends for an object-typed property. A value
+// that is not a string is refused rather than dropped: the caller would get a
+// URL that looks like it carries the header and does not.
+func responseHeadersArg(args map[string]any) (map[string]string, *mcpgo.CallToolResult) {
+	v, ok := args["response_headers"]
+	if !ok || v == nil {
+		return nil, nil
+	}
+	raw, ok := v.(map[string]any)
+	if !ok {
+		return nil, toolError(CodeInvalidArgument, "%s", "response_headers must be an object of header name to string value")
+	}
+	headers := make(map[string]string, len(raw))
+	for name, value := range raw {
+		s, ok := value.(string)
+		if !ok {
+			return nil, toolError(CodeInvalidArgument, "response header %q must be a string, got %T", name, value)
+		}
+		headers[name] = s
+	}
+	return headers, nil
 }
 
 // handleFilePerm dispatches chmod, chown, chtimes.
@@ -216,9 +242,6 @@ func (s *Server) handleFilePerm(ctx context.Context, request mcpgo.CallToolReque
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
 	action := getString(args, "action", "")
-	if res, held := s.gateOperation(ctx, request, "file_perm", sessionID); held {
-		return res, nil
-	}
 
 	if sessionID == "" {
 		return toolError(CodeInvalidArgument, "%s", "session_id required"), nil
@@ -283,9 +306,6 @@ func (s *Server) handleFileLinkOp(ctx context.Context, request mcpgo.CallToolReq
 	// readlink changes nothing, so it is not gated: putting a read behind a
 	// decision teaches a reviewer to click Accept without reading.
 	if action != "readlink" {
-		if res, held := s.gateOperation(ctx, request, "file_link", sessionID); held {
-			return res, nil
-		}
 	}
 
 	if sessionID == "" {
@@ -339,9 +359,6 @@ func (s *Server) handleFileFsOp(ctx context.Context, request mcpgo.CallToolReque
 	action := getString(args, "action", "")
 	// realpath and statvfs are reads; only truncate changes the host.
 	if action == "truncate" {
-		if res, held := s.gateOperation(ctx, request, "file_fs", sessionID); held {
-			return res, nil
-		}
 	}
 
 	if sessionID == "" {

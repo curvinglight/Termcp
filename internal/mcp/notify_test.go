@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -249,29 +251,18 @@ func TestShellNotify_SamplingDispatchToRegisteringClient(t *testing.T) {
 		t.Fatalf("initialize: %v", err)
 	}
 
-	startRes, err := cli.CallTool(ctx, callReq("session_start", map[string]any{
-		"command":    testShell(),
-		"args":       testShellIdleArgs(),
-		"mode":       "pipe",
-		"ssh_config": "internal",
-	}))
-	if err != nil || startRes.IsError {
-		t.Fatalf("session_start failed: %v %+v", err, startRes)
-	}
-	shellID := parseResult(t, startRes)["shell_id"].(string)
+	shellID := termCallTool(t, cli, ctx, "pipe internal --argv "+quoteArgv(append([]any{testShell()}, testShellIdleArgs()...)))
 
-	regRes, err := cli.CallTool(ctx, callReq("shell_notify", map[string]any{
-		"action":   "register",
-		"shell_id": shellID,
-		"channel":  "sampling",
-		"event":    "output",
-	}))
-	if err != nil || regRes.IsError {
-		t.Fatalf("shell_notify register failed: %v %+v", err, regRes)
-	}
+	termCallTool(t, cli, ctx, "watch "+shellID+" --event output --channel sampling")
 
-	// Drive the terminal-output hook the session reader would normally call.
-	s.notifyMgr.OnOutput(shellID)
+	// The rule is keyed by the channel's shell id, not by the session-level
+	// handle `pipe` returned. Drive the hook with what the session reader would
+	// call it with: the shell id the rule was registered under.
+	rules := s.notifyMgr.List("")
+	if len(rules) != 1 {
+		t.Fatalf("registered rules = %d, want 1", len(rules))
+	}
+	s.notifyMgr.OnOutput(rules[0].ShellID)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && handler.count() == 0 {
@@ -325,27 +316,18 @@ func TestShellNotify_ResourceDispatchEndToEnd(t *testing.T) {
 		}
 	})
 
-	startRes, err := cli.CallTool(ctx, callReq("session_start", map[string]any{
-		"command":    testShell(),
-		"args":       testShellIdleArgs(),
-		"mode":       "pipe",
-		"ssh_config": "internal",
-	}))
-	if err != nil || startRes.IsError {
-		t.Fatalf("session_start failed: %v %+v", err, startRes)
-	}
-	shellID := parseResult(t, startRes)["shell_id"].(string)
+	shellID := termCallTool(t, cli, ctx, "pipe internal --argv "+quoteArgv(append([]any{testShell()}, testShellIdleArgs()...)))
 
-	regRes, err := cli.CallTool(ctx, callReq("shell_notify", map[string]any{
-		"action":   "register",
-		"shell_id": shellID,
-		"channel":  "resource",
-		"event":    "output",
-	}))
-	if err != nil || regRes.IsError {
-		t.Fatalf("shell_notify register failed: %v %+v", err, regRes)
-	}
+	// The resource channel is the one a client without sampling can receive, so it
+	// is registered explicitly; the default channel is decided by the client's
+	// declared capabilities.
+	termCallTool(t, cli, ctx, "watch "+shellID+" --event output --channel resource")
 
+	// The notification manager indexes rules by the bare shell id, while the
+	// directive language addresses the short handle. Both name the same channel, so
+	// the drive below uses the id the manager knows — and so does the expected uri,
+	// which is built from the id, not from the handle a caller copied.
+	shellID = shellIDOf(t, s, shellID)
 	s.notifyMgr.OnOutput(shellID)
 
 	select {
@@ -517,4 +499,61 @@ func TestNotifyUser_NoNotifierStillSucceeds(t *testing.T) {
 	if _, ok := m["hint"]; !ok {
 		t.Fatal("expected a hint when nothing was delivered")
 	}
+}
+
+// termCallTool drives the single MCP tool through a real client and returns the
+// handle it reports, or fails. It is how these tests keep exercising the wire
+// instead of the in-process handler: the point of an end-to-end notification test
+// is the transport, and a test that bypassed it would pass with no dispatch at
+// all.
+func termCallTool(t *testing.T, cli *client.Client, ctx context.Context, cmd string) string {
+	t.Helper()
+	res, err := cli.CallTool(ctx, callReq(termToolName, map[string]any{"cmd": cmd}))
+	if err != nil || res.IsError {
+		t.Fatalf("term(%q) failed: %v %+v", cmd, err, res)
+	}
+	text := res.Content[0].(mcpgo.TextContent).Text
+	for _, line := range strings.Split(text, "\n") {
+		if h, ok := strings.CutPrefix(line, "Handle: "); ok {
+			return h
+		}
+	}
+	// A command that needs no handle (watch, close) has none; the caller ignores
+	// the value in that case.
+	return ""
+}
+
+// shellIDOf resolves a short handle to the bare shell id the internal managers
+// index by. The directive language addresses <session>[:N] because that is what a
+// human can copy; the notify manager keys on the channel's own id. index 1 is
+// elided from the handle, so the primary shell is the one a bare id names.
+func shellIDOf(t *testing.T, s *Server, handle string) string {
+	t.Helper()
+	sessPart, idxPart, hasIdx := strings.Cut(handle, ":")
+	sess, bad := s.requireSession(sessPart)
+	if bad != nil {
+		t.Fatalf("handle %q does not resolve: %+v", handle, bad)
+	}
+	if !hasIdx {
+		if sh := sess.PrimaryShell(); sh != nil {
+			return sh.ID
+		}
+		t.Fatalf("handle %q: session has no primary shell", handle)
+	}
+	sh := sess.GetChildShell(idxPart)
+	if sh == nil {
+		t.Fatalf("handle %q: no shell %q", handle, idxPart)
+	}
+	return sh.ID
+}
+
+// quoteArgv renders each argv word as a shell-quoted word, so `pipe --argv` receives the
+// program and its flags without the parser splitting them.
+func quoteArgv(argv []any) string {
+	parts := make([]string, 0, len(argv))
+	for _, a := range argv {
+		s := fmt.Sprint(a)
+		parts = append(parts, "'"+strings.ReplaceAll(s, "'", `'\''`)+"'")
+	}
+	return strings.Join(parts, " ")
 }

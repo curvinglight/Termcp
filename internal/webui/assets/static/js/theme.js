@@ -113,7 +113,7 @@ function normalizeThemeConfig(value) {
   var terminal = {};
   if (!source || typeof source !== 'object' || Array.isArray(source)) return terminal;
   if (typeof source.transparent === 'boolean') terminal.transparent = source.transparent;
-  var ranges = { fontSize: [6, 72], lineHeight: [1, 3], letterSpacing: [0, 10], opacity: [0, 1] };
+  var ranges = { fontSize: [6, 72], lineHeight: [1, 3], letterSpacing: [0, 10], opacity: [0, 1], minimumContrastRatio: [1, 21] };
   Object.keys(ranges).forEach(function (key) {
     var n = source[key];
     if (typeof n === 'number' && isFinite(n) && n >= ranges[key][0] && n <= ranges[key][1]) terminal[key] = n;
@@ -161,6 +161,7 @@ function setThemeTerminalConfig(config) {
     fontFamily: '--terminal-font-family', fontSize: '--terminal-font-size',
     fontWeight: '--terminal-font-weight', fontWeightBold: '--terminal-font-weight-bold',
     lineHeight: '--terminal-line-height', letterSpacing: '--terminal-letter-spacing', opacity: '--terminal-background-opacity',
+    minimumContrastRatio: '--terminal-minimum-contrast-ratio',
     background: '--terminal-background', foreground: '--xterm-foreground', cursor: '--xterm-cursor',
     cursorAccent: '--xterm-cursor-accent', selectionBackground: '--xterm-selection'
   };

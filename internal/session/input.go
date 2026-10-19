@@ -67,7 +67,7 @@ func appendEnter(data []byte, crlf bool) []byte {
 // the browser can learn that an agent — whose keystrokes never touch the page — is
 // driving.
 func (cs *ChildShell) logInput(src InputSource, submit bool) {
-	p := cs.parent
+	p := cs.parent.Load()
 	if p == nil {
 		return
 	}

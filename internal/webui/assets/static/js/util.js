@@ -272,13 +272,100 @@ function browserSystemNotify(n) {
   if (!('Notification' in window)) return;
   if (Notification.permission === 'granted') {
     fireBrowserNotify(n);
-  } else if (Notification.permission === 'default' && typeof Notification.requestPermission === 'function') {
-    // A WS-pushed notification is not a user gesture, so Chrome may keep
-    // permission at 'default' instead of prompting; best-effort only.
-    Notification.requestPermission().then(function (perm) {
-      if (perm === 'granted') fireBrowserNotify(n);
-    }).catch(function () {});
   }
+  /* No else: a WS-pushed notification is not a user gesture, so a prompt opened
+     from here would be ignored by Chrome and Safari. armPermissionRequest() has
+     already asked on the first click, which is the only place the prompt can
+     work. Someone who never granted it gets the toast and nothing else. */
+}
+
+/* --- asking for permission, from inside a gesture -------------------------
+ *
+ * Browser permissions that matter to a page that is not in front of the user —
+ * desktop notifications, and audio for them — are only granted in response to
+ * a user gesture. This page's notifications arrive from a WebSocket, which is
+ * not one, so asking at arrival time silently did nothing: `Notification.
+ * permission` stayed 'default' forever and every toast was screen-only. The
+ * audio context had the mirror-image problem, staying 'suspended' until
+ * something resumed it.
+ *
+ * So the ask happens on the first real input the page sees, whatever it is.
+ * Once per page load, and only while permission is still undecided: nagging a
+ * person who already said no is how a page gets blocked outright.
+ */
+var _permissionArmed = false;
+function armPermissionRequest() {
+  if (_permissionArmed) return;
+  _permissionArmed = true;
+  var ask = function () {
+    document.removeEventListener('pointerdown', ask, true);
+    document.removeEventListener('keydown', ask, true);
+    if ('Notification' in window && Notification.permission === 'default' &&
+        typeof Notification.requestPermission === 'function') {
+      Notification.requestPermission().catch(function () {});
+    }
+    /* An AudioContext starts only when it is created inside a gesture. Creating
+       one earlier and calling resume() here does not lift it — a context born
+       outside a gesture stays 'suspended' no matter how many clicks follow — so
+       the context is opened *now*, not at the first notification. */
+    ensureNotifyAudio();
+    if (_notifyAudio && _notifyAudio.state === 'suspended' && typeof _notifyAudio.resume === 'function') {
+      _notifyAudio.resume().catch(function () {});
+    }
+  };
+  document.addEventListener('pointerdown', ask, true);
+  document.addEventListener('keydown', ask, true);
+}
+
+/* --- notification sound ---------------------------------------------------
+ *
+ * Generated rather than shipped as an audio file: two short notes cost ~30
+ * lines and no asset, no fetch, and no autoplay policy puzzle (an <audio> the
+ * browser never got a gesture for is as silent as no sound at all). A person
+ * who does not want it mutes the tab.
+ *
+ * Every call is a no-op until a gesture has opened the context, which is why
+ * armPermissionRequest() exists: the first click on the page is what makes this
+ * work, and it is the same click that asks for notifications.
+ */
+var _notifyAudio = null;
+function ensureNotifyAudio() {
+  if (_notifyAudio || typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return _notifyAudio;
+  try {
+    _notifyAudio = new (typeof AudioContext !== 'undefined' ? AudioContext : webkitAudioContext)();
+  } catch (e) { _notifyAudio = null; }
+  return _notifyAudio;
+}
+
+/** Two ascending notes, the shape a chat app uses for "something arrived".
+ *  Level changes the pitch, not the volume: an error reads as more urgent
+ *  without being loud enough to startle. Returns true when it actually played,
+ *  so a caller (or a test) can tell a muted context from a working one. */
+function playNotifySound(level) {
+  var ctx = ensureNotifyAudio();
+  if (!ctx) return false;
+  if (ctx.state === 'suspended' && typeof ctx.resume === 'function') ctx.resume().catch(function () {});
+  if (ctx.state !== 'running') return false;
+  var notes = level === 'error' || level === 'warn' ? [740, 560] : [660, 880];
+  var at = ctx.currentTime;
+  notes.forEach(function (hz, i) {
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = hz;
+    /* A bare oscillator clicks. Ramping the gain up and back down over ~90 ms
+       is the smallest envelope that removes it, and it also keeps the sound
+       from competing with whatever the person is listening to. */
+    var t0 = at + i * 0.13;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(0.14, t0 + 0.02);
+    gain.gain.linearRampToValueAtTime(0, t0 + 0.11);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + 0.12);
+  });
+  return true;
 }
 
 function fireBrowserNotify(n) {
@@ -396,6 +483,7 @@ function showUiNotify(n) {
   uiNotifyStackEl().appendChild(card);
 
   markSessNotified(sid);
+  playNotifySound(level);
   browserSystemNotify(n);
 }
 
@@ -569,3 +657,13 @@ function paintSessionTileWindowMarkers() {
 }
 
 // ---- session tab bar (multi-session switching) ----
+
+/* Permissions and audio both need a gesture, and this module is loaded before
+   anything in the page can produce a notification, so arming here catches the
+   first click or keypress. Deliberately the last statement in the file: it must
+   run after the state it reads (`_permissionArmed`, `_notifyAudio`) has been
+   initialised, and a module-level call placed beside those declarations would
+   run before them — `var` hoists the binding but not the assignment, so the
+   flag would be cleared right after being set and the gesture would be armed
+   twice. */
+armPermissionRequest();

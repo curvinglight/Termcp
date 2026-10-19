@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -515,4 +516,191 @@ func TestShellOutputAcceptsLocator(t *testing.T) {
 	} else if code, msg := decodeToolError(t, bad); code != CodeShellNotFound || !strings.Contains(msg, "out of range") {
 		t.Fatalf("closed out-of-range: code=%q msg=%q", code, msg)
 	}
+}
+
+// TestShortHandleResolvesLikeTheLocator is the invariant behind the guide's
+// "copy a handle from ps into the next command".
+//
+// `ps`, `info` and the `pty`/`pipe` replies all print `<session>[:N]`, and the
+// empty call advertises that form as the thing to copy. Before this it did not
+// resolve at all — only the locator spelling did — so the printed handle was a
+// dead end and `run <sid>:2` answered shell_not_found.
+//
+// The two spellings must therefore address the SAME channel: adding the short
+// form may not move, shadow or renumber what the Web UI's copy buttons emit.
+func TestShortHandleResolvesLikeTheLocator(t *testing.T) {
+	s := newTestServer(t)
+	res, err := s.handleStartSession(context.Background(), makeRequest(map[string]any{
+		"command":    testShell(),
+		"args":       testInteractiveShellArgs(),
+		"mode":       "pty",
+		"ssh_config": "internal",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := parseResult(t, res)
+	sid := m["session_id"].(string)
+	primary := m["shell_id"].(string)
+	second := startSubShell(t, s, sid)
+
+	for _, tc := range []struct {
+		handle string
+		want   string
+	}{
+		{sid, primary},        // bare session id → primary channel
+		{sid + ":1", primary}, // explicit primary
+		{sid + ":2", second},  // the second channel
+		{"termcp://#" + sid, primary},
+		{"termcp://#" + sid + ":1", primary},
+		{"termcp://#" + sid + ":2", second},
+	} {
+		cs, bad := s.requireShell(tc.handle)
+		if bad != nil {
+			t.Fatalf("requireShell(%q) failed: %s", tc.handle, bad.Content[0].(mcpgo.TextContent).Text)
+		}
+		if cs.ID != tc.want {
+			t.Errorf("requireShell(%q) = %q, want %q", tc.handle, cs.ID, tc.want)
+		}
+	}
+
+	// Writes and reads go through the same door, so a handle that resolves for a
+	// read must be the one a run writes to.
+	if out := termText(t, s, map[string]any{"cmd": "run " + sid + ":2 echo short-handle"}); !strings.Contains(out, "short-handle") {
+		t.Fatalf("run %s:2 did not reach the channel:\n%s", sid, out)
+	}
+
+	// A channel number that names nothing stays an error on both spellings —
+	// the short form must not become a silent fallback to the primary.
+	for _, handle := range []string{sid + ":9", "termcp://#" + sid + ":9"} {
+		if _, bad := s.requireShell(handle); bad == nil {
+			t.Errorf("requireShell(%q) resolved; an out-of-range channel must fail", handle)
+		} else if code, _ := decodeToolError(t, bad); code != CodeShellNotFound {
+			t.Errorf("requireShell(%q) code = %q, want %q", handle, code, CodeShellNotFound)
+		}
+	}
+
+	// info/close resolve a short handle as a session too, so the namespace and
+	// admission gates see the same container the I/O routes it to.
+	sess, bad := s.requireSession(sid + ":2")
+	if bad != nil || sess.ID != sid {
+		t.Fatalf("requireSession(%q) = %v (bad=%v), want session %q", sid+":2", sess, bad, sid)
+	}
+}
+
+// TestEveryHandleDoorAgrees pins the property that replaced the per-entry-point
+// spelling rules: a handle means the same thing at EVERY door that accepts one.
+//
+// This is the regression test for the design flaw behind the whitelist bypass. The
+// spellings were re-derived in half a dozen places (requireShell, requireSession,
+// the guard's resolvers, resolveShellIDForRead, channelExitState,
+// transcript.Resolve), so each one could drift — and `sid:N`, the form every
+// reply prints, was missing from most of them. A door that does not understand a
+// spelling does not say so; it answers "not found" (or, in the guard, skips the
+// session entirely), which is how a wrong answer becomes a silent one.
+//
+// So the check is not "each door works" but "all doors agree", including on the
+// negative cases.
+func TestEveryHandleDoorAgrees(t *testing.T) {
+	s := newTestServer(t)
+	res, err := s.handleStartSession(context.Background(), makeRequest(map[string]any{
+		"command":    testShell(),
+		"args":       testInteractiveShellArgs(),
+		"mode":       "pty",
+		"ssh_config": "internal",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := parseResult(t, res)
+	sid := m["session_id"].(string)
+	primary := m["shell_id"].(string)
+	second := startSubShell(t, s, sid)
+	sess := s.sessMgr.Get(sid)
+	if sess == nil {
+		t.Fatal("session missing")
+	}
+
+	// spellings of the second channel: the raw id, the short handle ps prints, and
+	// the locator the Web UI emits — plus the primary's equivalents.
+	for _, tc := range []struct {
+		handle string
+		want   string
+		sess   string
+	}{
+		{sid, primary, sid},
+		{sid + ":1", primary, sid},
+		{sid + ":2", second, sid},
+		{"termcp://#" + sid, primary, sid},
+		{"termcp://#" + sid + ":1", primary, sid},
+		{"termcp://#" + sid + ":2", second, sid},
+		{second, second, sid},
+		{primary, primary, sid},
+	} {
+		// door 1: the write path.
+		cs, bad := s.requireShell(tc.handle)
+		if bad != nil {
+			t.Errorf("requireShell(%q) failed: %s", tc.handle, textOf(bad))
+			continue
+		}
+		if cs.ID != tc.want {
+			t.Errorf("requireShell(%q) = %q, want %q", tc.handle, cs.ID, tc.want)
+		}
+
+		// door 2: the read path, which must not disagree with the write path.
+		got, bad := s.resolveShellIDForRead(sess, tc.handle)
+		if bad != nil {
+			t.Errorf("resolveShellIDForRead(%q) failed: %s", tc.handle, textOf(bad))
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("resolveShellIDForRead(%q) = %q, want %q", tc.handle, got, tc.want)
+		}
+
+		// door 3: the session resolver.
+		gotSess, bad := s.requireSession(tc.handle)
+		if bad != nil || gotSess == nil {
+			t.Errorf("requireSession(%q) failed: %v", tc.handle, bad)
+			continue
+		}
+		if gotSess.ID != tc.sess {
+			t.Errorf("requireSession(%q) = %q, want %q", tc.handle, gotSess.ID, tc.sess)
+		}
+
+		// door 4: the whitelist gate. It must SEE the session for every spelling;
+		// resolving nothing is a bypass, not a miss.
+		if gs := (toolGuard{server: s}).sessionForSessionID(tc.handle); gs == nil || gs.ID != tc.sess {
+			t.Errorf("sessionForSessionID(%q) = %v, want session %q", tc.handle, gs, tc.sess)
+		}
+		if gs := (toolGuard{server: s}).sessionForShellID(tc.handle); gs == nil || gs.ID != tc.sess {
+			t.Errorf("sessionForShellID(%q) = %v, want session %q", tc.handle, gs, tc.sess)
+		}
+	}
+
+	// Negative cases must agree too: an out-of-range channel is an error at every
+	// door, never a silent fallback to the primary.
+	for _, handle := range []string{sid + ":9", "termcp://#" + sid + ":9"} {
+		if cs, bad := s.requireShell(handle); bad == nil {
+			t.Errorf("requireShell(%q) resolved to %q; an out-of-range channel must fail", handle, cs.ID)
+		}
+		if got, bad := s.resolveShellIDForRead(sess, handle); bad == nil {
+			t.Errorf("resolveShellIDForRead(%q) resolved to %q; must fail", handle, got)
+		}
+		if (toolGuard{server: s}).sessionForSessionID(handle) != nil {
+			// The session DOES exist, so the guard seeing it is correct here: the
+			// channel is what is out of range, and the handler reports that.
+			t.Logf("guard sees session for %q (correct: the channel, not the session, is missing)", handle)
+		}
+	}
+}
+
+// textOf renders a tool error result for test messages.
+func textOf(res *mcpgo.CallToolResult) string {
+	if res == nil || len(res.Content) == 0 {
+		return "<nil>"
+	}
+	if tc, ok := res.Content[0].(mcpgo.TextContent); ok {
+		return tc.Text
+	}
+	return fmt.Sprint(res.Content[0])
 }

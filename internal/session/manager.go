@@ -258,11 +258,17 @@ func (m *Manager) RenameSSHConfig(fromName, toName string) {
 // open cards keep rendering the old state until something else happens to
 // refresh them (the lock would appear not to have worked).
 func (m *Manager) EnableApproval(id string, need int, timeout time.Duration) error {
+	return m.EnableApprovalScoped(id, need, timeout, nil)
+}
+
+// EnableApprovalScoped is EnableApproval with an explicit set of gated kinds
+// (see Session.EnableApprovalScoped). Nil scopes gate everything.
+func (m *Manager) EnableApprovalScoped(id string, need int, timeout time.Duration, scopes []approval.Kind) error {
 	s := m.Get(id)
 	if s == nil {
 		return fmt.Errorf("session %q not found", id)
 	}
-	if err := s.EnableApproval(need, timeout); err != nil {
+	if err := s.EnableApprovalScoped(need, timeout, scopes); err != nil {
 		return err
 	}
 	s.mu.Lock()

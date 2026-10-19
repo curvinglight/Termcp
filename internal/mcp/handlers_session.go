@@ -11,7 +11,7 @@ import (
 
 func (s *Server) handleListSessions(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	all := s.sessMgr.ListAll()
-	return jsonResult(map[string]any{"sessions": listableSessions(all)}), nil
+	return jsonResult(map[string]any{"sessions": listableSessions(all, callerNamespace(ctx))}), nil
 }
 
 func (s *Server) handleGetSessionInfo(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {

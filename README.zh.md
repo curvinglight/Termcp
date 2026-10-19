@@ -140,7 +140,7 @@ npm 包装器会下载对应平台的预编译二进制（可用 `TERMCP_VERSION
 | **SSH 配置** | 中心化 TOML 存储，支持批量导入/导出、只存内存的临时主机、连接测试，以及编辑/复制/改名。 |
 | **审阅模式** | 按会话开启的审批闸门：Agent 的每一次写入都等人裁决。 |
 | **探测** | `shell_detect` 找出目标机自己的交互式 shell，而不是拿本机 `PATH` 去猜。 |
-| **Agent Skill** | 实例自带 `/skills.md`，Agent 用纯 `curl` 即可驱动全部能力。 |
+| **单一 REST 入口** | `POST /api/term` 与 MCP 工具说同一套指令，Agent 用纯 `curl` 即可驱动全部能力。 |
 
 ## 安全模型
 
@@ -157,7 +157,6 @@ npm 包装器会下载对应平台的预编译二进制（可用 `TERMCP_VERSION
 | [`docs/cli.md`](./docs/cli.md) | 全部 flag 与子命令、能力闸门、认证。 |
 | [`docs/clients.md`](./docs/clients.md) | 四个入口的完整接法：MCP 传输、stdio 桥、Skill 安装、REST 示例。 |
 | [`docs/deploy.md`](./docs/deploy.md) | Docker、多阶段构建、Compose、纯 API 构建。 |
-| [`docs/mcp-tools.md`](./docs/mcp-tools.md) | 全部 31 个 MCP 工具：参数、返回形状、错误码。 |
 | [`docs/api.md`](./docs/api.md) | REST 端点、WebSocket 帧、定位符解析。 |
 | [`docs/architecture.md`](./docs/architecture.md) | 会话内核、四个入口、存储。 |
 | [`docs/design/`](./docs/design) | 设计记录：Web UI、资源模型、会话存储、字体栈、移动端终端。 |

@@ -98,10 +98,15 @@ func TestApprovalUIIsWired(t *testing.T) {
 		t.Error("ui-socket.js must route the approval push event")
 	}
 
-	// And the session snapshot must carry the flag to opened windows.
+	// And the session snapshot must carry the flag to opened windows, along with
+	// what the switch covers: a narrowed scope has to reach the lock's tooltip, or
+	// a lock that says "review on" would imply typing is gated when it is not.
 	sess := readAssetLF(t, "static/js/sessions.js")
-	if !strings.Contains(sess, "applyApprovalMode(w, !!s.approval_mode)") {
+	if !strings.Contains(sess, "applyApprovalMode(w, !!s.approval_mode") {
 		t.Error("sessions.js must apply review mode to open windows from the snapshot")
+	}
+	if !strings.Contains(sess, "applyApprovalMode(w, !!s.approval_mode, s.approval_scopes)") {
+		t.Error("the snapshot's approval_scopes must reach applyApprovalMode")
 	}
 }
 

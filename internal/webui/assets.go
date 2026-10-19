@@ -37,7 +37,7 @@ func SetThemesDir(dir string) {
 }
 
 // Assets returns the asset FS rooted at the assets directory. Besides the
-// browser UI it holds the agent-facing documents (api.md, skills.md) that the
+// browser UI it holds the agent-facing document (api.md) that the
 // static server publishes
 // and that the MCP server registers as resources.
 func Assets() fs.FS {

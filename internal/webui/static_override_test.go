@@ -67,7 +67,6 @@ func TestAssetsMissingDirServesEmbedEntirely(t *testing.T) {
 	for _, tc := range []struct{ url, asset string }{
 		{"/", "index.html"},
 		{"/api.md", "api.md"},
-		{"/skills.md", "skills.md"},
 		{"/static/css/app.css", "static/css/app.css"},
 		{"/static/js/util.js", "static/js/util.js"},
 	} {
@@ -95,7 +94,6 @@ func TestAssetsNoOverrideIsByteIdenticalToEmbed(t *testing.T) {
 	for _, tc := range []struct{ url, asset string }{
 		{"/", "index.html"},
 		{"/api.md", "api.md"},
-		{"/skills.md", "skills.md"},
 	} {
 		want, err := fs.ReadFile(embeddedOnlyFS(t), tc.asset)
 		if err != nil {
@@ -227,7 +225,7 @@ func TestAssetsMissingEverywhereStays404(t *testing.T) {
 // TestAssetsOverrideAppliesToDocs pins that the browser UI and the agent-facing
 // documents read one FS: main wires mcpSrv.SetDocsFS(webui.Assets()), so an
 // overridden api.md is the same bytes over HTTP (/api.md) and as an MCP
-// resource, while the untouched skills.md still falls back to the embed.
+// resource, while an untouched document still falls back to the embed.
 func TestAssetsOverrideAppliesToDocs(t *testing.T) {
 	dir := t.TempDir()
 	const api = "# operator api reference\n\ncustom deployment notes\n"
@@ -253,13 +251,6 @@ func TestAssetsOverrideAppliesToDocs(t *testing.T) {
 		t.Error("HTTP /api.md and webui.Assets() disagree; the UI and the MCP docs must show the same bytes")
 	}
 
-	wantSkill, err := fs.ReadFile(embeddedOnlyFS(t), "skills.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if code, body := serveAsset(t, mux, "/skills.md"); code != http.StatusOK || body != string(wantSkill) {
-		t.Errorf("GET /skills.md = %d, %d bytes; want 200 with the embedded skill", code, len(body))
-	}
 }
 
 // TestAssetsRejectsEscapingPaths pins that the override directory cannot be read

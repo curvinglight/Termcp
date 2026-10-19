@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/transcript"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
@@ -25,7 +26,7 @@ func (h *Handler) handleCreateShell(w http.ResponseWriter, r *http.Request) {
 	// pipe shell for one purpose must not be reachable by a second channel nobody
 	// whitelisted (a plain login shell inside the same container would carry the
 	// container's whole environment).
-	if restRefuseTool(w, h.Sessions.Get(parentID), "shell_open") {
+	if restRefuseTool(w, h.Sessions.Get(parentID), capability.ShellOpen) {
 		return
 	}
 
@@ -126,7 +127,7 @@ func (h *Handler) writeOutputRange(w http.ResponseWriter, r *http.Request, id st
 	// the same decision — the same reconciliation the MCP guard makes. This route is
 	// the REST twin of shell_output, and a read is as gated as a write: the
 	// whitelist is about reachability, not direction.
-	if restRefuseTool(w, h.Sessions.Get(src.SessID), "shell_output") {
+	if restRefuseTool(w, h.Sessions.Get(src.SessID), capability.ShellOutput) {
 		return
 	}
 
@@ -224,7 +225,7 @@ func (h *Handler) handleCloseShell(w http.ResponseWriter, r *http.Request) {
 	// and both spellings are passed so a caller cannot walk around the refusal by
 	// naming the session instead. What gets closed below is unchanged: a session id
 	// still finds no shell to close, as before.
-	if sess := h.sessionOwning(id, id); restRefuseTool(w, sess, "shell_close") {
+	if sess := h.sessionOwning(id, id); restRefuseTool(w, sess, capability.ShellClose) {
 		return
 	}
 	// Internal primary shell: tab close is a no-op (process outlives the tab).
@@ -254,7 +255,7 @@ func (h *Handler) handleClosePrimaryShell(w http.ResponseWriter, r *http.Request
 	// only held for one of them would be a matter of how the caller spelled the id.
 	// The close logic stays keyed on the session id, so a shell id is still the
 	// no-op it was.
-	if restRefuseTool(w, h.sessionOwning(sessionID, sessionID), "shell_close") {
+	if restRefuseTool(w, h.sessionOwning(sessionID, sessionID), capability.ShellClose) {
 		return
 	}
 	sess := h.Sessions.Get(sessionID)

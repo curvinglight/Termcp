@@ -14,7 +14,7 @@ import (
 // browser UI would show up here.
 func TestNoWebUIBuildCarriesDocsOnly(t *testing.T) {
 	fsys := Assets()
-	for _, want := range []string{"api.md", "skills.md", "extensions.md"} {
+	for _, want := range []string{"api.md"} {
 		if _, err := fs.Stat(fsys, want); err != nil {
 			t.Errorf("Assets() is missing %s: %v", want, err)
 		}

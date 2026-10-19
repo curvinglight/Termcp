@@ -39,6 +39,17 @@
           <button type="button" class="lang-opt" data-lang="zh-Hant" onclick="chooseLang('zh-Hant')">繁中</button>
         </span>
       </span>
+      <!-- Who is connected to this instance (MCP clients and Web UI tabs). A
+           details/summary like the theme switch beside it: the content is a small
+           list that is only interesting on demand, and closing it needs no JS.
+           No count badge: the number of clients is a question the panel answers
+           when it is opened, and a badge that is usually 0 or 1 is one more thing
+           in the header asking to be read. The label is the whole trigger, and it
+           is the first thing to go on a narrow header (see workspace.css). -->
+      <details class="clients-menu" id="clients-menu">
+        <summary class="clients-btn" data-i18n-title="clients.label" title="Connected clients"><span class="clients-icon" aria-hidden="true"></span><span class="clients-label" data-i18n="clients.label">Clients</span></summary>
+        <div class="clients-panel"><div id="clients-body" role="list"></div><p id="clients-empty" class="clients-empty" data-i18n="clients.empty">Nothing connected yet.</p></div>
+      </details>
       <a href="api.html" class="api-nav-link" title="MCP, HTTP API and Agent skill integration docs" data-i18n-title="nav.api.title" aria-label="MCP, HTTP API and Agent skill integration docs" data-i18n-aria="nav.api.title">
         <svg class="api-nav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M2.25 2.5h3.1c1.13 0 2.05.92 2.05 2.05v8.2c-.5-.62-1.22-.98-2.05-.98h-3.1z"/>
@@ -545,5 +556,7 @@
   <script src="static/js/dialogs.js"></script>
   <script src="static/js/conn-form.js"></script>
   <script src="static/js/extensions.js"></script>
+  <script src="static/js/update-notice.js"></script>
+  <script src="static/js/clients.js"></script>
 </body>
 </html>

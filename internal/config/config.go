@@ -34,12 +34,10 @@ type Config struct {
 	AssetsDir           string // external static assets directory; files there override the embedded UI/docs (default: $TERMCP_ASSETS_DIR or ~/.termcp/assets)
 	LogLevel            string // log verbosity: debug|info|warn|error (default: "info")
 	NoInternal          bool   // disable the built-in loopback SSH profile
-	MCPManageSSHConfigs bool   // enable MCP tools for creating/editing/deleting SSH configs (default: false)
+	MCPManageSSHConfigs bool   // enable the profile write actions (create/edit/copy/delete) (default: false)
 	AuthToken           string // plaintext HTTP auth token ($TERMCP_AUTH_TOKEN); mutually exclusive with AuthHash
 	AuthHash            string // salted SHA-256 token hash ($TERMCP_AUTH_HASH); generate with `termcp --gen-auth-hash`
 	DisableAuth         bool   // force HTTP authentication off (--disable-auth / $TERMCP_DISABLE_AUTH_TOKEN)
-	MCPDeferTools       bool   // opt-in: mark low-frequency MCP tools defer_loading; off lists every tool eagerly
-	MCPDeferToolsLevel  string // defer_loading level: off (default) | partial | all; overrides the bool flag
 }
 
 // Default returns a Config with sensible defaults.

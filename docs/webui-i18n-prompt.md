@@ -145,7 +145,7 @@ go test -count=1 ./...        # 必须先全绿，否则后面分不清是谁的
 ### 3.3 明确不动
 
 - ❌ `internal/webui/assets/api.html`（本次不翻）
-- ❌ `assets/api.md`、`assets/skills.md`（面向 agent，不翻）
+- ❌ `assets/api.md`（面向 agent，不翻）
 - ❌ 任何 Go 业务逻辑（`handler.go` / `approval.go` 的 `http.Error(...)` 英文诊断信息保持原样透传）
 - ❌ `static/xterm/*`（第三方）
 - ❌ `escapeHtml()` 的行为、`formatSize()` 的单位、`fmtTime()`（已用 `toLocaleString()`，本就跟随浏览器）
@@ -624,7 +624,7 @@ P0 完成后**先停下来给人看一眼效果**再继续 P1——
 
 ## 10. 明确不做（YAGNI，不要自行扩大范围）
 
-- ❌ 不翻 `api.html`、`api.md`、`skills.md`
+- ❌ 不翻 `api.html`、`api.md`
 - ❌ 不做 `?lang=` URL 参数
 - ❌ 不做服务端 `Accept-Language` 协商、不做 Cookie 存储
 - ❌ 不翻译服务端 `http.Error(...)` 的英文诊断信息（保持原文透传，可搜索性更好）

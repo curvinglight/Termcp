@@ -515,8 +515,16 @@ function updateReviewLockTitle(win) {
   var btn = win.querySelector('.shell-review-lock');
   if (!btn) return;
   var n = (window._approvalCounts || {})[win._parentSid] || 0;
-  btn.title = (win._approvalMode ? t('review.lock.on') : t('review.lock.off')) +
-    (n ? t('review.lock.waitingCount', { count: n }) : t('review.lock.clickOpen'));
+  /* A narrowed scope is named in the tooltip. "Review on" is true of a session
+     that only holds file writes, and a lock that says only that would have the
+     reviewer believe typing is gated when it is not — the one thing a lock must
+     never be vague about. "all" is the default and needs no explanation. */
+  var mode = win._approvalMode ? t('review.lock.on') : t('review.lock.off');
+  var scopes = win._approvalScopes;
+  if (win._approvalMode && Array.isArray(scopes) && scopes.length) {
+    mode += t('review.lock.scoped', { scopes: scopes.join(', ') });
+  }
+  btn.title = mode + (n ? t('review.lock.waitingCount', { count: n }) : t('review.lock.clickOpen'));
 }
 
 /** setReviewSheetOpen shows or hides the queue panel.
@@ -611,7 +619,7 @@ function applyApprovalModeFromSnapshot(win, sessionId) {
   for (var i = 0; i < list.length; i++) {
     if (list[i] && list[i].id === sessionId) {
       win._approvalNeed = list[i].approval_need || 1;
-      applyApprovalMode(win, !!list[i].approval_mode);
+      applyApprovalMode(win, !!list[i].approval_mode, list[i].scopes);
       found = true;
       break;
     }
@@ -634,7 +642,7 @@ function refreshApprovalState(win, sessionId) {
       // opened another for the same session in the meantime.
       if (win._parentSid !== sessionId) return;
       win._approvalNeed = j.need || 1;
-      applyApprovalMode(win, !!j.approval_mode);
+      applyApprovalMode(win, !!j.approval_mode, j.scopes);
     })
     .catch(function () {});
 }
@@ -675,9 +683,12 @@ function paintReviewLabels(win) {
  *  view. The title-bar lock carries the state — closed and amber while the AI's
  *  writes wait for a decision, open and neutral while they do not — and the tab
  *  bar carries how many are waiting (see applyApprovalCounts). */
-function applyApprovalMode(win, on) {
+function applyApprovalMode(win, on, scopes) {
   if (!win) return;
   win._approvalMode = !!on;
+  // What the switch covers, for the lock's tooltip. Absent/"all" means every
+  // gated kind, which is the default and what an older payload reports.
+  win._approvalScopes = Array.isArray(scopes) ? scopes : null;
   paintReviewLabels(win);
   // The number is not on the lock: it belongs to the pane tabs, where it can say
   // WHICH face is waiting (a file write vs a command) instead of only how many.
@@ -793,6 +804,13 @@ function termcpTerminalOptions() {
     fontWeightBold: weight('--terminal-font-weight-bold', 'bold'),
     lineHeight: number('--terminal-line-height', 1),
     letterSpacing: number('--terminal-letter-spacing', 0),
+    /* Passed to xterm, which repairs a cell it cannot read by moving the text
+       colour's lightness away from the background it was painted on. `ls`
+       colours an other-writable directory blue on green, and eight of the
+       sixteen ANSI slots are the UI's semantic tokens — a hue picked to read
+       on the page, not on another ANSI colour. Without this the light theme
+       renders that cell at a ratio of 1.00 (identical colours). */
+    minimumContrastRatio: number('--terminal-minimum-contrast-ratio', 4.5),
     allowTransparency: !!_themeTerminal.transparent,
     theme: termcpXtermTheme()
   };

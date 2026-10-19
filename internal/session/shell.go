@@ -13,11 +13,11 @@ import (
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
-// Lock ordering: shellStateMu -> mu -> stdinMu (and shellStateMu -> cs.mu).
-// Never acquire in reverse order. s.mu and cs.mu are leaves; shellStateMu is
-// only taken by session-level transitions (close/DEAD/terminate, new shells).
-// The manager-assigned callbacks and the per-shell closed flag are atomics and
-// need no lock (see field docs below).
+// Lock ordering: shellStateMu -> stdinMu. Never acquire in reverse order.
+// shellStateMu is only taken by session-level transitions (close/DEAD/terminate,
+// new shells), and stdinMu serializes writes only. Per-shell state that changes
+// after creation is atomic, so there is no per-shell lock to order: a reader
+// never blocks the exit watcher (see the field docs below).
 
 // ChildShell is a lightweight shell channel sharing the parent Session's SSH connection.
 //
@@ -35,19 +35,21 @@ type ChildShell struct {
 	// test, or one restored from a manifest written before Index existed).
 	Index       int
 	Name        string
-	parent      *Session // nil if not yet attached to a session
+	parent      atomic.Pointer[Session] // nil if not yet attached to a session
 	execSession *sshclient.ExecSession
 	buf         *buffer.Buffer
 	done        chan struct{}
 	closeOnce   sync.Once
 	cleanupOnce sync.Once // guards explicit removal from the parent shell map
-	mu          sync.RWMutex
 	stdinMu     sync.Mutex
-	Status      api.SessionStatus
-	CreatedAt   int64 // Unix ms
-	ExitCode    *int
-	Rows        int
-	Cols        int
+	// status is stored through atomic.Value so the zero value stays "" (a shell
+	// built directly in a test), matching the old plain field. Load returns nil
+	// until the constructor publishes running.
+	status    atomic.Value // api.SessionStatus
+	CreatedAt int64        // Unix ms
+	exitCode  atomic.Pointer[int]
+	rows      atomic.Int32
+	cols      atomic.Int32
 	// enterCRLF selects the byte sequence for pipe-mode enter.
 	// It reflects the target shell family (unix vs cmd/powershell), not the
 	// termcp host OS, so cross-OS SSH sessions send the right line ending.
@@ -58,7 +60,7 @@ type ChildShell struct {
 	pipeWG sync.WaitGroup
 	// deliberateClose is set by TerminateShell/CloseChildShell so the exit
 	// watcher does not treat an intentional channel close as SSH disconnect.
-	deliberateClose bool
+	deliberateClose atomic.Bool
 	// closed marks a shell the user explicitly closed (CloseChildShell). A
 	// closed shell is a DELETE, not a DEAD transition: it is removed from the
 	// live map AND the per-shell history snapshot. Atomic so the exit watcher
@@ -67,39 +69,60 @@ type ChildShell struct {
 	closed atomic.Bool
 }
 
+// statusValue reads the lifecycle status. The zero ChildShell reports "", the
+// same value the old field held before a constructor ran.
+func (cs *ChildShell) statusValue() api.SessionStatus {
+	if v := cs.status.Load(); v != nil {
+		return v.(api.SessionStatus)
+	}
+	return ""
+}
+
+// setStatus publishes a lifecycle transition.
+func (cs *ChildShell) setStatus(st api.SessionStatus) { cs.status.Store(st) }
+
+// exitCodeValue returns a copy of the process exit code, or nil while running.
+func (cs *ChildShell) exitCodeValue() *int {
+	p := cs.exitCode.Load()
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// setExitCode publishes the process exit code.
+func (cs *ChildShell) setExitCode(code int) { cs.exitCode.Store(&code) }
+
 // ParentSessionID returns the parent Session ID for this child shell.
 func (cs *ChildShell) ParentSessionID() string {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	if cs.parent != nil {
-		return cs.parent.ID
+	if p := cs.parent.Load(); p != nil {
+		return p.ID
 	}
 	return ""
 }
 
 // Info returns a snapshot of the child shell's public metadata.
 func (cs *ChildShell) Info() api.Session {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
 	s := api.Session{
 		ID:        cs.ID,
 		Index:     cs.Index,
 		Name:      cs.Name,
 		Mode:      cs.mode,
-		Status:    cs.Status,
-		Rows:      cs.Rows,
-		Cols:      cs.Cols,
+		Status:    cs.statusValue(),
+		Rows:      int(cs.rows.Load()),
+		Cols:      int(cs.cols.Load()),
 		CreatedAt: cs.CreatedAt,
 		UpdatedAt: clock.Now(),
 	}
-	if cs.ExitCode != nil {
-		v := *cs.ExitCode
-		s.ExitCode = &v
-	}
+	s.ExitCode = cs.exitCodeValue()
 	return s
 }
 
-// Done returns a channel that closes when the child shell process exits.
+// Done returns a channel that closes once the shell is finalized: the process
+// has exited, its output is drained and sealed, and Status/ExitCode are
+// published. A waiter that wakes on it may read the final transcript and exit
+// code without racing the exit watcher.
 func (cs *ChildShell) Done() <-chan struct{} {
 	return cs.done
 }
@@ -117,9 +140,7 @@ func (cs *ChildShell) SendTerminalBytes(data []byte, pressEnter bool) error {
 // records what was sent, which is the only way to explain a transcript where the
 // screen does not show the input (password prompts, full-screen programs).
 func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src InputSource) error {
-	cs.mu.RLock()
-	status := cs.Status
-	cs.mu.RUnlock()
+	status := cs.statusValue()
 	if status != api.SessionRunning {
 		return fmt.Errorf("process has %s, cannot send input", status)
 	}
@@ -167,9 +188,7 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 	if err != nil {
 		return err
 	}
-	cs.mu.RLock()
-	status := cs.Status
-	cs.mu.RUnlock()
+	status := cs.statusValue()
 	if status != api.SessionRunning {
 		return fmt.Errorf("process has %s, cannot send input", status)
 	}
@@ -193,53 +212,43 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 // a terminal: a pipe shell has no TTY, so this reports an error instead of
 // forwarding a meaningless window-change to the transport.
 func (cs *ChildShell) ResizePty(rows, cols int) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
 	if cs.mode != api.ModePTY {
 		return fmt.Errorf("PTY resize only available in pty mode (shell mode %q)", cs.mode)
 	}
-	if cs.Status != api.SessionRunning {
+	if cs.statusValue() != api.SessionRunning {
 		return fmt.Errorf("process not running")
 	}
 	if err := cs.execSession.ResizePty(rows, cols); err != nil {
 		return err
 	}
-	cs.Rows = rows
-	cs.Cols = cols
+	cs.rows.Store(int32(rows))
+	cs.cols.Store(int32(cols))
 	return nil
 }
 
 // TerminateShell closes the child shell's exec session channel without touching the
 // shared SSH client (CloseSessionOnly). The client lifetime is managed by the parent Session.
 func (cs *ChildShell) TerminateShell() {
-	cs.mu.Lock()
-	if cs.Status != api.SessionRunning {
-		cs.mu.Unlock()
+	if cs.statusValue() != api.SessionRunning {
 		return // already terminated
 	}
-	cs.deliberateClose = true
-	cs.mu.Unlock()
+	cs.deliberateClose.Store(true)
 
 	cs.execSession.CloseSessionOnly()
 	select {
 	case <-cs.execSession.Done():
 	case <-time.After(2 * time.Second):
 	}
-	cs.mu.Lock()
-	cs.Status = api.SessionExited
-	code := -1
-	cs.ExitCode = &code
-	cs.mu.Unlock()
-	cs.mu.RLock()
-	parent := cs.parent
-	cs.mu.RUnlock()
-	if parent != nil {
-		cs.retainHistory(parent)
-	}
 	// Flush output already handed to the process before sealing the buffer,
-	// otherwise the tail of the transcript is dropped.
+	// otherwise the tail of the transcript is dropped. The exit state is
+	// published only after the bytes are final (same rule as the watcher).
 	cs.drainPipes()
 	cs.buf.Close()
+	cs.setExitCode(-1)
+	cs.setStatus(api.SessionExited)
+	if parent := cs.parent.Load(); parent != nil {
+		cs.retainHistory(parent)
+	}
 	// Ensure Done() channel is closed for any waiters (closeOnce prevents races with the exit watcher goroutine).
 	cs.closeOnce.Do(func() { close(cs.done) })
 }

@@ -74,7 +74,7 @@ func runDaemonHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --data-dir              (start, stdio) where the launched instance keeps its")
 	fmt.Fprintln(w, "                          data; its log is written to <data-dir>/termcp.log.")
 	fmt.Fprintln(w, "  --assets, --log-level, --no-internal, --mcp-manage-ssh-configs,")
-	fmt.Fprintln(w, "  --mcp-defer-tools, --disable-auth")
+	fmt.Fprintln(w, "  --disable-auth")
 	fmt.Fprintln(w, "                          (start, stdio) inherited by the launched instance, so")
 	fmt.Fprintln(w, "                          it serves what `termcp` with the same flags would.")
 	fmt.Fprintln(w)

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/open-mcp-ai/termcp/internal/directive"
 )
 
 // oneShotMarker is printed by the one-shot command so the archived transcript can
@@ -158,68 +160,37 @@ func TestSessionStartRejectsAnUnknownOnExit(t *testing.T) {
 }
 
 // TestOnExitIsDiscoverableOnTheWire pins the other half of the feature: a policy
-// the model cannot see is one it will never use. The description budget is tight
-// (tool descriptions sat 4 bytes under the limit before this change), so the
-// sentence naming on_exit is exactly the kind of thing a later edit trims away to
-// make room -- and the feature would then exist but stay unused.
-//
-// It reads tools/list, not the source: compactToolDescriptions replaces the
-// description declared at registration, so asserting on tools.go would pass while
-// the model saw nothing.
+// the model cannot see is one it will never use. The rule is asserted through
+// what the model actually reads — help pipe, reached over the wire — rather than
+// against the source table, because a flag documented in one place and trimmed in
+// another would leave the feature existing but unused.
 func TestOnExitIsDiscoverableOnTheWire(t *testing.T) {
-	s := New(nil, nil, nil, nil, "test")
-	ctx := originContext("http://127.0.0.1:18765")
+	// `on-exit` used to be a property of the session_start tool schema. There is
+	// one tool now, so the flag's semantics live in the directive that takes it,
+	// and the assertion follows the knowledge instead of the old wire shape.
+	s := newTestServer(t)
+	help := termText(t, s, map[string]any{"cmd": "help pipe"})
 
-	var start, oneShotDesc string
-	var enumValues []any
-	for _, tool := range listTools(t, s, ctx) {
-		if tool.Name != "session_start" {
-			continue
-		}
-		start = tool.Description
-		prop, ok := tool.InputSchema.Properties["on_exit"].(map[string]any)
-		if !ok {
-			t.Fatalf("session_start has no on_exit property; got %v", tool.InputSchema.Properties)
-		}
-		if d, ok := prop["description"].(string); ok {
-			oneShotDesc = d
-		}
-		enumValues, _ = prop["enum"].([]any)
-	}
-	if start == "" {
-		t.Fatal("session_start missing from tools/list")
-	}
-
-	// The tool description must name the argument: that is what a model reads when
-	// it decides how to start a one-shot command.
-	if !strings.Contains(start, "on_exit") {
-		t.Errorf("session_start description never mentions on_exit:\n%s", start)
-	}
-	if !strings.Contains(start, `"close"`) {
-		t.Errorf("session_start description mentions on_exit but not the value that fixes the pile-up:\n%s", start)
-	}
-
-	// The property carries the semantics, including that the default is the old
-	// behaviour (a model must not think every session now auto-closes).
-	if !strings.Contains(oneShotDesc, "keep") || !strings.Contains(oneShotDesc, "close") {
-		t.Errorf("on_exit property description does not explain both values:\n%s", oneShotDesc)
-	}
-	if !strings.Contains(oneShotDesc, "archiv") {
-		t.Errorf("on_exit property description does not say what close does:\n%s", oneShotDesc)
-	}
-
-	// The wire enum and the handler's validation must agree: an enum offering a
-	// value the handler refuses is a documented-but-broken argument.
-	if len(enumValues) != 2 {
-		t.Fatalf("on_exit enum = %v, want keep+close", enumValues)
-	}
-	got := map[string]bool{}
-	for _, v := range enumValues {
-		if str, ok := v.(string); ok {
-			got[str] = true
+	for _, want := range []string{"on-exit", "keep", "close"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help pipe misses %q; a model deciding how to start a one-shot command reads this:\n%s", want, help)
 		}
 	}
-	if !got["keep"] || !got["close"] {
-		t.Errorf("on_exit enum = %v, want keep+close", enumValues)
+
+	// The flag must be accepted by the parser, and an unknown value must not be
+	// silently coerced: the handler validates it, so a typo is an error rather
+	// than a session that quietly stays in the running list.
+	if _, err := directive.Parse("pipe internal --on-exit close"); err != nil {
+		t.Errorf("--on-exit is not accepted by the pipe grammar: %v", err)
+	}
+	if _, err := directive.Parse("pipe internal --on-exit bogus"); err != nil {
+		t.Errorf("--on-exit must parse even with an unknown value (the handler validates it): %v", err)
+	}
+
+	// And the default is still the old behaviour: a model must not think every
+	// session now auto-closes.
+	guide := termText(t, s, map[string]any{})
+	if !strings.Contains(guide, "pipe") {
+		t.Errorf("the guide does not mention pipe, so a caller never learns how to open a channel:\n%s", guide)
 	}
 }

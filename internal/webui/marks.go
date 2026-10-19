@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/open-mcp-ai/termcp/internal/capability"
+
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -49,7 +51,7 @@ type marksResponse struct {
 // for the last span.
 func (h *Handler) handleShellMarks(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	sessionID, shellID, ok := h.marksTarget(w, id, "message")
+	sessionID, shellID, ok := h.marksTarget(w, id, capability.SessionMessage)
 	if !ok {
 		http.Error(w, "shell not found: "+id, http.StatusNotFound)
 		return
