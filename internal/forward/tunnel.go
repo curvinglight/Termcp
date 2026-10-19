@@ -19,15 +19,8 @@ import (
 // The ctx is monitored; when cancelled all active connections are closed.
 // Returns a local listener and a cancel function for lifecycle management.
 func LocalForwardSSH(ctx context.Context, client *ssh.Client, remoteHost string, remotePort int, localPort int) (*ForwardInfo, net.Listener, error) {
-	if localPort == 0 {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, nil, err
-		}
-		localPort = l.Addr().(*net.TCPAddr).Port
-		l.Close()
-	}
-
+	// localPort 0 means "let the kernel pick": bind once and keep it. Probe-then-bind
+	// leaves a window for another process to take the port (see dynamicLocal).
 	localListener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
 	if err != nil {
 		return nil, nil, err
@@ -138,14 +131,8 @@ func RemoteForwardSSH(ctx context.Context, client *ssh.Client, agentHost string,
 // The ctx is used to stop the SOCKS5 server and close active connections.
 // Returns a listener for lifecycle management.
 func DynamicForwardSSH(ctx context.Context, client *ssh.Client, localPort int) (*ForwardInfo, net.Listener, error) {
-	if localPort == 0 {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, nil, err
-		}
-		localPort = l.Addr().(*net.TCPAddr).Port
-		l.Close()
-	}
+	// localPort 0 means "let the kernel pick": bind once and keep it. Probe-then-bind
+	// leaves a window for another process to take the port (see dynamicLocal).
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
 	if err != nil {
 		return nil, nil, err
@@ -172,14 +159,14 @@ func DynamicForwardSSH(ctx context.Context, client *ssh.Client, localPort int) (
 
 // dynamicLocal starts a SOCKS5 proxy using net.Dial from termcp itself.
 func (fm *ForwardManager) dynamicLocal(sessionID, sshConfig string, localPort int) (*ForwardInfo, error) {
-	if localPort == 0 {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, err
-		}
-		localPort = l.Addr().(*net.TCPAddr).Port
-		l.Close()
-	}
+	// localPort 0 means "let the kernel pick": bind once and keep that listener.
+	//
+	// The obvious way -- Listen(":0"), read the port, Close, Listen(":N") -- is a
+	// race: the port is free when probed and can be taken by anything else before
+	// the real bind, which is exactly how this failed on CI
+	// ("bind: address already in use"). Holding the first listener removes the
+	// window instead of narrowing it, and on Linux the kernel also avoids
+	// handing out the same ephemeral port twice while it is held.
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
 	if err != nil {
 		return nil, err
