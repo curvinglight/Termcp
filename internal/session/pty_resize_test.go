@@ -52,15 +52,22 @@ func TestSession_PtyResizeReachesChild(t *testing.T) {
 
 	// askSize runs the size command in the shell and returns until the child
 	// reports exactly rows x cols (empty when it never does).
+	//
+	// Send ONCE, then only read. The earlier version re-sent the command on every
+	// poll iteration, so a slow first read (Windows PowerShell taking longer than
+	// the 300ms read window to echo anything) queued a second copy behind the
+	// first. The output then contained several interleaved echoes of the command
+	// and never matched the marker — a failure that looked like "the resize did
+	// not reach the child" but was the test typing over itself.
 	askSize := func(rows, cols int) string {
 		t.Helper()
 		want := marker + fmt.Sprintf("%d %d", rows, cols)
+		if err := s.PrimaryShell().SendTerminalBytes([]byte(testShellInput(sizeCmd)), false); err != nil {
+			t.Fatalf("send size command: %v", err)
+		}
 		var out string
-		deadline := time.Now().Add(3 * time.Second)
+		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			if err := s.PrimaryShell().SendTerminalBytes([]byte(testShellInput(sizeCmd)), false); err != nil {
-				t.Fatalf("send size command: %v", err)
-			}
 			chunk, _ := s.ReadOutput(context.Background(), 300*time.Millisecond, true, 0, 0)
 			out += chunk
 			if strings.Contains(out, want) {
