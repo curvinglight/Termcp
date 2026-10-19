@@ -81,7 +81,15 @@ func sweepStaleBrowserProfiles() {
 // isolated profile and browser lifetime belong to this probe on every OS.
 func renderedProbeDOM(t *testing.T, chrome, path string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	// The budget covers launching Chrome, loading the page and rendering the
+	// result. 30s was measured on a warm local machine and expired on a loaded CI
+	// runner (the read deadline fired at Page.navigate before the probe had
+	// produced anything), which is a slow machine, not a broken probe.
+	//
+	// 60s rather than more: the package has to fit inside the workflow's -timeout
+	// 240s together with every other test here, so a probe that needs longer than
+	// this would be a probe measuring the machine rather than the rendering.
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	profile := browserProfileDir(t)
 	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox",

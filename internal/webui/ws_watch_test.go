@@ -1,6 +1,8 @@
 package webui
 
 import (
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -101,7 +103,15 @@ func TestWatchAddActuallySubscribes(t *testing.T) {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		var m map[string]any
 		if err := conn.ReadJSON(&m); err != nil {
-			continue // read timeout: the channel is quiet, keep waiting
+			// A read timeout means the channel is quiet, which is expected while
+			// waiting for output — but it is NOT the only way ReadJSON fails, and
+			// treating every failure as "quiet" re-reads a dead connection. gorilla
+			// panics on that ("repeated read on failed websocket connection"), which
+			// turned a slow CI runner into a panic instead of a test failure.
+			if isTimeout(err) {
+				continue
+			}
+			t.Fatalf("reading the watch channel: %v", err)
 		}
 		if m["type"] != "terminal" {
 			continue
@@ -133,4 +143,12 @@ func shellArgsForTest() []string {
 		return nil
 	}
 	return []string{"-i"}
+}
+
+// isTimeout reports whether err is a read deadline, as opposed to the
+// connection being gone. Only the first kind means "keep waiting": re-reading a
+// closed WebSocket panics inside gorilla rather than returning again.
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
