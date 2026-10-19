@@ -703,10 +703,16 @@ func TestReconcilerStatusUnknownName(t *testing.T) {
 // shortLivedCommand runs for longer than the probe's grace window and then exits
 // on its own: the shape of a process that starts fine and dies later.
 func shortLivedCommand() (string, []string) {
+	// Long enough that the reconciler reports the extension available BEFORE the
+	// process exits. With 2s, a slow CI runner could spend that whole window
+	// starting the process, so "died after being reported available" never
+	// happened — the test then waited for a transition it had already missed and
+	// failed with a stale `available` status. The test is about noticing a death,
+	// not about being fast.
 	if runtime.GOOS == "windows" {
-		return "powershell.exe", []string{"-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 2"}
+		return "powershell.exe", []string{"-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 6"}
 	}
-	return "bash", []string{"-c", "sleep 2"}
+	return "bash", []string{"-c", "sleep 6"}
 }
 
 // TestReconcilerReopensChannelOfDeadProcess pins what sharing means for a process
@@ -730,7 +736,12 @@ func TestReconcilerReopensChannelOfDeadProcess(t *testing.T) {
 
 	// The process exits on its own; nothing notifies the reconciler, so the walk is
 	// what notices (nudged here rather than waited for, to keep the test quick).
-	deadline := time.Now().Add(12 * time.Second)
+	//
+	// 25s, not 12s: the countdown does not start until the process has been reported
+	// available, and it then has to outlive shortLivedCommand (6s) plus however long
+	// a CI runner takes to start PowerShell, notice the exit, and reopen a channel.
+	// 12s left no margin once the first two were slow.
+	deadline := time.Now().Add(25 * time.Second)
 	for {
 		r.Trigger()
 		cur, _ := r.Status("short-lived")
