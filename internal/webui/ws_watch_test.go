@@ -19,6 +19,11 @@ import (
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
+// readDeadline bounds one wait for a frame while watching, and is also the
+// yardstick for "did that timeout arrive when it should have": a quiet connection
+// reports one only after the full deadline, a dead one reports immediately.
+const readDeadline = 2 * time.Second
+
 // TestWatchAddActuallySubscribes drives the Web UI socket the way a browser tab
 // does and asks the only question that matters to a user: once a tab says it is
 // watching a channel, does that channel's output reach the tab?
@@ -95,23 +100,28 @@ func TestWatchAddActuallySubscribes(t *testing.T) {
 		t.Fatalf("input: %v", err)
 	}
 
-	// The output pump coalesces, so the marker may arrive split across frames;
-	// accumulate the payloads rather than requiring one frame to hold it all.
+	// ONE DEADLINE FOR THE WHOLE WAIT, NOT A POLL PER FRAME.
+	//
+	// gorilla caches the first read error on a connection and NEVER clears it: one
+	// expired read deadline poisons the socket for the rest of its life, and every
+	// later read returns that same error in microseconds without touching the wire.
+	// A poll loop with a 2s deadline per iteration therefore kills its own connection
+	// the first time it waits for output that has not arrived yet -- and then spins,
+	// because the failures come back instantly.
+	//
+	// So the deadline is armed once, for the whole budget. A timeout at the end means
+	// the marker never showed up, which is the thing worth failing on. A non-timeout
+	// error means the peer is gone. Nothing in between needs a heuristic.
 	deadline := time.Now().Add(20 * time.Second)
 	var got strings.Builder
-	for time.Now().Before(deadline) {
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(deadline)
+	for {
 		var m map[string]any
 		if err := conn.ReadJSON(&m); err != nil {
-			// A read timeout means the channel is quiet, which is expected while
-			// waiting for output — but it is NOT the only way ReadJSON fails, and
-			// treating every failure as "quiet" re-reads a dead connection. gorilla
-			// panics on that ("repeated read on failed websocket connection"), which
-			// turned a slow CI runner into a panic instead of a test failure.
 			if isTimeout(err) {
-				continue
+				t.Fatalf("the marker never arrived within %v; got %q", 20*time.Second, got.String())
 			}
-			t.Fatalf("reading the watch channel: %v", err)
+			t.Fatalf("reading the watch channel: %v (got %q)", err, got.String())
 		}
 		if m["type"] != "terminal" {
 			continue
@@ -125,7 +135,6 @@ func TestWatchAddActuallySubscribes(t *testing.T) {
 			return // the tab received the channel's live output
 		}
 	}
-	t.Fatalf("watch_add did not deliver the channel's output; got %q", got.String())
 }
 
 // shellForTest and shellArgsForTest pick a shell that stays alive and echoes,
