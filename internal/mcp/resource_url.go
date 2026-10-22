@@ -68,7 +68,7 @@ func (s *Server) sessionFromParsed(p *parsedResourceURL) (*session.Session, erro
 	}
 	if sess := s.sessMgr.Get(p.SessionID); sess != nil {
 		if sess.Info().Status != api.SessionRunning {
-			return nil, fmt.Errorf("session %q is closed (status %s); its output is read-only via shell_output", p.SessionID, sess.Info().Status)
+			return nil, fmt.Errorf("session %q is closed (status %s); its output is still readable with `read`", p.SessionID, sess.Info().Status)
 		}
 		return sess, nil
 	}

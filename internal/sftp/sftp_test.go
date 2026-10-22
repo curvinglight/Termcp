@@ -51,3 +51,29 @@ func TestNormalizeReadRange(t *testing.T) {
 		})
 	}
 }
+
+// TestSiblingOfKeepsTheRemoteSpelling pins the temp-name builder against the failure
+// that only showed up on Windows CI.
+//
+// `path.Dir("C:\Users\x\agent.conf")` is ("." , the whole string), because path only
+// knows "/". The temporary file therefore came out as
+// `.C:\Users\x\agent.conf.termcp-replace-…` and the server rejected the name — a
+// replace that worked on two platforms and failed on the third, in the platform that
+// spells paths differently.
+func TestSiblingOfKeepsTheRemoteSpelling(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		// The platform that broke: backslashes, drive letter, no forward slash.
+		{`C:\Users\x\agent.conf`, `C:\Users\x\.agent.conf.S`},
+		// POSIX, unchanged behaviour.
+		{"/tmp/agent.conf", "/tmp/.agent.conf.S"},
+		// A bare name has no directory to join.
+		{"agent.conf", ".agent.conf.S"},
+		// At the root the separator must survive, or the path stops being absolute.
+		{"/agent.conf", "/.agent.conf.S"},
+		{`C:\agent.conf`, `C:\.agent.conf.S`},
+	} {
+		if got := siblingOf(tc.in, ".S"); got != tc.want {
+			t.Errorf("siblingOf(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

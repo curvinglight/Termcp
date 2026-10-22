@@ -2,133 +2,10 @@ package mcp
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
-
-	"github.com/open-mcp-ai/termcp/internal/notify"
 )
-
-// handleShellNotifyOps dispatches register, unregister, and list actions on shell_notify.
-func (s *Server) handleShellNotifyOps(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	if s.notifyMgr == nil {
-		return toolError(CodeNotConfigured, "%s", "notification manager not initialized"), nil
-	}
-	args := request.GetArguments()
-	action := strings.TrimSpace(getString(args, "action", ""))
-
-	switch action {
-	case "register":
-		shellID := strings.TrimSpace(getString(args, "shell_id", ""))
-		if shellID == "" {
-			return toolError(CodeInvalidArgument, "%s", "shell_id is required for register"), nil
-		}
-		// Validate that the shell exists in running sessions
-		shell, bad := s.requireShell(shellID)
-		if bad != nil {
-			return bad, nil
-		}
-
-		channelStr := strings.TrimSpace(getString(args, "channel", ""))
-		var channel notify.Channel
-		switch channelStr {
-		case "resource":
-			channel = notify.ChannelResource
-		case "sampling":
-			channel = notify.ChannelSampling
-		case "":
-			channel = defaultNotifyChannel(ctx)
-		default:
-			return toolError(CodeInvalidArgument, "%s", "channel must be resource or sampling"), nil
-		}
-
-		eventStr := strings.TrimSpace(getString(args, "event", "output"))
-		var event notify.Event
-		switch eventStr {
-		case "exit":
-			event = notify.EventExit
-		case "silence":
-			event = notify.EventSilence
-		case "output":
-			event = notify.EventOutput
-		default:
-			return toolError(CodeInvalidArgument, "%s", "event must be exit, silence, or output"), nil
-		}
-
-		// nil when the caller did not say, a pointer to the value they did say.
-		// `--for 0` used to be indistinguishable from omitting the flag, so the one
-		// request for "do not wait at all" silently became a three-second wait.
-		var silenceSec *int
-		if _, ok := args["silence_seconds"]; ok {
-			v := int(getFloat64(args, "silence_seconds", 0))
-			silenceSec = &v
-		}
-
-		sessionID := shell.ParentSessionID()
-		// Capture the MCP client session that registered this rule so sampling
-		// notifications can be delivered later from timer/exit goroutines, where
-		// the dispatch context no longer carries the client session.
-		target := mcpserver.ClientSessionFromContext(ctx)
-		// Register under the resolved shell id: the rule's ShellID is what the
-		// cascade matches on (ClearShell from the exit watcher, and the session's
-		// ResourceScope) and what the broadcast URI carries
-		// (termcp://shells/<shell_id>). A locator stored here would make both the
-		// cleanup and the URI name something that is not a shell.
-		rule, err := s.notifyMgr.Register(sessionID, shell.ID, channel, event, silenceSec, target)
-		if err != nil {
-			return toolError(CodeOperationFailed, "%s", err.Error()), nil
-		}
-		// Attach at creation: session deletion releases the rule (and stops its
-		// timers) through the session's ResourceScope.
-		if sess := s.sessMgr.Get(sessionID); sess != nil {
-			sess.AttachCleanup(func() { s.notifyMgr.Unregister(rule.ID) })
-		}
-		out := map[string]any{
-			"ok":       true,
-			"rule_id":  rule.ID,
-			"shell_id": rule.ShellID,
-			"channel":  string(rule.Channel),
-			"event":    string(rule.Event),
-		}
-		// Echo the wait the rule actually took, for silence rules. Without it the
-		// caller cannot tell "0 was honoured" from "0 was quietly replaced by the
-		// default", which is exactly the ambiguity the pointer above removed from the
-		// input side.
-		if rule.Event == notify.EventSilence {
-			out["silence_seconds"] = rule.SilenceSec
-		}
-		return jsonResult(out), nil
-
-	case "unregister":
-		ruleID := strings.TrimSpace(getString(args, "rule_id", ""))
-		if ruleID == "" {
-			return toolError(CodeInvalidArgument, "%s", "rule_id is required for unregister"), nil
-		}
-		if !s.notifyMgr.Unregister(ruleID) {
-			return toolError(CodeRuleNotFound, "%s", fmt.Sprintf("rule %q not found", ruleID)), nil
-		}
-		return jsonResult(map[string]any{"ok": true, "rule_id": ruleID}), nil
-
-	case "list":
-		shellID := strings.TrimSpace(getString(args, "shell_id", ""))
-		// An optional filter: resolve it so a locator selects the same rules a bare
-		// id would, instead of matching nothing.
-		if shellID != "" {
-			shell, bad := s.requireShell(shellID)
-			if bad != nil {
-				return bad, nil
-			}
-			shellID = shell.ID
-		}
-		rules := s.notifyMgr.List(shellID)
-		return jsonResult(map[string]any{"rules": rules}), nil
-
-	default:
-		return toolError(CodeInvalidArgument, "%s", "action must be register, unregister, or list"), nil
-	}
-}
 
 // maxNotifyMessageLen caps the message shown in the Web UI toast.
 const maxNotifyMessageLen = 2000
@@ -192,17 +69,4 @@ func (s *Server) handleNotifyUser(ctx context.Context, request mcpgo.CallToolReq
 		out["hint"] = "no Web UI tab is open; the notification was not displayed"
 	}
 	return jsonResult(out), nil
-}
-
-// defaultNotifyChannel picks the transport when the caller omitted --channel:
-// sampling when the client declared support for it, resource otherwise. This
-// is what makes the documented "omit it and the server decides" a default
-// instead of an error.
-func defaultNotifyChannel(ctx context.Context) notify.Channel {
-	if cs := mcpserver.ClientSessionFromContext(ctx); cs != nil {
-		if ci, ok := cs.(mcpserver.SessionWithClientInfo); ok && ci.GetClientCapabilities().Sampling != nil {
-			return notify.ChannelSampling
-		}
-	}
-	return notify.ChannelResource
 }

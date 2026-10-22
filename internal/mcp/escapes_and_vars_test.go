@@ -3,6 +3,7 @@ package mcp
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRawControlBytesRefusedByDefault pins the escape gate: unquoted control bytes
@@ -120,16 +121,26 @@ func TestVarsASTSubstitution(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := termText(t, s, map[string]any{
-				"cmd": tc.cmd,
-				"vars": tc.env,
-			})
-			if strings.HasPrefix(got, "TERM/1 4") {
-				t.Fatalf("call failed with 4xx:\n%s", got)
+			// POLL, DO NOT RACE THE SHELL. One `run` returns what has arrived by the
+			// time the window closes, which under -race on a loaded runner can be the
+			// echoed command line alone — the output was coming, the caller just asked
+			// too early. Every attempt is a fresh `run`, so a late first read still
+			// sees the result once the shell has produced it.
+			var got string
+			for i := 0; i < 40; i++ {
+				got = termText(t, s, map[string]any{
+					"cmd":  tc.cmd,
+					"vars": tc.env,
+				})
+				if strings.HasPrefix(got, "TERM/1 4") {
+					t.Fatalf("call failed with 4xx:\n%s", got)
+				}
+				if strings.Contains(got, tc.want) {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
 			}
-			if !strings.Contains(got, tc.want) {
-				t.Errorf("output does not contain %q:\n%s", tc.want, got)
-			}
+			t.Errorf("output does not contain %q:\n%s", tc.want, got)
 		})
 	}
 }
@@ -141,7 +152,7 @@ func TestVarsMissingVariableIsRefused(t *testing.T) {
 	s := newTestServer(t)
 
 	got := termText(t, s, map[string]any{
-		"cmd": "run a:1 echo $UNDEFINED_VAR",
+		"cmd":  "run a:1 echo $UNDEFINED_VAR",
 		"vars": map[string]any{"OTHER": "x"},
 	})
 	if !strings.HasPrefix(got, "TERM/1 4") {
@@ -161,10 +172,10 @@ func TestVarsArgumentTypeValidation(t *testing.T) {
 		args map[string]any
 		want string
 	}{
-		{"vars is array", map[string]any{"cmd": "ps", "vars": []any{"a"}}, "vars must be an object"},
-		{"vars is string", map[string]any{"cmd": "ps", "vars": "FOO=1"}, "vars must be an object"},
-		{"vars value is number", map[string]any{"cmd": "ps", "vars": map[string]any{"FOO": 42}}, "vars[FOO] must be a string"},
-		{"vars key is empty", map[string]any{"cmd": "ps", "vars": map[string]any{"": "val"}}, "empty name"},
+		{"vars is array", map[string]any{"cmd": "ls", "vars": []any{"a"}}, "vars must be an object"},
+		{"vars is string", map[string]any{"cmd": "ls", "vars": "FOO=1"}, "vars must be an object"},
+		{"vars value is number", map[string]any{"cmd": "ls", "vars": map[string]any{"FOO": 42}}, "vars[FOO] must be a string"},
+		{"vars key is empty", map[string]any{"cmd": "ls", "vars": map[string]any{"": "val"}}, "empty name"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := s.Term(t.Context(), "", tc.args).Text()

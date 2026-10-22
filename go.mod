@@ -1,6 +1,6 @@
 module github.com/open-mcp-ai/termcp
 
-go 1.25.9
+go 1.27.3
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -9,10 +9,11 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/mark3labs/mcp-go v0.50.0
 	github.com/pkg/sftp v1.13.10
-	golang.org/x/crypto v0.50.0
-	golang.org/x/sys v0.43.0
-	golang.org/x/term v0.42.0
-	golang.org/x/text v0.36.0
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.47.0
+	golang.org/x/term v0.45.0
+	golang.org/x/text v0.41.0
+	mvdan.cc/sh/v3 v3.11.0
 )
 
 require (
@@ -26,5 +27,4 @@ require (
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/spf13/cast v1.7.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	mvdan.cc/sh/v3 v3.11.0 // indirect
 )

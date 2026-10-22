@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -39,7 +40,7 @@ func withLogging(name string, h toolHandler, s *Server) toolHandler {
 		baseAttrs := []any{"tool", name}
 		baseAttrs = appendSafeArgs(baseAttrs, request)
 
-		slog.DebugContext(ctx, "tool call start", baseAttrs...)
+		slog.InfoContext(ctx, "tool call start", baseAttrs...)
 		result, err := h(ctx, request)
 		durMs := time.Since(start).Milliseconds()
 
@@ -70,7 +71,13 @@ func withLogging(name string, h toolHandler, s *Server) toolHandler {
 					exitAttrs = append(exitAttrs, "output_preview", truncate(preview, 200))
 				}
 			}
-			slog.DebugContext(ctx, "tool call end", exitAttrs...)
+			// INFO, not Debug. A successful call is the unit a support report is
+			// written in ("this call returned X"), and at Debug level the ones that
+			// matter are absent by default — a report of a broken reply arrived with a
+			// log whose last line was an unrelated 400, because everything that had
+			// worked was invisible. One line per call is the cost; being able to match
+			// a complaint to a command is what it buys.
+			slog.InfoContext(ctx, "tool call end", exitAttrs...)
 		}
 		return result, err
 	}
@@ -94,6 +101,16 @@ func appendSafeArgs(attrs []any, request mcpgo.CallToolRequest) []any {
 	args := request.GetArguments()
 	if args == nil {
 		return attrs
+	}
+	// CMD FIRST, because it is the only attribute that says what was ASKED.
+	//
+	// The log carried the resolved ids and the window parameters but never the
+	// command line, so a support report of "this call returned [object Object]" could
+	// not be matched to anything: the log showed a session and a handle and no way to
+	// tell which directive produced them. Truncated like every other value — a
+	// payload can be a whole heredoc, and the log is not a transcript.
+	if v, ok := args["cmd"].(string); ok && v != "" {
+		attrs = append(attrs, "cmd", truncate(v, 200))
 	}
 	if v, ok := args["session_id"].(string); ok && v != "" {
 		attrs = append(attrs, "session_id", v)
@@ -167,17 +184,57 @@ func extractOutputPreview(result *mcpgo.CallToolResult) string {
 // extractErrorInfo decodes the dedicated error_code field from a failed tool
 // result. Plain-text errors (returned by mcp-go internals or third-party
 // handlers) yield an empty code and the raw text as the message.
+//
+// THE FAILING SLOT, NOT THE FIRST LINE. A reply is several TERM/1 sections, one
+// per statement, and `isError` is true when ANY of them failed. Reading the preview
+// from the top therefore logged the first statement's status as the error — a call
+// whose second statement failed was recorded as "is_error=true error=TERM/1 200 OK",
+// which points a reader at the statement that worked. Every failed call would then
+// have to be re-diagnosed from scratch.
 func extractErrorInfo(result *mcpgo.CallToolResult) (code, message string) {
 	preview := extractOutputPreview(result)
 	if preview == "" {
 		return "", ""
 	}
+	failed := failingSection(preview)
+	if failed == "" {
+		return "", preview
+	}
 	var payload struct {
 		ErrorCode string `json:"error_code"`
 		Error     string `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(preview), &payload); err == nil && payload.ErrorCode != "" {
+	if err := json.Unmarshal([]byte(failed), &payload); err == nil && payload.ErrorCode != "" {
 		return payload.ErrorCode, payload.Error
 	}
-	return "", preview
+	return "", failed
+}
+
+// failingSection returns the first TERM/1 section whose status is 4xx or 5xx, or ""
+// when every section succeeded.
+//
+// Sections are split on the "TERM/1 " marker rather than on blank lines: a body can
+// contain blank lines (it is terminal output), and the marker is the one thing the
+// envelope guarantees.
+func failingSection(preview string) string {
+	const marker = "TERM/1 "
+	sections := strings.Split(preview, marker)
+	if len(sections) == 1 {
+		// Not an envelope: a handler's own JSON error, which is a single result and
+		// therefore already the failure this function is looking for. Returning ""
+		// here made every such error fall back to operation_failed and lose its code
+		// — `close nosuchsession` answered 500 with session_not_found in the body.
+		return preview
+	}
+	for _, sec := range sections[1:] { // sections[0] precedes the first marker
+		// The status follows the marker: "200 OK", "404 Not Found", …
+		if len(sec) < 3 {
+			continue
+		}
+		if sec[0] < '4' {
+			continue
+		}
+		return marker + sec
+	}
+	return ""
 }

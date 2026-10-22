@@ -95,7 +95,48 @@ func TestWatchAddActuallySubscribes(t *testing.T) {
 		t.Fatalf("watch_add: %v", err)
 	}
 	marker := "watch-marker-" + time.Now().Format("150405.000000")
-	time.Sleep(200 * time.Millisecond)
+
+	// THE SHELL IS A PIPE, SO THE LINE ENDS WITH '\n'.
+	//
+	// Enter is '\r' only on a pty — `shell_key enter` branches on exactly that
+	// (internal/session/keys.go) — and a pipe has no line discipline to translate
+	// anything, so '\r' is just a byte in the middle of the command and the line never
+	// ends. This test creates ModePipe, so '\n' is the separator. Changing it to '\r'
+	// made the command never execute at all.
+	//
+	// THEN LET THE SHELL START, WITHOUT DECIDING HOW LONG THAT TAKES.
+	//
+	// `handleWSInput` looks the shell up and RETURNS SILENTLY when the session's child
+	// shell is not registered yet, so input sent too early is dropped and the test then
+	// waits for output nobody asked for. A fixed 200ms sleep sat here and was
+	// load-bearing for that reason.
+	//
+	// A shell that prints a banner gives us something to wait FOR. A silent pipe gives
+	// nothing, so the wait is bounded and its expiry is not an error. It cannot share
+	// this connection: gorilla caches the first read error and never clears it (see the
+	// deadline comment below), so a timeout here would poison the reads that matter.
+	// Hence the throwaway connection — it is the only way to ask "has the shell said
+	// anything yet" without spending the real one.
+
+	// THE SHELL MUST BE REGISTERED, OR THE INPUT IS DROPPED IN SILENCE.
+	//
+	// `handleWSInput` resolves the channel with `getTerminalShell` and returns without
+	// a word when it is not there yet, so input sent too early simply disappears and
+	// the test then waits for output nobody asked for. A fixed 200ms sleep used to sit
+	// here for that reason; on a loaded runner it was a coin flip.
+	//
+	// The wait polls the SAME lookup the input path uses, so it is not a guess about
+	// timing, and it costs nothing when the shell is already registered (the usual
+	// case). No websocket read is involved: gorilla caches the first read error, so a
+	// probe read that times out would poison the connection the assertions need.
+	deadline := time.Now().Add(10 * time.Second)
+	for sessMgr.GetChildShell(shell.ID) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("channel %s never registered with the session manager", shell.ID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if err := conn.WriteJSON(map[string]any{"type": "input", "id": shell.ID, "d": "echo " + marker + "\n"}); err != nil {
 		t.Fatalf("input: %v", err)
 	}
@@ -112,9 +153,9 @@ func TestWatchAddActuallySubscribes(t *testing.T) {
 	// So the deadline is armed once, for the whole budget. A timeout at the end means
 	// the marker never showed up, which is the thing worth failing on. A non-timeout
 	// error means the peer is gone. Nothing in between needs a heuristic.
-	deadline := time.Now().Add(20 * time.Second)
+	readDeadline := time.Now().Add(20 * time.Second)
 	var got strings.Builder
-	_ = conn.SetReadDeadline(deadline)
+	_ = conn.SetReadDeadline(readDeadline)
 	for {
 		var m map[string]any
 		if err := conn.ReadJSON(&m); err != nil {

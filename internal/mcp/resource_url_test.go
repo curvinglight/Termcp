@@ -346,8 +346,8 @@ func TestRequireShellArchivedLocator(t *testing.T) {
 		if code != CodeSessionNotFound {
 			t.Errorf("%s: error_code = %q, want %q", id, code, CodeSessionNotFound)
 		}
-		if !strings.Contains(got, "closed") || !strings.Contains(got, "shell_output") {
-			t.Errorf("%s: error should mention closed + shell_output, got %q", id, got)
+		if !strings.Contains(got, "closed") || !strings.Contains(got, "read") {
+			t.Errorf("%s: error should mention closed + the read directive, got %q", id, got)
 		}
 	}
 }
@@ -411,7 +411,7 @@ func TestRequireShellGarbageAndBroadcastURI(t *testing.T) {
 
 // TestStartSessionSSHConfigLocatorErrors: an ssh_config value written in
 // termcp:// syntax must be diagnosed precisely — malformed syntax and
-// session/shell locators are invalid_argument, not "profile not found".
+// session/shell locators are invalid_argument, not "edit host not found".
 func TestStartSessionSSHConfigLocatorErrors(t *testing.T) {
 	s := newTestServer(t)
 	cases := []struct {

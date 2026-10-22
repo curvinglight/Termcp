@@ -46,6 +46,11 @@ func (s *Server) handleSSHConfigOps(ctx context.Context, request mcpgo.CallToolR
 	switch action {
 	case "list":
 		return s.handleListSSHConfigs(ctx, request)
+	case "get":
+		// Reading one entry is not a mutation, so it is not gated by
+		// --mcp-manage-ssh-configs: list is already open, and hiding the fields while
+		// showing the name protects nothing.
+		return s.handleGetSSHConfig(ctx, request)
 	case "create", "edit", "copy", "delete":
 		if !s.ManageSSHConfigs {
 			return toolError(CodeForbidden, "%s", "SSH config write actions are disabled; start termcp with --mcp-manage-ssh-configs"), nil
@@ -61,6 +66,6 @@ func (s *Server) handleSSHConfigOps(ctx context.Context, request mcpgo.CallToolR
 			return s.handleDeleteSSHConfig(ctx, request)
 		}
 	default:
-		return toolError(CodeInvalidArgument, "%s", "action must be list, create, edit, copy, or delete"), nil
+		return toolError(CodeInvalidArgument, "%s", "action must be list, get, create, edit, copy, or delete"), nil
 	}
 }

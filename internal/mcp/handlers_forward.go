@@ -49,7 +49,7 @@ func (s *Server) handleLocalForward(ctx context.Context, request mcpgo.CallToolR
 func (s *Server) handleRemoteForward(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
-	localHost := getString(args, "local_host", "0.0.0.0")
+	localHost := getString(args, "local_host", "127.0.0.1")
 	localPort := int(getFloat64(args, "local_port", 0))
 	remoteHost := getString(args, "remote_host", "")
 	remotePort := int(getFloat64(args, "remote_port", 0))

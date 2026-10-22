@@ -41,11 +41,11 @@ func TestWindowArgumentTypesAreRefused(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args := map[string]any{"cmd": "ps"}
+			args := map[string]any{"cmd": "ls"}
 			for k, v := range tc.args {
 				args[k] = v
 			}
-			got := s.Term(context.Background(), "ps", args).Text()
+			got := s.Term(context.Background(), "ls", args).Text()
 			if !strings.Contains(got, "400") {
 				t.Fatalf("a mistyped window value must be a 400:\n%s", got)
 			}
@@ -70,11 +70,11 @@ func TestWindowArgumentBoundsAreRefused(t *testing.T) {
 		{map[string]any{"total_bytes_limit": 0}, "total_bytes_limit must be >= 1"},
 	}
 	for _, tc := range cases {
-		args := map[string]any{"cmd": "ps"}
+		args := map[string]any{"cmd": "ls"}
 		for k, v := range tc.args {
 			args[k] = v
 		}
-		got := s.Term(context.Background(), "ps", args).Text()
+		got := s.Term(context.Background(), "ls", args).Text()
 		if !strings.Contains(got, "400") || !strings.Contains(got, tc.want) {
 			t.Errorf("%v must be refused with %q:\n%s", tc.args, tc.want, got)
 		}
@@ -86,11 +86,11 @@ func TestWindowArgumentBoundsAreRefused(t *testing.T) {
 func TestAbsentWindowArgumentsStillDefault(t *testing.T) {
 	s := newTestServer(t)
 	for _, args := range []map[string]any{
-		{"cmd": "ps"},
-		{"cmd": "ps", "timeout": nil},
-		{"cmd": "ps", "on_bytes_overflow": ""},
+		{"cmd": "ls"},
+		{"cmd": "ls", "timeout": nil},
+		{"cmd": "ls", "on_bytes_overflow": ""},
 	} {
-		got := s.Term(context.Background(), "ps", args).Text()
+		got := s.Term(context.Background(), "ls", args).Text()
 		// The status line, not the whole reply: a body can contain "400" by
 		// coincidence (a byte count, a session id), which would make this assertion
 		// fail for the wrong reason.

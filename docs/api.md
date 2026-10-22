@@ -966,7 +966,7 @@ Request:
   "remote_host": "localhost",
   "remote_port": 80,
   "bind_host":  "",          // local: what THIS host listens on (default 127.0.0.1)
-  "local_host": "0.0.0.0",   // remote: what the TARGET listens on
+  "local_host": "127.0.0.1", // remote: what the TARGET listens on (default 127.0.0.1)
   "local_port": 8080          // 0 = auto-assign (local/dynamic only)
 }
 ```
@@ -978,9 +978,11 @@ Request:
 | `dynamic` | `local_port` optional; `bind_host` is refused unless loopback |
 
 `bind_host` and `local_host` name two different machines, which is why they are two
-fields: `local` and `dynamic` listen here, `remote` listens on the target. Setting
-`bind_host` to `0.0.0.0` (or `*`) publishes the tunnel to every interface, and the
-review prompt says so before the forward is created. A `dynamic` forward refuses any
+fields: `local` and `dynamic` listen here, `remote` listens on the target. **Both
+default to `127.0.0.1`**: a forward carries an already-authenticated tunnel, so
+publishing it is an explicit act. Setting either to `0.0.0.0` (or `*`) publishes the
+tunnel to every interface, and the review prompt says so before the forward is
+created. A `dynamic` forward refuses any
 non-loopback `bind_host`: its SOCKS5 handshake performs no authentication, so it
 would be an open proxy for anything that can reach the port.
 

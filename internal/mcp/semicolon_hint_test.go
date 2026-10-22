@@ -33,7 +33,7 @@ func TestSemicolonAfterPayloadGetsAHint(t *testing.T) {
 // no payload has no `;` to blame, so the reply must not suggest args.
 func TestNoHintWhenNothingWasCutShort(t *testing.T) {
 	s := newTestServer(t)
-	got := termText(t, s, map[string]any{"cmd": "ps; bogus"})
+	got := termText(t, s, map[string]any{"cmd": "ls; bogus"})
 	if !strings.Contains(got, "unknown directive: bogus") {
 		t.Fatalf("the failure itself must be reported:\n%s", got)
 	}
@@ -69,13 +69,13 @@ func TestHintSuppressesTheDirectiveTable(t *testing.T) {
 	if !strings.Contains(got, "HINT") {
 		t.Fatalf("expected a hint:\n%s", got)
 	}
-	if strings.Contains(got, "run | type | key") {
+	if strings.Contains(got, "connect | open | ls") {
 		t.Errorf("the directive table competes with the hint:\n%s", got)
 	}
 
 	// A plain typo still gets the table: that caller DOES need the name list.
-	got = termText(t, s, map[string]any{"cmd": "ps; bogus"})
-	if !strings.Contains(got, "run | type | key") {
+	got = termText(t, s, map[string]any{"cmd": "ls; bogus"})
+	if !strings.Contains(got, "connect | open | ls") {
 		t.Errorf("a bare typo should still carry the table:\n%s", got)
 	}
 }

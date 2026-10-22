@@ -12,7 +12,6 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/extensions"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/message"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
@@ -65,7 +64,6 @@ type Handler struct {
 	MsgMgr     *message.Manager
 	SSH        *sshconfig.Store
 	ForwardMgr *forward.ForwardManager
-	NotifyMgr  *notify.Manager // active shell notification rules (read-only listing + delete)
 	// Extensions drives the right-side panel: it lists the pinned,
 	// capability-trimmed sessions and reports whether each is up. nil in a build
 	// that does not run the reconciler, in which case the panel is simply empty.
@@ -136,9 +134,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	}
 	if h.ForwardMgr != nil {
 		h.ForwardMgr.SetOnChange(h.sessionHub().broadcast)
-	}
-	if h.NotifyMgr != nil {
-		h.NotifyMgr.SetOnChange(h.sessionHub().broadcast)
 	}
 	if h.SSH != nil {
 		h.SSH.SetOnChange(h.sessionHub().broadcast)

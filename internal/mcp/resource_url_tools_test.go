@@ -388,46 +388,6 @@ func TestForwardToolsWithoutManagerFailCleanly(t *testing.T) {
 	}
 }
 
-// TestNotifyToolsStoreResolvedShellID is the regression for the rule-leak: a rule
-// registered through a locator stored the locator as its ShellID, so
-// (a) the cascade cleanup keyed on the real shell id never removed it, leaving
-// timers running for a shell that no longer exists, and (b) the resource
-// broadcast URI became termcp://shells/termcp://#<sid>:2, which names nothing.
-func TestNotifyToolsStoreResolvedShellID(t *testing.T) {
-	s, sid, _, second, _ := locatorFixture(t)
-	loc := "termcp://#" + sid + ":2"
-
-	res, err := s.handleShellNotifyOps(context.Background(), makeRequest(map[string]any{
-		"action": "register", "shell_id": loc, "channel": "resource", "event": "output",
-	}))
-	if err != nil || res.IsError {
-		t.Fatalf("shell_notify(register) via locator failed: %v %v", err, res)
-	}
-	body := parseResult(t, res)
-	if body["shell_id"] != second {
-		t.Fatalf("rule stored shell_id %v, want the canonical %q", body["shell_id"], second)
-	}
-
-	// list: the optional filter must resolve too, or a locator selects nothing.
-	res, err = s.handleShellNotifyOps(context.Background(), makeRequest(map[string]any{
-		"action": "list", "shell_id": loc,
-	}))
-	if err != nil || res.IsError {
-		t.Fatalf("shell_notify(list) via locator failed: %v %v", err, res)
-	}
-	rules, _ := parseResult(t, res)["rules"].([]any)
-	if len(rules) != 1 {
-		t.Fatalf("shell_notify(list) via locator returned %d rules, want the 1 just registered", len(rules))
-	}
-
-	// Cascade cleanup by the real shell id — what the exit watcher calls — must
-	// find the rule.
-	s.notifyMgr.ClearShell(second)
-	if left := s.notifyMgr.List(second); len(left) != 0 {
-		t.Errorf("ClearShell(%s) left %d rule(s): the cascade cannot see them", second, len(left))
-	}
-}
-
 // TestNotifyUserResolvesSessionLocator pins that the human-facing notification
 // highlights the right card: the UI matches on the id, so a locator echoed back
 // would highlight nothing.
@@ -567,7 +527,7 @@ func TestDeadSessionShellLookupIsRefusedConsistently(t *testing.T) {
 		if code != CodeSessionNotFound {
 			t.Errorf("requireShell(%q) error_code = %q, want %q", id, code, CodeSessionNotFound)
 		}
-		if !strings.Contains(msg, "closed") || !strings.Contains(msg, "shell_output") {
+		if !strings.Contains(msg, "closed") || !strings.Contains(msg, "read") {
 			t.Errorf("requireShell(%q) message should name the state and the way out, got %q", id, msg)
 		}
 	}

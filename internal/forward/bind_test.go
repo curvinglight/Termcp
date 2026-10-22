@@ -82,20 +82,23 @@ func TestLocalForwardBindsRequestedHost(t *testing.T) {
 	}
 }
 
-// TestLocalForwardReportsRequestedHostNotExpansion keeps an explicit wildcard
-// bind reported as what the caller asked for: the kernel expands 0.0.0.0 into
-// nothing printable, and a forward created for the network must not list itself
-// as a loopback tunnel.
+// TestLocalForwardReportsTheAddressItWasGiven keeps a forward's report honest: the
+// listener's own Addr is what a caller dials, so it is reported verbatim rather than
+// reinterpreted.
 func TestLocalForwardReportsRequestedHostNotExpansion(t *testing.T) {
+	// NO WILDCARD BIND HERE. Binding 0.0.0.0 asks the OS to open a port to the
+	// network, and on Windows that is a firewall dialog shown to whoever is at the
+	// machine — for a test binary that lives a second. The mapping that decides
+	// what 0.0.0.0 becomes is asserted above, where it costs no socket at all.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fw, ln, err := LocalForwardSSH(ctx, nil, "0.0.0.0", "127.0.0.1", 1, 0)
+	fw, ln, err := LocalForwardSSH(ctx, nil, "127.0.0.1", "127.0.0.1", 1, 0)
 	if err != nil {
-		t.Skipf("binding 0.0.0.0 is not permitted here: %v", err)
+		t.Fatal(err)
 	}
 	defer ln.Close()
-	if !strings.HasPrefix(fw.ListenAddr, "0.0.0.0:") {
-		t.Errorf("ListenAddr = %q, want the 0.0.0.0 form the caller asked for", fw.ListenAddr)
+	if !strings.HasPrefix(fw.ListenAddr, "127.0.0.1:") {
+		t.Errorf("ListenAddr = %q, want the address the caller asked for", fw.ListenAddr)
 	}
 }
 
@@ -148,7 +151,11 @@ func TestCreateDynamicRefusalLeavesNoListener(t *testing.T) {
 		t.Fatal("non-loopback SOCKS5 bind was allowed")
 	}
 	// The port must still be free: a refusal that bound first would hold it.
-	ln, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+	//
+	// PROBED ON 127.0.0.1, not on the wildcard: whether a port is free is a fact
+	// about the port, and asking it in a way that raises a Windows firewall prompt
+	// makes the test cost more than it proves.
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("port %d was left bound by the refused call: %v", port, err)
 	}

@@ -17,6 +17,11 @@ the enforcement is listed so you can tell a real failure from a stale doc.
   carried v0.2.7's notes under `## Unreleased` after v0.2.7 shipped, and would
   have re-shipped them in the next release. Bouncing the commit back is what
   empties `Unreleased` and brings `server.json` current on the dev line.
+  `TestUnreleasedDoesNotRepeatAPublishedEntry` fails when this is skipped, which
+  it has been twice (v0.2.7, v0.2.8-rc.3) — the paragraph above did not prevent
+  either, so the check is now mechanical. If the test is red, the release commit
+  is on `main` and not on `dev`: cherry-pick it rather than deleting the
+  duplicate entries by hand.
 
 ## Ordinary development
 

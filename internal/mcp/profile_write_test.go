@@ -21,7 +21,7 @@ func profilesTestServer(t *testing.T) *Server {
 // `fwd --action close`), which is what makes this one wrong rather than a style.
 func TestProfileDeleteOnAMissingNameIsRefused(t *testing.T) {
 	s := profilesTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "profile --action delete --name never-existed"})
+	text := termText(t, s, map[string]any{"cmd": "rm host never-existed"})
 	if strings.Contains(text, "success") {
 		t.Fatalf("deleting a missing profile answered success:\n%s", text)
 	}
@@ -35,16 +35,16 @@ func TestProfileDeleteOnAMissingNameIsRefused(t *testing.T) {
 func TestProfileDeleteOnAnExistingNameSucceeds(t *testing.T) {
 	s := profilesTestServer(t)
 	if text := termText(t, s, map[string]any{
-		"cmd": "profile --action create --name victim --host 192.0.2.1 --user u --password p",
+		"cmd": "create host victim --host 192.0.2.1 --user u --password p",
 	}); !strings.Contains(text, "success") {
 		t.Fatalf("create failed:\n%s", text)
 	}
 	if text := termText(t, s, map[string]any{
-		"cmd": "profile --action delete --name victim",
+		"cmd": "rm host victim",
 	}); !strings.Contains(text, "success") {
 		t.Fatalf("deleting an existing profile failed:\n%s", text)
 	}
-	list := termText(t, s, map[string]any{"cmd": "profile --action list"})
+	list := termText(t, s, map[string]any{"cmd": "edit host --action list"})
 	if strings.Contains(list, "victim") {
 		t.Fatalf("the profile is still listed after delete:\n%s", list)
 	}

@@ -25,12 +25,15 @@ func TestFramePayloadExpandsInsideQuotes(t *testing.T) {
 		arg  string
 		want string
 	}{
-		{`cdp call h '{"expression":"$1"}'`, "2+3", `call h '{"expression":"2+3"}'`},
-		{`mcp call h '{"name":"$1"}'`, "term", `call h '{"name":"term"}'`},
-		{`jrpc call h '{"m":"$1"}'`, "ping", `call h '{"m":"ping"}'`},
+		// One verb, one payload rule: whichever door the handle belongs to, `call`
+		// carries the frame verbatim, so the three doors are three handles rather than
+		// three spellings of the same statement.
+		{`call h '{"expression":"$1"}'`, "2+3", `'{"expression":"2+3"}'`},
+		{`call h '{"name":"$1"}'`, "term", `'{"name":"term"}'`},
+		{`call h '{"m":"$1"}'`, "ping", `'{"m":"ping"}'`},
 		// Unquoted frames work too: the old behaviour only ever worked here, which is
 		// why the bug went unnoticed.
-		{`cdp call h {"id":1,"v":"$1"}`, "x", `call h {"id":1,"v":"x"}`},
+		{`call h {"id":1,"v":"$1"}`, "x", `{"id":1,"v":"x"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.cmd, func(t *testing.T) {
@@ -53,12 +56,12 @@ func TestFramePayloadExpandsInsideQuotes(t *testing.T) {
 //
 // The peer then saw the shell quotes as part of the value.
 func TestFramePayloadDoesNotQuoteNamedValues(t *testing.T) {
-	f, err := ParseWithSubst(`cdp call h '{"e":"$EXPR"}'`,
+	f, err := ParseWithSubst(`call h '{"e":"$EXPR"}'`,
 		Subst{Named: map[string]string{"EXPR": "2+3"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := f.Statements[0].Payload, `call h '{"e":"2+3"}'`; got != want {
+	if got, want := f.Statements[0].Payload, `'{"e":"2+3"}'`; got != want {
 		t.Errorf("payload = %q, want %q", got, want)
 	}
 }
@@ -88,7 +91,7 @@ func TestShellQuotingIsUnchangedOutsideFrames(t *testing.T) {
 // TestFrameArgsStillRejectBadIndexes pins that the frame rule did not weaken the
 // guards: an out-of-range reference is reported before anything is sent.
 func TestFrameArgsStillRejectBadIndexes(t *testing.T) {
-	_, err := ParseWithSubst(`cdp call h '{"e":"$2"}'`, Subst{Pos: []string{"only"}})
+	_, err := ParseWithSubst(`call h '{"e":"$2"}'`, Subst{Pos: []string{"only"}})
 	if err == nil {
 		t.Fatal("an out-of-range reference in a frame must be refused")
 	}

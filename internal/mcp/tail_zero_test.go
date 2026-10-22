@@ -13,7 +13,7 @@ func TestTailZeroReturnsEmptyWindow(t *testing.T) {
 	// A pipe that prints three lines and exits, so the log is complete and stable
 	// by the time we read it.
 	text := termText(t, s, map[string]any{
-		"cmd": "pipe internal --argv printf 'LINE_ONE\\nLINE_TWO\\nLINE_THREE\\n'",
+		"cmd": "connect internal --argv printf 'LINE_ONE\\nLINE_TWO\\nLINE_THREE\\n'",
 	})
 	h := handleFrom(t, text)
 

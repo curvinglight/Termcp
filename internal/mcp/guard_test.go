@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/forward"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
@@ -353,8 +352,7 @@ func TestGuardResolvesIndirectResourceIDs(t *testing.T) {
 	if sess == nil {
 		t.Fatal("session not found")
 	}
-	shellID := sess.PrimaryShellID()
-	if shellID == "" {
+	if sess.PrimaryShellID() == "" {
 		t.Fatal("test session has no primary shell")
 	}
 
@@ -366,10 +364,6 @@ func TestGuardResolvesIndirectResourceIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateDynamic: %v", err)
 	}
-	rule, err := s.notifyMgr.Register(sid, shellID, notify.ChannelResource, notify.EventOutput, nil, nil)
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
 
 	if bad := (toolGuard{server: s}).check(context.Background(), "forward", lookupGate("forward"), makeRequest(map[string]any{
 		"action": "close", "forward_id": fw.ForwardID,
@@ -378,37 +372,19 @@ func TestGuardResolvesIndirectResourceIDs(t *testing.T) {
 	} else if code, _ := decodeToolError(t, bad); code != CodeForbidden {
 		t.Errorf("forward(close) code = %q, want %q", code, CodeForbidden)
 	}
-	if bad := (toolGuard{server: s}).check(context.Background(), "shell_notify", lookupGate("shell_notify"), makeRequest(map[string]any{
-		"action": "unregister", "rule_id": rule.ID,
-	})); bad == nil {
-		t.Error("shell_notify(unregister) on a session that granted no shell_notify must be refused")
-	} else if code, _ := decodeToolError(t, bad); code != CodeForbidden {
-		t.Errorf("shell_notify(unregister) code = %q, want %q", code, CodeForbidden)
-	}
 
 	// A resource owned by an ordinary session is untouched: the guard is
 	// invisible to every caller that predates the whitelist.
 	plain := createTestSession(t, s, api.ModePipe)
-	plainShell := s.sessMgr.Get(plain).PrimaryShellID()
 	fw2, err := s.forwardMgr.CreateDynamic(plain, "plain", "", 0, nil, true)
 	if err != nil {
 		t.Fatalf("CreateDynamic: %v", err)
-	}
-	rule2, err := s.notifyMgr.Register(plain, plainShell, notify.ChannelResource, notify.EventOutput, nil, nil)
-	if err != nil {
-		t.Fatalf("Register: %v", err)
 	}
 	if bad := (toolGuard{server: s}).check(context.Background(), "forward", lookupGate("forward"), makeRequest(map[string]any{
 		"action": "close", "forward_id": fw2.ForwardID,
 	})); bad != nil {
 		_, msg := decodeToolError(t, bad)
 		t.Errorf("an unrestricted session's forward was refused: %s", msg)
-	}
-	if bad := (toolGuard{server: s}).check(context.Background(), "shell_notify", lookupGate("shell_notify"), makeRequest(map[string]any{
-		"action": "unregister", "rule_id": rule2.ID,
-	})); bad != nil {
-		_, msg := decodeToolError(t, bad)
-		t.Errorf("an unrestricted session's rule was refused: %s", msg)
 	}
 
 	// An id nothing owns is the handler's not-found error, not a refusal.

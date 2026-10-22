@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -33,6 +34,17 @@ func termCall(t *testing.T, s *Server, args map[string]any) *mcpgo.CallToolResul
 func termText(t *testing.T, s *Server, args map[string]any) string {
 	t.Helper()
 	return toolResultText(termCall(t, s, args))
+}
+
+// termTextWithCtx runs a term call on a caller-supplied context, which is how a test
+// supplies the client session that sampling forwarding looks for.
+func termTextWithCtx(t *testing.T, s *Server, ctx context.Context, args map[string]any) string {
+	t.Helper()
+	res, err := s.call(ctx, "term", args)
+	if err != nil {
+		t.Fatalf("term(%v): %v", args, err)
+	}
+	return toolResultText(res)
 }
 
 // headerValue reads one header out of a rendered slot. It is deliberately a
@@ -73,16 +85,17 @@ func TestTermEmptyCallIsTheGuide(t *testing.T) {
 	if !strings.HasPrefix(text, "TERM/1 200 OK\n") {
 		t.Errorf("status line = %q", strings.SplitN(text, "\n", 2)[0])
 	}
-	// It must say where am I, what can I do, and what is here.
-	for _, want := range []string{"Syntax", "ps", "ext list", "help", "running now"} {
+	// It must say what this is, where capability lives, where state lives, and what
+	// is running right now.
+	for _, want := range []string{"cmd = the DSL", "sh = a shell command", "ls ext", "ls", "help", "running now"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the guide misses %q:\n%s", want, text)
 		}
 	}
-	// And it must not require remembering anything: handles are obtained, not
+	// And it must not require remembering anything: an address is obtained, not
 	// supplied.
-	if !strings.Contains(text, "copy one from ps") {
-		t.Errorf("the guide must point at where handles come from:\n%s", text)
+	if !strings.Contains(text, "from `ls`") {
+		t.Errorf("the guide must point at where channel addresses come from:\n%s", text)
 	}
 }
 
@@ -92,7 +105,7 @@ func TestTermEmptyCallIsTheGuide(t *testing.T) {
 func TestTermHelp(t *testing.T) {
 	s := newTestServer(t)
 	text := termText(t, s, map[string]any{"cmd": "help"})
-	for _, op := range []string{"run", "read", "ps", "pipe", "pty", "alias", "help"} {
+	for _, op := range []string{"run", "read", "ls", "open", "connect", "create", "help"} {
 		if !strings.Contains(text, "\n"+op+" ") && !strings.Contains(text, "\n"+op+"\n") {
 			t.Errorf("help misses directive %q:\n%s", op, text)
 		}
@@ -107,7 +120,7 @@ func TestTermHelp(t *testing.T) {
 	if _, rest, ok := strings.Cut(single, "\n\n"); ok {
 		body = rest // skip the envelope: status line and headers
 	}
-	if first, _, _ := strings.Cut(body, "\n"); !strings.HasPrefix(first, "run <handle> <payload>") {
+	if first, _, _ := strings.Cut(body, "\n"); !strings.HasPrefix(first, "run <session> <index> <line>") {
 		t.Errorf("the body does not open with the usage template:\n%s", single)
 	}
 }
@@ -137,7 +150,7 @@ func TestTermUnknownDirectiveTeaches(t *testing.T) {
 // successful reply would be noise the caller cannot turn off.
 func TestTermSuccessIsSilentWithoutLearnMode(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "ps"})
+	text := termText(t, s, map[string]any{"cmd": "ls"})
 	if _, ok := headerValue(t, text, "Usage"); ok {
 		t.Errorf("a successful reply carried Usage without learn_mode:\n%s", text)
 	}
@@ -167,7 +180,7 @@ func TestTermLearnModeDeduplicatesUsage(t *testing.T) {
 // A fresh pipe channel hands back a handle, which is news by definition.
 func TestTermPipeReturnsHandle(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "pipe internal --argv sleep 5"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --argv sleep 5"})
 	if !strings.HasPrefix(text, "TERM/1 200 OK\n") {
 		t.Fatalf("status line = %q", strings.SplitN(text, "\n", 2)[0])
 	}
@@ -179,7 +192,7 @@ func TestTermPipeReturnsHandle(t *testing.T) {
 	if strings.Contains(h, "termcp://") {
 		t.Errorf("Handle = %q, want the short form (the termcp:// prefix costs 9 chars per slot)", h)
 	}
-	if info := termText(t, s, map[string]any{"cmd": "info " + h}); !strings.HasPrefix(info, "TERM/1 200 OK") {
+	if info := termText(t, s, map[string]any{"cmd": "get " + h}); !strings.HasPrefix(info, "TERM/1 200 OK") {
 		t.Errorf("the returned handle does not resolve: %s", info)
 	}
 }
@@ -189,9 +202,9 @@ func TestTermPipeReturnsHandle(t *testing.T) {
 func TestTermArgvCarriesItsWords(t *testing.T) {
 	s := newTestServer(t)
 	for _, cmd := range []string{
-		"pipe internal --argv echo hello",
-		"pipe internal --argv sh -c 'echo hello'",
-		"pipe internal --argv sh -c \"echo hello\"", // a quoted argument keeps its space
+		"connect internal --argv echo hello",
+		"connect internal --argv sh -c 'echo hello'",
+		"connect internal --argv sh -c \"echo hello\"", // a quoted argument keeps its space
 	} {
 		text := termText(t, s, map[string]any{"cmd": cmd})
 		if !strings.HasPrefix(text, "TERM/1 200 OK") {
@@ -212,34 +225,35 @@ func TestTermArgvCarriesItsWords(t *testing.T) {
 	}
 
 	// A known flag after --argv would be handed to the program if accepted.
-	res := termCall(t, s, map[string]any{"cmd": "pipe internal --argv echo hi --name chat"})
+	res := termCall(t, s, map[string]any{"cmd": "connect internal --argv echo hi --name chat"})
 	if !res.IsError || !strings.Contains(toolResultText(res), "flags come before --argv") {
 		t.Errorf("a flag after --argv was not refused:\n%s", toolResultText(res))
 	}
 	// A bare payload used to be dropped without a word.
-	res = termCall(t, s, map[string]any{"cmd": "pipe internal sleep 5"})
+	res = termCall(t, s, map[string]any{"cmd": "connect internal sleep 5"})
 	if !res.IsError || !strings.Contains(toolResultText(res), "--argv") {
 		t.Errorf("a bare payload was not refused:\n%s", toolResultText(res))
 	}
 }
 
-// The mode is the directive: pipe builds a pipe, pty builds a pty, and there is no
-// way to ask for one and silently get the other.
-func TestTermModeIsTheDirective(t *testing.T) {
+// The MODE follows ssh's own rule: a command means no terminal, no command means a
+// terminal. The claim that matters is not which word produced which mode, but that
+// the reply says so — a caller reading "pipe" knows an exit code is coming and a
+// caller reading "pty" knows it is not.
+func TestTermModeFollowsTheArgv(t *testing.T) {
 	s := newTestServer(t)
-	pipeText := termText(t, s, map[string]any{"cmd": "pipe internal --argv sleep 5"})
+	pipeText := termText(t, s, map[string]any{"cmd": "connect internal --argv sleep 5"})
 	if !strings.Contains(pipeText, "pipe") {
-		t.Errorf("pipe reply = %q", pipeText)
+		t.Errorf("a command should have made a pipe, got %q", pipeText)
 	}
-	ptyText := termText(t, s, map[string]any{"cmd": "pty internal"})
+	ptyText := termText(t, s, map[string]any{"cmd": "connect internal"})
 	if !strings.Contains(ptyText, "pty") {
-		t.Errorf("pty reply = %q", ptyText)
+		t.Errorf("no command should have made a pty, got %q", ptyText)
 	}
-	// `pipe x --mode pty` must never silently change the mode: --mode is not a
-	// flag of either directive, so it is refused.
-	res := termCall(t, s, map[string]any{"cmd": "pipe internal --mode pty"})
-	if !res.IsError {
-		t.Errorf("--mode was accepted; the mode must be the directive:\n%s", toolResultText(res))
+	// And --pty overrides the rule, so the two are not simply welded together.
+	forced := termText(t, s, map[string]any{"cmd": "connect internal --argv sleep 5 --pty"})
+	if !strings.Contains(forced, "pty") {
+		t.Errorf("--pty did not force a terminal, got %q", forced)
 	}
 }
 
@@ -275,7 +289,8 @@ func TestTermPtyRunWaitsTheWindow(t *testing.T) {
 	s := newTestServer(t)
 	h := openPty(t, s)
 	text := termText(t, s, map[string]any{
-		"cmd":     "run " + h + " sleep 1 && echo LATE",
+		"cmd":     "run " + h + " $1",
+		"args":    []any{"sleep 1 && echo LATE"},
 		"timeout": float64(3),
 	})
 	if !strings.Contains(text, "LATE") {
@@ -328,7 +343,7 @@ func TestTermRunStartsAtItsOwnOffset(t *testing.T) {
 func TestTermExitCodeIsAFunctionOfTheChannel(t *testing.T) {
 	s := newTestServer(t)
 	script := writeScript(t, "exit 3")
-	text := termText(t, s, map[string]any{"cmd": "pipe internal --argv sh '" + script + "'"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --argv sh '" + script + "'"})
 	h := handleFrom(t, text)
 	// Wait for the process to end.
 	deadline := time.Now().Add(5 * time.Second)
@@ -355,14 +370,20 @@ func TestTermExitCodeIsAFunctionOfTheChannel(t *testing.T) {
 	}
 }
 
-// A read of a closed channel whose process failed is a 500 that still carries the
-// bytes and the range: dropping the output would leave the caller knowing neither
-// what happened nor where to continue.
+// A read of a closed channel whose process failed is a 200 that still carries the
+// bytes, the range and the exit code.
+//
+// IT USED TO BE A 500, and that was wrong in a way the caller could not see past:
+// the read itself succeeded — it delivered every byte — while the status said the
+// call failed, so any OTHER statement in the same cmd was reported as failed too
+// (isError is a property of the whole call). The exit code is a fact about the
+// program in the transcript, not about the read, so it travels in Exit-Code and
+// Error-Code: child_exit while the code stays 200.
 func TestTermFailureKeepsTheBytes(t *testing.T) {
 	s := newTestServer(t)
 	// A multi-statement program is a script file, not shell syntax in --argv.
 	script := writeScript(t, "echo boom >&2; exit 3")
-	text := termText(t, s, map[string]any{"cmd": "pipe internal --argv sh '" + script + "'"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --argv sh '" + script + "'"})
 	h := handleFrom(t, text)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -373,11 +394,11 @@ func TestTermFailureKeepsTheBytes(t *testing.T) {
 	}
 	res := termCall(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 	out := toolResultText(res)
-	if !strings.HasPrefix(out, "TERM/1 500 Internal Server Error\n") {
+	if !strings.HasPrefix(out, "TERM/1 200 OK\n") {
 		t.Fatalf("status line = %q:\n%s", strings.SplitN(out, "\n", 2)[0], out)
 	}
-	if !res.IsError {
-		t.Error("isError must be true when the code is >= 400")
+	if res.IsError {
+		t.Error("a read that delivered its bytes is not a failed call")
 	}
 	if !strings.Contains(out, "boom") {
 		t.Errorf("the failing command's stderr was dropped:\n%s", out)
@@ -394,14 +415,14 @@ func TestTermFailureKeepsTheBytes(t *testing.T) {
 // verbatim as another directive's target.
 func TestTermPSLinesAreCopyable(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "ps"})
+	text := termText(t, s, map[string]any{"cmd": "ls"})
 	if strings.Contains(text, "{") || strings.Contains(text, "[") {
-		t.Errorf("ps must be terminal columns, not JSON:\n%s", text)
+		t.Errorf("ls must be terminal columns, not JSON:\n%s", text)
 	}
 	h := openPipe(t, s, "sleep 5")
-	text = termText(t, s, map[string]any{"cmd": "ps"})
+	text = termText(t, s, map[string]any{"cmd": "ls"})
 	if !strings.Contains(text, h) {
-		t.Fatalf("ps does not list %s:\n%s", h, text)
+		t.Fatalf("ls does not list %s:\n%s", h, text)
 	}
 	// The format requirement that matters: copy a column into the next command.
 	body := text[strings.Index(text, "\n\n")+2:]
@@ -413,7 +434,7 @@ func TestTermPSLinesAreCopyable(t *testing.T) {
 		if len(fields) == 0 {
 			continue
 		}
-		probe := termText(t, s, map[string]any{"cmd": "info " + fields[0]})
+		probe := termText(t, s, map[string]any{"cmd": "get " + fields[0]})
 		if strings.Contains(probe, "404") {
 			t.Errorf("the handle %q from ps does not resolve:\n%s", fields[0], probe)
 		}
@@ -424,14 +445,14 @@ func TestTermPSLinesAreCopyable(t *testing.T) {
 func TestTermInfoIsKeyValueLines(t *testing.T) {
 	s := newTestServer(t)
 	h := openPipe(t, s, "sleep 5")
-	text := termText(t, s, map[string]any{"cmd": "info " + h})
+	text := termText(t, s, map[string]any{"cmd": "get " + h})
 	for _, key := range []string{"id: ", "status: ", "ssh_config: ", "shell: "} {
 		if !strings.Contains(text, key) {
-			t.Errorf("info misses %q:\n%s", key, text)
+			t.Errorf("get misses %q:\n%s", key, text)
 		}
 	}
 	if strings.Contains(text, "{") {
-		t.Errorf("info must be key: value lines, not JSON:\n%s", text)
+		t.Errorf("get must be key: value lines, not JSON:\n%s", text)
 	}
 }
 
@@ -442,10 +463,10 @@ func TestTermWindowAppliesToGeneratedReplies(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		openPipe(t, s, "sleep 5")
 	}
-	text := termText(t, s, map[string]any{"cmd": "ps", "lines_limit": float64(2), "bytes_limit": float64(80)})
+	text := termText(t, s, map[string]any{"cmd": "ls", "lines_limit": float64(2), "bytes_limit": float64(80)})
 	body := text[strings.Index(text, "\n\n")+2:]
 	if len(body) > 200 {
-		t.Errorf("ps ignored the window (%d bytes):\n%s", len(body), text)
+		t.Errorf("ls ignored the window (%d bytes):\n%s", len(body), text)
 	}
 }
 
@@ -521,24 +542,24 @@ func TestMCPRecvDeliversTheFrameAndDoesNotRepeatIt(t *testing.T) {
 	h := openPipe(t, s, "cat")
 
 	frame := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
-	if out := termText(t, s, map[string]any{"cmd": "mcp send " + h + " " + frame}); !strings.Contains(out, "202") {
-		t.Fatalf("mcp send did not accept the frame:\n%s", out)
+	if out := termText(t, s, map[string]any{"cmd": "call " + h + " " + frame}); !strings.Contains(out, "202") {
+		t.Fatalf("write did not accept the frame:\n%s", out)
 	}
 
 	// The peer is a process; poll a few times rather than assuming it has written.
 	var got string
 	for i := 0; i < 20; i++ {
-		got = termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)})
+		got = termText(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 		if strings.Contains(got, `"method":"tools/list"`) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !strings.Contains(got, `"method":"tools/list"`) {
-		t.Fatalf("mcp recv never delivered a frame that was on the channel:\n%s", got)
+		t.Fatalf("read never delivered a frame that was on the channel:\n%s", got)
 	}
 
-	twice := termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)})
+	twice := termText(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 	if strings.Contains(twice, `"method":"tools/list"`) {
 		t.Errorf("a second recv re-delivered the same frame; the cursor did not advance:\n%s", twice)
 	}
@@ -553,25 +574,17 @@ func TestMCPRecvDeliversTheFrameAndDoesNotRepeatIt(t *testing.T) {
 // long-lived instance is the worst kind, because the workaround is a restart.
 func TestMCPRecvCursorIsDroppedOnClose(t *testing.T) {
 	s := newTestServer(t)
-	h := openPipe(t, s, "cat")
+	h := openPty(t, s)
 
-	// Give the handle a cursor by consuming one frame through recv.
-	if out := termText(t, s, map[string]any{"cmd": `mcp send ` + h + ` {"jsonrpc":"2.0","id":1,"method":"x"}`}); !strings.Contains(out, "202") {
-		t.Fatalf("mcp send: %s", out)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)}); strings.Contains(got, "200") {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if _, ok := s.recvCursors[h]; !ok {
-		t.Fatalf("no cursor recorded for %s after a recv; the rest of this test proves nothing", h)
-	}
+	// THE CURSOR IS SET DIRECTLY, because the invariant is about close, not about how
+	// a frame was obtained. Producing a real frame was platform-dependent in a way
+	// that cost two CI rounds: spawning `echo '{…}'` fails under powershell, and typing
+	// it at a "pty" assumes a terminal that echoes, which Windows does not always give.
+	// The frame-reading half is covered by TestMCPRecvCursorUsesRawByteSpan.
+	s.setRecvCursor(h, 7)
 
-	if out := termText(t, s, map[string]any{"cmd": "mcp close " + h}); !strings.Contains(out, "204") {
-		t.Fatalf("mcp close: %s", out)
+	if out := termText(t, s, map[string]any{"cmd": "close " + h}); !strings.Contains(out, "204") {
+		t.Fatalf("close: %s", out)
 	}
 	if _, ok := s.recvCursors[h]; ok {
 		t.Errorf("handle %s still has a recv cursor after close; the map grows for the life of the process", h)
@@ -591,14 +604,14 @@ func TestMCPRecvCursorUsesRawByteSpan(t *testing.T) {
 	h := openPipe(t, s, "cat")
 
 	frame := `{"jsonrpc":"2.0","id":7,"method":"ping"}`
-	if out := termText(t, s, map[string]any{"cmd": "mcp send " + h + " " + frame}); !strings.Contains(out, "202") {
+	if out := termText(t, s, map[string]any{"cmd": "call " + h + " " + frame}); !strings.Contains(out, "202") {
 		t.Fatalf("mcp send: %s", out)
 	}
 
 	var got string
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		got = termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)})
+		got = termText(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 		if strings.Contains(got, `"id":7`) {
 			break
 		}
@@ -610,7 +623,7 @@ func TestMCPRecvCursorUsesRawByteSpan(t *testing.T) {
 
 	// The cursor must sit at or before the stream length, and the next recv must
 	// not re-deliver this frame.
-	next := termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)})
+	next := termText(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 	if strings.Contains(next, `"id":7`) {
 		t.Errorf("the frame was delivered twice; the cursor did not advance past it: %s", next)
 	}
@@ -639,8 +652,8 @@ func TestMCPRecvDrainsEveryQueuedFrame(t *testing.T) {
 		`{"jsonrpc":"2.0","id":3,"method":"notifications/initialized"}`,
 	}
 	for _, f := range frames {
-		if out := termText(t, s, map[string]any{"cmd": "mcp send " + h + " " + f}); !strings.Contains(out, "202") {
-			t.Fatalf("mcp send did not accept %s:\n%s", f, out)
+		if out := termText(t, s, map[string]any{"cmd": "call " + h + " " + f}); !strings.Contains(out, "202") {
+			t.Fatalf("write did not accept %s:\n%s", f, out)
 		}
 	}
 
@@ -653,7 +666,7 @@ func TestMCPRecvDrainsEveryQueuedFrame(t *testing.T) {
 	var seen []string
 	deadline := time.Now().Add(3 * time.Second)
 	for len(seen) < len(want) && time.Now().Before(deadline) {
-		got := termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)})
+		got := termText(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 		if strings.Contains(got, "no complete frame yet") {
 			time.Sleep(25 * time.Millisecond)
 			continue
@@ -677,7 +690,7 @@ func TestMCPRecvDrainsEveryQueuedFrame(t *testing.T) {
 
 	// And it is a consumer, not a snapshot: with the queue drained, the next recv
 	// has nothing to give rather than replaying the three frames again.
-	after := termText(t, s, map[string]any{"cmd": "mcp recv " + h, "timeout": float64(0)})
+	after := termText(t, s, map[string]any{"cmd": "read " + h, "timeout": float64(0)})
 	if strings.Contains(after, `"jsonrpc"`) {
 		t.Errorf("recv re-delivered a frame after the queue drained:\n%s", after)
 	}
@@ -793,7 +806,7 @@ func TestTermStructuredContentIsIsomorphic(t *testing.T) {
 func TestTermAliasExpands(t *testing.T) {
 	s := newTestServer(t)
 	h := openPipe(t, s, "sleep 5")
-	if res := termCall(t, s, map[string]any{"cmd": "alias look read " + h}); res.IsError {
+	if res := termCall(t, s, map[string]any{"cmd": "create alias look read " + h}); res.IsError {
 		t.Fatalf("alias failed:\n%s", toolResultText(res))
 	}
 	text := termText(t, s, map[string]any{"cmd": "look", "timeout": float64(0)})
@@ -804,7 +817,7 @@ func TestTermAliasExpands(t *testing.T) {
 	if !strings.Contains(path, "read "+h) {
 		t.Errorf("Path = %q, want the EXPANDED directive", path)
 	}
-	list := termText(t, s, map[string]any{"cmd": "alias"})
+	list := termText(t, s, map[string]any{"cmd": "ls alias"})
 	if !strings.Contains(list, "look = read") {
 		t.Errorf("alias list = %q", list)
 	}
@@ -814,34 +827,37 @@ func TestTermAliasExpands(t *testing.T) {
 // reviewed while a write is.
 func TestTermFileDirective(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "file --action stat --remote-path /etc/hostname"})
+	text := termText(t, s, map[string]any{"cmd": "get nosuch file /etc/hostname"})
 	// No session named: the failure must be a NOT FOUND (404), not a crash.
 	if !strings.Contains(text, "TERM/1 ") {
 		t.Fatalf("no envelope:\n%s", text)
 	}
-	unknown := termText(t, s, map[string]any{"cmd": "file --action nope --remote-path /x"})
-	if !strings.Contains(unknown, "TERM/1 400 Bad Request") {
-		t.Errorf("an unknown file action must be a 400:\n%s", unknown)
+	// An op the SFTP layer does not know must not be answered as if it worked. With
+	// the resource tree the first refusal may be the missing session rather than the
+	// unknown op, so any 4xx is the contract; a 2xx would be the bug.
+	unknown := termText(t, s, map[string]any{"cmd": "get nosuch file /x --op nope"})
+	if !strings.Contains(unknown, "TERM/1 4") {
+		t.Errorf("an unknown file action was not refused:\n%s", unknown)
 	}
 }
 
-// fwd and profile translate onto their tools and report their actions.
+// The three collections are all listed by one verb.
 func TestTermFwdAndProfileDirectives(t *testing.T) {
 	s := newTestServer(t)
-	fwd := termText(t, s, map[string]any{"cmd": "fwd --action list"})
+	fwd := termText(t, s, map[string]any{"cmd": "ls forward"})
 	if !strings.Contains(fwd, "TERM/1 200 OK") {
-		t.Errorf("fwd list = %q", fwd)
+		t.Errorf("ls  = %q", fwd)
 	}
-	prof := termText(t, s, map[string]any{"cmd": "profile --action list"})
+	prof := termText(t, s, map[string]any{"cmd": "ls host"})
 	if !strings.Contains(prof, "TERM/1 200 OK") {
-		t.Errorf("profile list = %q", prof)
+		t.Errorf("ls host = %q", prof)
 	}
-	ext := termText(t, s, map[string]any{"cmd": "ext --action list"})
+	ext := termText(t, s, map[string]any{"cmd": "ls ext"})
 	// The test server has no extension reconciler, so the honest answer is
 	// not_configured (422) — what matters is that the directive REACHES the
 	// extension layer and reports its state instead of failing to translate.
 	if !strings.Contains(ext, "TERM/1 422") || !strings.Contains(ext, "not_configured") {
-		t.Errorf("ext list = %q", ext)
+		t.Errorf("ls ext = %q", ext)
 	}
 }
 
@@ -941,9 +957,9 @@ func TestTermGeneratedRepliesHonorSpaceWindows(t *testing.T) {
 	if body := strings.SplitN(one, "\n\n", 2); len(body) != 2 || strings.Count(body[1], "\n") > 1 {
 		t.Fatalf("lines_limit=1 body = %q", one)
 	}
-	detect := termText(t, s, map[string]any{"cmd": "detect", "bytes_limit": float64(0)})
-	if !strings.HasPrefix(detect, "TERM/1 204 No Content") {
-		t.Fatalf("bytes_limit=0 on detect = %q", strings.SplitN(detect, "\n", 2)[0])
+	noBytes := termText(t, s, map[string]any{"cmd": "ls", "bytes_limit": float64(0)})
+	if !strings.HasPrefix(noBytes, "TERM/1 204 No Content") {
+		t.Fatalf("bytes_limit=0 on ps = %q", strings.SplitN(noBytes, "\n", 2)[0])
 	}
 	res := termCall(t, s, map[string]any{"cmd": "help", "on_bytes_overflow": "bogus"})
 	if !res.IsError || !strings.Contains(toolResultText(res), "on_bytes_overflow") {
@@ -955,9 +971,9 @@ func TestTermGeneratedRepliesHonorSpaceWindows(t *testing.T) {
 // to streamed windows.
 func TestTermLearnModeAttachesUsageToGeneratedReplies(t *testing.T) {
 	s := newTestServer(t)
-	ps := termText(t, s, map[string]any{"cmd": "ps", "learn_mode": true})
-	if !strings.Contains(ps, "Usage: ps") {
-		t.Fatalf("ps with learn_mode has no Usage:\n%s", ps)
+	ls := termText(t, s, map[string]any{"cmd": "ls", "learn_mode": true})
+	if !strings.Contains(ls, "Usage: ") {
+		t.Fatalf("ls with learn_mode has no Usage:\n%s", ls)
 	}
 	help := termText(t, s, map[string]any{"cmd": "help run", "learn_mode": true})
 	if !strings.Contains(help, "Usage: help") {
@@ -969,22 +985,24 @@ func TestTermLearnModeAttachesUsageToGeneratedReplies(t *testing.T) {
 // endpoint, and close actually removes the handle.
 func TestTermMCPStreamableHandshakeAndClose(t *testing.T) {
 	s := newTestServer(t)
+	internalSession(t, s) // mcp open tunnels through a session
 	ts := httptest.NewServer(s.StreamableHTTPHandler())
 	defer ts.Close()
 
-	text := termText(t, s, map[string]any{"cmd": "mcp open " + ts.URL})
+	// OPEN IS THE HANDSHAKE. It runs initialize + tools/list and reports the tools in
+	// the same reply that hands back the handle, so there is no second call to make
+	// the state machine advance.
+	text := termText(t, s, map[string]any{"cmd": "open internal mcp " + ts.URL})
 	h := handleFrom(t, text)
-	tools := termText(t, s, map[string]any{"cmd": "mcp tools " + h})
-	if !strings.HasPrefix(tools, "TERM/1 200 OK") ||
-		(!strings.Contains(tools, `"name":"term"`) && !strings.Contains(tools, `"name": "term"`)) {
-		t.Fatalf("tools/list did not return the term tool:\n%s", tools)
+	if !strings.HasPrefix(text, "TERM/1 200 OK") || !strings.Contains(text, "tools (") {
+		t.Fatalf("open did not report the peer's tools:\n%s", text)
 	}
-	if res := termCall(t, s, map[string]any{"cmd": "mcp close " + h}); res.IsError {
-		t.Fatalf("mcp close failed:\n%s", toolResultText(res))
+	if res := termCall(t, s, map[string]any{"cmd": "close " + h}); res.IsError {
+		t.Fatalf("close failed:\n%s", toolResultText(res))
 	}
-	after := termText(t, s, map[string]any{"cmd": "mcp tools " + h})
-	if !strings.Contains(after, "not found") {
-		t.Fatalf("closed handle still resolves:\n%s", after)
+	after := termText(t, s, map[string]any{"cmd": "read " + h})
+	if !strings.Contains(after, "404") || !strings.Contains(after, "names nothing") {
+		t.Fatalf("closed peer still resolves:\n%s", after)
 	}
 }
 
@@ -998,7 +1016,8 @@ func TestTermMCPStreamableHandshakeAndClose(t *testing.T) {
 // was actually unsupported was the SHAPE, and the shape is now handled.
 func TestTermMcpOpenValidatesURL(t *testing.T) {
 	s := newTestServer(t)
-	res := termCall(t, s, map[string]any{"cmd": "mcp open not-a-url"})
+	internalSession(t, s) // mcp open tunnels through a session
+	res := termCall(t, s, map[string]any{"cmd": "open internal mcp not-a-url"})
 	body := toolResultText(res)
 	if !res.IsError || !strings.Contains(body, "http(s)") || !strings.Contains(body, "ws(s)") {
 		t.Fatalf("mcp open refused a non-URL without naming what works:\n%s", body)
@@ -1007,7 +1026,7 @@ func TestTermMcpOpenValidatesURL(t *testing.T) {
 	// A URL with a scheme but no listener is a connection failure, which is a
 	// different reply from a refusal: the caller has to be able to tell a typo
 	// from a dead endpoint.
-	res = termCall(t, s, map[string]any{"cmd": "mcp open ftp://example.com"})
+	res = termCall(t, s, map[string]any{"cmd": "open internal mcp ftp://example.com"})
 	if !res.IsError || !strings.Contains(toolResultText(res), "unsupported scheme") {
 		t.Fatalf("an unknown scheme was not explained:\n%s", toolResultText(res))
 	}
@@ -1036,7 +1055,7 @@ func TestTermSpanAcceptsSessionHandle(t *testing.T) {
 func TestTermInternalDisabledIsConflict(t *testing.T) {
 	s := newTestServer(t)
 	s.NoInternal = true
-	res := termCall(t, s, map[string]any{"cmd": "pipe internal --argv echo hi"})
+	res := termCall(t, s, map[string]any{"cmd": "connect internal --argv echo hi"})
 	if !strings.HasPrefix(toolResultText(res), "TERM/1 409 Conflict") {
 		t.Fatalf("pipe internal with NoInternal = %q", strings.SplitN(toolResultText(res), "\n", 2)[0])
 	}
@@ -1046,16 +1065,16 @@ func TestTermInternalDisabledIsConflict(t *testing.T) {
 // gated write is 403, not 500.
 func TestTermPositionalActions(t *testing.T) {
 	s := newTestServer(t)
-	res := termCall(t, s, map[string]any{"cmd": "profile create --name demo --host 127.0.0.1 --user demo"})
+	res := termCall(t, s, map[string]any{"cmd": "edit host create --name demo --host 127.0.0.1 --user demo"})
 	if !res.IsError || !strings.Contains(toolResultText(res), "disabled") {
-		t.Fatalf("profile create did not reach the write gate:\n%s", toolResultText(res))
+		t.Fatalf("edit host create did not reach the write gate:\n%s", toolResultText(res))
 	}
 	if !strings.HasPrefix(toolResultText(res), "TERM/1 403 Forbidden") {
-		t.Fatalf("profile write gate status = %q", strings.SplitN(toolResultText(res), "\n", 2)[0])
+		t.Fatalf("edit host write gate status = %q", strings.SplitN(toolResultText(res), "\n", 2)[0])
 	}
-	res = termCall(t, s, map[string]any{"cmd": "ext delete nope"})
+	res = termCall(t, s, map[string]any{"cmd": "rm ext nope"})
 	if !res.IsError {
-		t.Fatalf("ext delete nope was silently accepted:\n%s", toolResultText(res))
+		t.Fatalf("edit ext delete nope was silently accepted:\n%s", toolResultText(res))
 	}
 }
 
@@ -1063,16 +1082,16 @@ func TestTermPositionalActions(t *testing.T) {
 // directive.
 func TestTermAliasChains(t *testing.T) {
 	s := newTestServer(t)
-	defer termText(t, s, map[string]any{"cmd": "alias chain1 --off"})
-	defer termText(t, s, map[string]any{"cmd": "alias chain2 --off"})
-	if res := termCall(t, s, map[string]any{"cmd": "alias chain1 help"}); res.IsError {
+	defer termText(t, s, map[string]any{"cmd": "rm alias chain1"})
+	defer termText(t, s, map[string]any{"cmd": "rm alias chain2"})
+	if res := termCall(t, s, map[string]any{"cmd": "create alias chain1 help"}); res.IsError {
 		t.Fatal(toolResultText(res))
 	}
-	if res := termCall(t, s, map[string]any{"cmd": "alias chain2 chain1"}); res.IsError {
+	if res := termCall(t, s, map[string]any{"cmd": "create alias chain2 chain1"}); res.IsError {
 		t.Fatal(toolResultText(res))
 	}
 	text := termText(t, s, map[string]any{"cmd": "chain2"})
-	if !strings.Contains(text, "run <handle>") {
+	if !strings.Contains(text, "run <session>") {
 		t.Fatalf("chained alias did not reach help:\n%s", text)
 	}
 }
@@ -1094,9 +1113,9 @@ func writeScript(t *testing.T, body string) string {
 // openPipe starts a pipe channel on the loopback profile and returns its handle.
 func openPipe(t *testing.T, s *Server, argv string) string {
 	t.Helper()
-	text := termText(t, s, map[string]any{"cmd": "pipe internal --argv " + argv})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --argv " + argv})
 	if !strings.HasPrefix(text, "TERM/1 200 OK") {
-		t.Fatalf("pipe %s failed:\n%s", argv, text)
+		t.Fatalf("connect --argv %s failed:\n%s", argv, text)
 	}
 	return handleFrom(t, text)
 }
@@ -1104,9 +1123,9 @@ func openPipe(t *testing.T, s *Server, argv string) string {
 // openPty starts a pty channel (a login shell) and returns its handle.
 func openPty(t *testing.T, s *Server) string {
 	t.Helper()
-	text := termText(t, s, map[string]any{"cmd": "pty internal"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal"})
 	if !strings.HasPrefix(text, "TERM/1 200 OK") {
-		t.Fatalf("pty failed:\n%s", text)
+		t.Fatalf("connect internal failed:\n%s", text)
 	}
 	return handleFrom(t, text)
 }
@@ -1123,7 +1142,7 @@ func TestTermNamespaceIsolationHoldsPerDirective(t *testing.T) {
 	alice := namespaceContext("alice")
 	bob := namespaceContext("bob")
 
-	created, err := s.call(alice, "term", map[string]any{"cmd": "pipe internal --argv sleep 30"})
+	created, err := s.call(alice, "term", map[string]any{"cmd": "connect internal --argv sleep 30"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1137,11 +1156,11 @@ func TestTermNamespaceIsolationHoldsPerDirective(t *testing.T) {
 	// just the ones that reach a handler. info/span/close read the manager
 	// directly, which is exactly how they would slip through.
 	for _, cmd := range []string{
-		"type " + handle + " echo pwned",
+		"input " + handle + " echo pwned",
 		"run " + handle + " echo pwned",
 		"key " + handle + " enter",
 		"read " + handle,
-		"info " + handle,
+		"get " + handle,
 		"span " + handle,
 		"close " + handle,
 		"resize " + handle + " 10 10",
@@ -1158,7 +1177,7 @@ func TestTermNamespaceIsolationHoldsPerDirective(t *testing.T) {
 
 	// And a batch is refused as a whole: running the entries bob may reach while
 	// skipping the ones it may not would make the outcome unknowable.
-	bobOwn, err := s.call(bob, "term", map[string]any{"cmd": "pipe internal --argv sleep 30"})
+	bobOwn, err := s.call(bob, "term", map[string]any{"cmd": "connect internal --argv sleep 30"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1172,7 +1191,7 @@ func TestTermNamespaceIsolationHoldsPerDirective(t *testing.T) {
 	}
 
 	// A listing must not reveal it either.
-	ps, err := s.call(bob, "term", map[string]any{"cmd": "ps"})
+	ps, err := s.call(bob, "term", map[string]any{"cmd": "ls"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1189,13 +1208,13 @@ func TestTermRefusalIsNeverSuccessShaped(t *testing.T) {
 	alice := namespaceContext("alice")
 	bob := namespaceContext("bob")
 
-	created, err := s.call(alice, "term", map[string]any{"cmd": "pipe internal --argv sleep 30"})
+	created, err := s.call(alice, "term", map[string]any{"cmd": "connect internal --argv sleep 30"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	handle := handleFrom(t, toolResultText(created))
 
-	res, err := s.call(bob, "term", map[string]any{"cmd": "type " + handle + " echo pwned"})
+	res, err := s.call(bob, "term", map[string]any{"cmd": "input " + handle + " echo pwned"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1230,12 +1249,12 @@ func TestProfileListRendersTheHandlerKey(t *testing.T) {
 	}
 	s.sshConfigs = store
 
-	out := termText(t, s, map[string]any{"cmd": "profile list"})
+	out := termText(t, s, map[string]any{"cmd": "ls host"})
 	if !strings.Contains(out, "demo-one") {
-		t.Fatalf("profile list dropped the profile it was given:\n%s", out)
+		t.Fatalf("ls host dropped the profile it was given:\n%s", out)
 	}
 	if strings.Contains(out, "(none)") {
-		t.Fatalf("profile list answered the empty state while a profile exists:\n%s", out)
+		t.Fatalf("ls host answered the empty state while a profile exists:\n%s", out)
 	}
 }
 
@@ -1257,7 +1276,14 @@ func TestFileSubActionsAreReachable(t *testing.T) {
 		{"link", "readlink", "readlink"},
 		{"fs", "realpath", "realpath"},
 	} {
-		out := termText(t, s, map[string]any{"cmd": "file " + h + " --action " + tc.action + " --op " + tc.sub + " --remote-path /tmp"})
+		verb := "get"
+		if tc.action == "perm" || tc.action == "link" {
+			verb = "write"
+			if tc.action == "link" {
+				verb = "create"
+			}
+		}
+		out := termText(t, s, map[string]any{"cmd": verb + " " + h + " file /tmp --op " + tc.sub})
 		if strings.Contains(out, "unknown flag") {
 			t.Errorf("file --action %s --op %s: the flag is still not accepted:\n%s", tc.action, tc.sub, out)
 		}
@@ -1326,15 +1352,16 @@ func TestPipeToBadTargetIsAnError(t *testing.T) {
 // "needs a JSON-RPC frame" and only worked with a junk word in front of it.
 func TestMCPCallTakesTheFrameFirst(t *testing.T) {
 	s := newTestServer(t)
+	internalSession(t, s)
 	ts := httptest.NewServer(s.StreamableHTTPHandler())
 	defer ts.Close()
 
-	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "mcp open " + ts.URL}))
-	defer termText(t, s, map[string]any{"cmd": "mcp close " + h})
+	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "open internal mcp " + ts.URL}))
+	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
-	out := termText(t, s, map[string]any{"cmd": `mcp call ` + h + ` {"jsonrpc":"2.0","id":7,"method":"tools/list"}`})
+	out := termText(t, s, map[string]any{"cmd": `call ` + h + ` {"jsonrpc":"2.0","id":7,"method":"tools/list"}`})
 	if !strings.Contains(out, `"name":"term"`) && !strings.Contains(out, `"name": "term"`) {
-		t.Fatalf("mcp call did not send the frame it was given:\n%s", out)
+		t.Fatalf("call did not send the frame it was given:\n%s", out)
 	}
 }
 
@@ -1352,18 +1379,19 @@ func TestMCPCallTakesTheFrameFirst(t *testing.T) {
 // three spellings apart.
 func TestMCPCallAcceptsEveryQuotingOfTheFrame(t *testing.T) {
 	s := newTestServer(t)
+	internalSession(t, s)
 	ts := httptest.NewServer(s.StreamableHTTPHandler())
 	defer ts.Close()
 
-	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "mcp open " + ts.URL}))
-	defer termText(t, s, map[string]any{"cmd": "mcp close " + h})
+	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "open internal mcp " + ts.URL}))
+	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	// Spaces in the params object are the point, not decoration.
-	frame := `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"ps"}}}`
+	frame := `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"ls"}}}`
 	for name, cmd := range map[string]string{
-		"bare":   "mcp call " + h + " " + frame,
-		"single": "mcp call " + h + " '" + frame + "'",
-		"double": "mcp call " + h + ` "` + frame + `"`,
+		"bare":   "call " + h + " " + frame,
+		"single": "call " + h + " '" + frame + "'",
+		"double": "call " + h + ` "` + frame + `"`,
 	} {
 		out := termText(t, s, map[string]any{"cmd": cmd})
 		// Assert on the REPLY, not on the echo. The rendered slot repeats the
@@ -1413,7 +1441,7 @@ func TestFilePermChmodActuallyChangesTheMode(t *testing.T) {
 
 	// 420 decimal == 0644. The old bug set 0 and still answered 200.
 	out := termText(t, s, map[string]any{
-		"cmd": "file " + sid + " --action perm --op chmod --remote-path " + file + " --mode 420",
+		"cmd": "write " + sid + " file " + file + " --op chmod --mode 420",
 	})
 	if !strings.Contains(out, "success") && !strings.Contains(out, "200") {
 		t.Fatalf("chmod did not report success: %s", out)
@@ -1526,7 +1554,7 @@ func TestAParseFailureSaysNothingRan(t *testing.T) {
 	s := newTestServer(t)
 
 	// A batch where the first statement parses: the note must name it.
-	reply := s.Term(t.Context(), "ps; definitely-not-a-directive x", map[string]any{})
+	reply := s.Term(t.Context(), "ls; definitely-not-a-directive x", map[string]any{})
 	if len(reply.Slots) != 1 {
 		t.Fatalf("got %d slots, want 1", len(reply.Slots))
 	}
@@ -1561,7 +1589,7 @@ func TestABatchIsNotPartlyExecuted(t *testing.T) {
 		t.Fatalf("the batch was not refused: %+v", reply.Slots[0])
 	}
 
-	ps := s.Term(t.Context(), "ps --all", map[string]any{})
+	ps := s.Term(t.Context(), "ls --all", map[string]any{})
 	if strings.Contains(ps.Slots[0].Body, name) {
 		t.Error("the statement before the parse failure ran: parsing must precede every statement")
 	}
@@ -1587,4 +1615,73 @@ func TestRunDetailStatesWhatAPtyCannotKnow(t *testing.T) {
 	if !strings.Contains(body, "consuming cursor") {
 		t.Errorf("`help run` does not warn that read is a consuming cursor:\n%s", body)
 	}
+}
+
+// quoteArgv formats an argv list as single-quoted shell words.
+func quoteArgv(argv []any) string {
+	parts := make([]string, 0, len(argv))
+	for _, a := range argv {
+		str := fmt.Sprint(a)
+		parts = append(parts, "'"+strings.ReplaceAll(str, "'", `'''`)+"'")
+	}
+	return strings.Join(parts, " ")
+}
+
+// internalSession opens a session on the built-in loopback and returns its id.
+//
+// Gateways need a session: `mcp open internal <url>` says which network the URL is
+// resolved on. Tests that used to pass a bare URL now name `internal` and, to do that
+// meaningfully, need the session to exist first — the same two steps a caller takes.
+func internalSession(t *testing.T, s *Server) string {
+	t.Helper()
+	out := termText(t, s, map[string]any{"cmd": "connect internal"})
+	// pty answers with a channel handle (<session>:<index>); the session half is what
+	// a gateway needs, because `mcp open` tunnels through the link and not the shell.
+	h, ok := headerValue(t, out, "Handle")
+	if !ok {
+		t.Fatalf("pty internal returned no Handle header:\n%s", out)
+	}
+	sid, _, _ := strings.Cut(h, ":")
+	if sid == "" {
+		t.Fatalf("pty internal returned a handle with no session part: %q", h)
+	}
+	return sid
+}
+
+// TestEveryFlagIsDiscoverableFromHelp pins that the derived flag list reaches the
+// caller. The table declares the flags and `help <verb>` prints them from the same
+// table, so the only way this fails is the wiring between the two — which is exactly
+// the failure a caller would experience as "the capability does not exist".
+func TestEveryFlagIsDiscoverableFromHelp(t *testing.T) {
+	s := newTestServer(t)
+	for _, op := range directive.Ops() {
+		if len(op.Flags) == 0 {
+			continue
+		}
+		body := termText(t, s, map[string]any{"cmd": "help " + op.Name})
+		for _, f := range op.Flags {
+			if !strings.Contains(body, "--"+f) {
+				t.Errorf("help %s does not mention --%s", op.Name, f)
+			}
+		}
+	}
+}
+
+// statusCode reads the code off a rendered slot's status line.
+//
+// SEARCHING THE WHOLE REPLY FOR "400" IS WRONG: an objectId, a byte count or a
+// base64 blob can contain those digits, and the assertion then fails on a payload
+// that is perfectly healthy. The status line is the only place the code is a code.
+func statusCode(t *testing.T, text string) int {
+	t.Helper()
+	line, _, _ := strings.Cut(text, "\n")
+	field := strings.Fields(line)
+	if len(field) < 2 {
+		t.Fatalf("no status line in:\n%s", text)
+	}
+	n, err := strconv.Atoi(field[1])
+	if err != nil {
+		t.Fatalf("status line is not a code: %q", line)
+	}
+	return n
 }

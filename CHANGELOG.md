@@ -2,8 +2,61 @@
 
 ## Unreleased
 
+## v0.2.8-rc.4 — 2026-10-22
 
+- **`get host <name>` 读回一个 host，口令只报有无不改值**。此前 host 能建、能改、能列、能删，就是读不回来：`ls host` 只有名字，改一个字段时无法知道其余字段当前是什么，于是「部分修改」只能靠猜，而猜错就是覆盖。现在 `get host <name>` 返回条目内容，密码与密钥口令替换为 `has_password` / `has_passphrase`——把口令放进回复等于写进 transcript 和日志，而调用方真正要问的是「有没有设置」。读取不是变更，所以不受 `--mcp-manage-ssh-configs` 限制：列表本来就开放，只藏字段不藏名字没有意义。`ls host <name>` 也不再静默丢掉名字返回全表，而是明说要读单个条目该用哪个动词。
+
+- **补上四处「表里写了、实际用不了」的能力**。`--jump-host` 一直存在，但校验要求每一跳自带凭据，而表里只有 host/user/port 三个跳板 flag，于是任何跳板配置都被拒；新增 `--jump-password` / `--jump-private-key` / `--jump-key-passphrase`。`--op truncate` 要求 `--size`，而 `write` 根本没有这个 flag，truncate 因此没有可用的写法。硬链接没有入口：`write --op link` 缺 target，handler 要的是 existing_path/new_path；现在 `create <session> file <新名> --op link --target <已有文件>`，与软链接 `--target` 同一句式。另外 `reader` 在进程已结束的通道上过去回 500 `buffer: closed`，把可预期的生命周期状态报成了内部故障；现在是 409，并说明它已产生的输出仍然可以用 `read` 读到。
+
+
+- **指令表面重写成「动词 + 资源树上的地址」（破坏性，无旧名保留）**。原来是三种互不相干的形状：`verb target`（`run`、`read`、`close`）、`noun verb`（`host`、`ext`、`mcp`、`cdp`、`jrpc`）、以及 `noun --action verb`（`file`、`fwd`）。最后一种是最刺眼的证据：`file` 是唯一不接受位置动作的指令，`file nosuch read` 回 `400 file needs --action …`，而同表的 `read nosuch` 是 404——同一个错误在两张表里有两种报法，因为「哪个词是动词」这件事从来没有定论。现在只有一种形状：**一个动词，加上它作用的那个节点**。资源树是 `host → session → { <index> = channel, file <path>, forward <id>, mcp|cdp|jrpc <url> }`，`ext` 在旁边独立成列。`connect <host>` 建一个 session，`open <session>` 给它加子节点（通道 / 文件 / 转发 / peer），其余动词作用在一个节点上。23 条指令收敛成 **19 个动词**：`connect open ls get close rm run input key resize span reader read write call create edit notify help`。
+
+  几个由此消失的概念，而不是被重命名：
+
+  - **`pty` / `pipe` 不再是指令**。它们是 `open <session>` 的创建模式，规则直接借 ssh 的：有 `--argv` 就是无终端的管道，没有就是终端，`--pty` 可以强制回来。这不只是省一个词——pty 没有「命令结束」的信号，所以退出码读不到；一个要跑单条命令的调用方如果拿到的是终端，会把空回复读成「没有输出」而不是「还在跑」。
+  - **`profile` 不再需要别名**。`host` 本来就是这个东西的名字，现在它是树上的顶层节点（`ls host` / `create host` / `rm host`），而不是一个带 `--action` 的指令。
+  - **`mcp` / `cdp` / `jrpc` 不再是动词**。它们是 `open <session> <kind> <url>` 造出来的子节点。`mcp call` / `cdp recv` / `jrpc send` 这三种拼法一并归到 `call` / `read` / `write`：帧永远走 `call`（payload 逐字节，引号不重写），读帧走 `read --frame`。通道上跑 stdio server 与网络 peer 用同一套动词，调用方不需要知道自己面对的是哪一种。
+  - **`file` 的十一个 `--action` 按语义分给了动词**：读内容 `read <session> file <path>`，写内容 `write`，查路径 `get`，建目录/软链 `create`，删 `rm`。`--old-text` 让 `write` 变成原地替换——是「写」还是「改」取决于提供了什么，而不是第二个词。
+  - **`ps` 与 `host list` / `ext list` / `fwd --action list` 合并成一个 `ls`**。列举是同一个动作，只是集合不同：`ls`、`ls host`、`ls ext`、`ls <session>`、`ls <session> forward`。`ls <session>` 是对同一份列表的收窄，不是另一张表。
+  - **`info` 改名 `get`**，`type` 改名 `input`，`fwd` 拆进 `open`/`close`/`ls`。`a1f3:1` 与 `a1f3 1` 现在等价：冒号是 `ls` 打印出来的样子，空格是语法本身。
+
+  语法层面加了两样东西支撑它：`Op.Kinds` 声明一个动词接受哪些子资源（`open` 是 `forward/mcp/cdp/jrpc`，`ls` 是 `forward/file/host/ext/alias`），`Statement.Kind` 与 `Statement.Key` 承载解析结果，于是 kind 可以写在目标**前面或后面**；以及 `Op.MaxArgs`，让「这些词必须走 `--argv`」成为一个可拒绝的条件而不是静默丢弃（`connect host sleep 5` 看着像 `ssh host sleep 5`，直接回 400 并点名 `--argv`）。
+
+  顺带修掉三处测试暴露出来的真问题：`connect <host> --argv cmd` 之前建成的是 pty（`ssh host cmd` 的语义是无 tty），所以一次单命令调用的退出码读不到；关闭通道时不释放它的帧游标，而句柄单调递增，等于每条开过的通道泄漏一个 map 项；`read <pipe 通道>` 会把普通命令输出当 JSON-RPC 解析，现在帧要显式 `--frame`。
+
+  `help <verb>` 现在还会打印一张**从同一张表派生**的 flag 清单（`flagList`），所以 25 个 flag 的 `create host` 也不必在手写 usage 行里塞满；`TestEveryFlagIsDiscoverableFromHelp` 盯着这条线真的到达调用方。
+
+- **被动监听与唤醒机制整体移除（破坏性）**。`watch` 指令、`shell_notify` 工具（及其 `notify.list` / `notify.delete`）、`internal/notify` 的规则管理器、以及「审批状态变化唤醒 Agent」的那条接线，一并删掉了。它们要解决的是同一个问题：命令跑到一半停下来等人在终端里回答时，Agent 怎么知道自己该回来了。实测这条路走不通——`notifications/resources/updated` 是订阅作用域且无 payload，MCP 也没有「把通知注入模型对话」的原语，所以注册成功的规则可能一次都不响，而失败是静默的：调用方以为自己挂了监听，实际在等一个不会来的信号。留着比删掉更危险，因为它把「继续轮询」伪装成「已经安排好了」。现在只有单向的 `notify`：它把人叫过来，然后**停下来等人**——等待由回复本身承载（长命令的回复会带回窗口内到达的字节，`Still-Running: true` 说明还没结束），而不是靠一个可能永不触发的回调。能力表里 `shell.notify` 随之消失，新增 `shell_archive`（关闭通道时归档其记录）。
+
+- **`write --old-text / --new-text`：精确替换，命中必须唯一**。新增的 `file --action replace` 在动词重写后并入 `write`：`--old-text` 必须在文件里**恰好出现一次**，0 次或多次都报错，多次时错误给出命中次数。这是特性不是限制——改错地方的代价远高于多写几个字符的上下文。实现是「写同目录临时文件 + rename」，POSIX 上原子且保留原文件权限；Windows 上 rename 不能覆盖已存在的文件，退化为先删后改名（一处短暂缺失，明确取舍而非将就）。超过 16 MiB 的文件被拒绝——那是搬运，不是编辑。
+
+- **`mcp` / `cdp` / `jrpc` 的连接改从 session 里穿过去（破坏性）**。`... open <url>` 变成 `... open <session> <url>`。此前这三个网关用的是 termcp 自己的网络栈：`http.DefaultClient` 与 `websocket.DefaultDialer`，于是同一个 URL 的含义取决于 termcp 恰好跑在哪台机器上——`cdp open http://localhost:9222` 连的是**进程所在机器**的调试端口，不是被控主机的。这不只是别扭：它等于给 termcp 加了一项目标主机的网络从未授予的能力（从本机打出任意出站连接），而走 session 则什么也没加——复用的就是 `-L` 那条已有隧道。现在 `internal/jrpc` 的 `Open` 必须拿到一个 `DialFunc`，`dialerForSession` 用 `sess.SSHClient().Dial` 实现它，HTTP transport 与 websocket dialer 都换成这一条。`<session>` 既接受 `ps` 打印的 id，也接受 host 名（`internal`、`prod`），后者解析到该 host 下**唯一**在跑的 session；有两三个同名目标时报错并列出 id 让你选，而不是替你在可能不同的跳板/代理之间猜一个。顺带修掉一处必然的失败：x/crypto 的 SSH channel 不实现 deadline（`ssh: tcpChan: deadline not supported`），而 gorilla 拨号时会设 deadline 并检查返回值，所以 websocket 过隧道一开始就必然失败；`deadlineFreeConn` 让三个 SetDeadline 静默成功，超时仍由 context 负责（channel 随 context 结束而拆掉）。
+
+- **`profile` 改名 `host`**。`profile` 是这个项目自己造的词，而它描述的东西——一台机器在哪、用什么用户和密钥连——调用方本来就有名字：host。`host` 现在是正式名，`profile` 不再接受——这是一次重写，留着旧拼法只会让「哪个词是对的」重新变成需要猜的事。用法行、拒绝信息（`host needs --action …`）、审批摘要（`create host x`）一并改了。同时把全表 `Usage` 里的 `<handle>` 换成 `<channel>`：`handle` 这个词已经废除，通道就叫 channel，写成 `<session>:<index>`。
+
+- **`ps` 带上 `learn_mode` 会展开「拿到地址之后能做什么」**。`learn_mode` 原本只给**当前**这条指令挂 usage，对 `ps` 几乎没用——刚跑完 `ps` 的调用方手里是一把地址，正想问这些地址能喂给谁，而列表本身只有 id 和状态，说不出 `close a1f3:1` 归档通道、`rm a1f3` 抹掉会话。现在 `ps learn_mode:true` 在列表后面接上 `info` / `close` / `rm` / `resize` / `read` / `span` 的用法行，一次调用换掉四次 `help` 往返。
+
+- **`initialize` 的 instructions 重写成「这是什么」**。原来是七条规则，其中三条是「不要做 X」：读完只知道每一种失败方式，不知道手里拿着什么。现在按世界本身组织——`cmd` 是 DSL 而 `sh` 是 shell 命令（`sh` 只作为值经 `args`/`vars` 进入）、`session`／`channel` 是什么、能力集中在 `ext list`、状态集中在 `ps`、以及一条无法从任何东西推导出来的硬边界（越过人的权限不可逆）与被 held 的调用不能重试。1799 B，仍在上限内；`TestNoSpecDriftBetweenDirectivesAndSkill` 与 `TestTokenBudgetGuard` 两个方向都还锁着。
+
+- **cdp 门补齐成一台可用的浏览器控制台，挂在 `cdp` 这个资源下面**。此前 `cdp` 只是把 WebSocket 当普通帧通道转发，于是把浏览器交给 Agent 的每一步都要手工拼装：`Target.getTargets` 找 targetId、`Target.attachToTarget` 拿 sessionId、之后每条帧自己往 JSON 里塞那串十六进制——而这一串最容易错的地方恰恰是静默的：少写 sessionId 的帧不会被拒绝，它被发给浏览器进程，于是 `Page.navigate` 回了 frameId、页面没动。现在：
+
+  - **地址沿用资源树的规则，`:N` 表示连接，不再是自增句柄**。一台机器上的第二个浏览器、第二个 MCP server 现在表示得出来：`open internal cdp http://…:9222` → `internal cdp:1`，再开一个 → `internal cdp:2`，编号由这一层给、不复用，并在 `ls` 里列出来。旧的自增句柄（`mcp1` / `cdp1` / `jrpc3`）整个删除：它只出现在 `open` 的那一行回复里，`ls` 看不见，丢了就找不回来，也不告诉你它挂在哪个 session 上。标签页**不编号**：一条连接就能管理整个浏览器实例，页靠浏览器自己的 targetId 指（`internal cdp:1@7D87…`），那是 `Target.getTargets` 已经打印的东西，再编一套号只会让同一个东西有两个名字。只开了一条连接时编号可以省略（`internal cdp`）；开了两条还省略就回 `400` 并列出候选，而不是替你猜一个——猜错的表现是驱动了另一个浏览器、而回复说成功。
+  - `mcp` / `jrpc` 用同一套（`internal mcp:1`、`internal mcp:2`），stdio server 仍按通道地址；`ls <session> <kind>` 列连接，`ls <session> cdp:1` 列标签页。
+  - `ls <session> cdp:1` 直接列标签页与已附着状态（问浏览器，不查缓存），`open <session> cdp:1 --target <targetId>` 创建一个页面地址 `<session> cdp:1@<targetId>`，之后 `call <session> cdp:1@<targetId> '<frame>'` 由这一层补 sessionId。顺序错（先 enable 后 attach）不再沉默：帧发到浏览器进程时回 `400` 并点明「这是页面级方法」。`close <session> cdp:1@<targetId>` 只断开附着，标签页还在。
+  - **一条连接上的帧按页过滤**。一条 socket 承载所有已附着页的帧，靠帧里的 sessionId 区分；`read <session> cdp:1@<targetId> --since N` 只回那一页的帧，不写目标时连浏览器级的帧一起回。
+  - **`call` 不再把帧当参数吃掉**。`call <session> cdp '<frame>'` 的帧是整行剩余部分，但解析器原先会把第一个词当成资源树的 key（那是 `read <session> file <path>` 的规则），于是报「needs a JSON-RPC frame」——说的正是它刚吞掉的那个帧。payload 类动词现在只从紧贴写法（`cdp:1`、`cdp@<targetId>`）取 key。
+  - **帧不再被吃掉**。`recv` 是一次性出队，CDP 又从不重放事件，于是「记录一个位置、做动作、回看期间发生了什么」根本做不到。`internal/jrpc` 现在给每个收到的帧编上单调序号并保留一个环形窗口，`read <session> cdp:1 --since N` 按游标取增量且**不消费**，回答带 `Latest`、`Frames` 两个头，所以下一次调用从上一个号继续。`--grep` 在窗口之前过滤。
+  - **大答案变回执，不再塞进上下文**。超过 4 KB 的应答不再内联——回执给出帧号、字节数和前 512 字节，正文留在帧日志里：`read <session> cdp:1 --at 57 --offset 4096` 按字节翻页，`Next-Offset` 可直接接着用。此前这种做法只有一个坏结局：外层窗口把它截成半截 JSON，既大到不值得付 token，又坏到没法用。`--at` 是帧日志的另一条轴——`--since` 沿时间翻，`--at` 在一帧内部翻，两者都不消费。分页边界会让出半个字符，所以一页可能比要求的少一两个字节。
+  - **大脚本不必穿过工具**。帧是命令行，所以 200 KB 的 bundle 得由调用方逐字节吐出来——这是唯一无法扩展的一步。浏览器自己去取就行：在会话自己的网络上把它 serve 出来，再往页面里挂一个指向该 URL 的 `<script>`：`open <session> --argv python3 -m http.server 8123` 起服务，`Runtime.evaluate` 追加一个 `document.createElement('script')`。只有 URL 穿过工具，而 127.0.0.1 是浏览器自己的回环——文件根本不必离开它所在的那台机器。整个过程只用已有的动词：那个"服务器"是一个普通 pipe 通道，注入是一条普通 CDP 方法。原始 CDP 没有 `addScriptTag`（那是 Puppeteer 的助手），所以帧自己建元素。
+  - **unicode 转义还原成字符**。Chrome 把每个非 ASCII 都写成 `\uXXXX`，一路透传的结果是中文标题以转义形式到达调用方——两倍 token，且要人在脑子里解码。帧在出口做一次解码（其它转义、`\\u`、孤立代理项原样保留）。
+  - **协议取自浏览器自己**：`get <session> cdp:1 protocol [Domain]` 读 `/json/protocol`（与 socket 走同一条 SSH 链路），不再有第二份会漂移的方法表。
+  - 一次性形式 `call <session> cdp@<targetId> '<frame>'`（attach → call → detach，已有会话则复用而不拆掉；已附着的目标也可直接写 `cdp:1@<targetId>`）。传输/协议错误现在是**失败回复**（4xx/5xx）而不是 `200` 里裹一个 `{"error":…}`，并针对两种常见陷阱给出下一句该做什么。
+
+- **转发默认值全部改为 loopback**。`remote`（`ssh -R`）的 `--local-host` 默认从 `0.0.0.0` 改为 `127.0.0.1`，与 `local`/`dynamic` 的 `--bind-host` 一致：端口是经认证隧道的出口，发布到网络是一个决定，不是缺省行为。测试与示例里的 Chrome 调试端口也固定 `--remote-debugging-address=127.0.0.1`——裸的 `--remote-debugging-port` 会让 Chrome 监听所有网卡，在 Windows 上每次跑测试都弹一次防火墙确认框。
 ## v0.2.8-rc.3 — 2026-10-21
+
+- **构建工具链升到 Go 1.27，纳入 crypto/x509 中间证书 denylist（GO-2026-6809 / CVE-2026-111943）**。此前 `go.mod`、CI 与 Dockerfile 全部钉在 Go 1.25，而 1.25 已停止维护、永远不会带这个修复：连接 HTTPS/WSS 的远程 MCP server 时，若对端证书链途经已被吊销的中间证书且系统信任库未更新，未修补的 `x509.Certificate.Verify` 会放行。仓库没有自定义 TLS 验证（全走标准库默认路径），所以修复就是工具链：`go.mod` 最低版本提到 `go 1.27.3`（`go install` 构建随之强制带修复），CI 与 Docker 镜像跟到 1.27，本次发布起的预编译二进制都带 denylist。
+
 
 - **底部会话栏列出的是会话，不再是窗口**。它原来只遍历 `allShellWins()`，于是底栏只认识「这个页面自己打开过的窗口」：MCP 的 `pty` / `session_start`、`POST /api/sessions`、以及「窗口关了但会话还在跑」这三种会话全都不在栏里——服务端一直在广播完整的 snapshot，是前端把列表建在了 DOM 上。现在 `dockEntries()` 取「所有打开窗口 ∪ snapshot 里运行中的会话」，以会话为键（`sess:<id>`；占位窗口与扩展状态卡仍是 `win:<id>`），所以关掉窗口标签不会消失，勾选也跟着会话走。没有窗口的会话以虚线上边框绘制，点一下即开终端（`focusSessionWindow`）；中键仍只丢窗口、不动会话。归档会话留在右列，扩展自己的连接留在扩展列——与两张卡片的 `isHiddenSession` 同一条规则。关闭对话框的计数与动作现在用同一个谓词（`entries`），连接中的窗口不再被排除在「要停止几个会话」之外。
 

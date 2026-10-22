@@ -83,7 +83,11 @@ func TestWithLogging_PassesThroughResultAndError(t *testing.T) {
 	}
 }
 
-func TestWithLogging_LogsDebugEntryAndExit(t *testing.T) {
+// TestWithLogging_LogsEntryAndExitAtInfo pins that a SUCCESSFUL call is logged at
+// the default level. It used to be Debug, which meant a support report of a broken
+// reply could not be matched to a command: everything that worked was invisible and
+// the log's last line was an unrelated failure.
+func TestWithLogging_LogsEntryAndExitAtInfo(t *testing.T) {
 	cap := withCapturedLogger(t)
 
 	h := func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -101,16 +105,16 @@ func TestWithLogging_LogsDebugEntryAndExit(t *testing.T) {
 	}
 
 	entry := records[0]
-	if entry.Level != slog.LevelDebug {
-		t.Fatalf("entry record: expected Debug level, got %v", entry.Level)
+	if entry.Level != slog.LevelInfo {
+		t.Fatalf("entry record: expected Info level, got %v", entry.Level)
 	}
 	if v, ok := attrValue(entry, "tool"); !ok || v.String() != "test_tool" {
 		t.Fatalf("entry record: expected tool=test_tool, got %v (found=%v)", v, ok)
 	}
 
 	exit := records[len(records)-1]
-	if exit.Level != slog.LevelDebug {
-		t.Fatalf("exit record: expected Debug level, got %v", exit.Level)
+	if exit.Level != slog.LevelInfo {
+		t.Fatalf("exit record: expected Info level, got %v", exit.Level)
 	}
 	if v, ok := attrValue(exit, "tool"); !ok || v.String() != "test_tool" {
 		t.Fatalf("exit record: expected tool=test_tool, got %v (found=%v)", v, ok)

@@ -82,7 +82,7 @@ func TestHTTPTermReturnsTheSameEnvelope(t *testing.T) {
 	if got := slots[0]["code"]; got != float64(200) {
 		t.Errorf("code = %v, want 200", got)
 	}
-	if body, _ := slots[0]["body"].(string); !strings.Contains(body, "help [directive]") {
+	if body, _ := slots[0]["body"].(string); !strings.Contains(body, "help [verb]") {
 		t.Errorf("body does not look like the help listing: %q", body)
 	}
 
@@ -136,11 +136,11 @@ func TestHTTPTermBatchIsOneReplyPerStatement(t *testing.T) {
 
 	// Two statements that both succeed: one reply, two slots, each labelled with
 	// the command it ran.
-	slots := termSlots(t, postTerm(t, s, `{"cmd":"ps; help"}`))
+	slots := termSlots(t, postTerm(t, s, `{"cmd":"ls; help"}`))
 	if len(slots) != 2 {
 		t.Fatalf("got %d slots, want 2 (one per statement)", len(slots))
 	}
-	if got := slots[0]["Path"]; got != "ps" {
+	if got := slots[0]["Path"]; got != "ls" {
 		t.Errorf("first slot Path = %v, want ps", got)
 	}
 	if got := slots[1]["Path"]; got != "help" {
@@ -149,7 +149,7 @@ func TestHTTPTermBatchIsOneReplyPerStatement(t *testing.T) {
 
 	// An unknown directive is a parse error: one slot, its own code, and the whole
 	// directive table so the caller learns the shape without a second call.
-	rec := postTerm(t, s, `{"cmd":"ps; nosuchdirective x"}`)
+	rec := postTerm(t, s, `{"cmd":"ls; nosuchdirective x"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: nothing in the command parsed", rec.Code)
 	}
@@ -285,8 +285,8 @@ func TestCmdThatIsNotAStringIsA400(t *testing.T) {
 		body string
 	}{
 		{"number", `{"cmd": 42}`},
-		{"array", `{"cmd": ["ps"]}`},
-		{"object", `{"cmd": {"line": "ps"}}`},
+		{"array", `{"cmd": ["ls"]}`},
+		{"object", `{"cmd": {"line": "ls"}}`},
 		{"bool", `{"cmd": true}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -322,7 +322,7 @@ func TestAbsentCmdIsStillTheGuide(t *testing.T) {
 		}
 		slots := termSlots(t, rec)
 		text, _ := slots[0]["body"].(string)
-		if !strings.Contains(text, "termcp terminal") {
+		if !strings.Contains(text, "termcp — a shell-like DSL") {
 			t.Errorf("%s did not return the guide: %q", body, text[:min(120, len(text))])
 		}
 	}
@@ -338,7 +338,7 @@ func TestHTTPTermEmptyBodyIsTheGuide(t *testing.T) {
 		t.Fatalf("code = %v, want 200", got)
 	}
 	body, _ := slots[0]["body"].(string)
-	if !strings.Contains(body, "termcp terminal") {
+	if !strings.Contains(body, "termcp — a shell-like DSL") {
 		t.Errorf("empty body did not return the guide: %q", body[:min(120, len(body))])
 	}
 }
@@ -358,9 +358,9 @@ func TestHTTPTermAdmitsThroughTheCapabilityTable(t *testing.T) {
 	sid := guardTestSession(t, s, []string{capability.ShellList}, nil)
 
 	// `ps` only lists, so it is admitted.
-	slots := termSlots(t, postTerm(t, s, `{"cmd":"ps"}`))
+	slots := termSlots(t, postTerm(t, s, `{"cmd":"ls"}`))
 	if got := slots[0]["code"]; got != float64(200) {
-		t.Errorf("ps over HTTP = %v, want 200 for a listing-only template", got)
+		t.Errorf("ls over HTTP = %v, want 200 for a listing-only template", got)
 	}
 
 	// `run` writes to the shell, which the template does not grant.
@@ -577,7 +577,7 @@ func TestEscapeHeaderKeepsCarriageReturns(t *testing.T) {
 // reply, two projections, one answer.
 func TestHeaderAndBodyAgreeOnAPathWithCR(t *testing.T) {
 	s := newTestServer(t)
-	rec := postTerm(t, s, `{"cmd": "info \"a\rb\""}`)
+	rec := postTerm(t, s, `{"cmd": "get \"a\rb\""}`)
 	slots := termSlots(t, rec)
 	bodyPath, _ := slots[0]["Path"].(string)
 	if !strings.Contains(bodyPath, "\r") {

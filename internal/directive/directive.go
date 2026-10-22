@@ -46,7 +46,7 @@ const (
 	// reaches the shell as `'a'"b"'c'`, not as `abc`.
 	KindPayload
 	// KindInterpreted is a payload that is also a NAME, not a command line
-	// (`alias jira mcp open <url>`): the payload is one shell word, so a
+	// (`alias jira mcp open internal <url>`): the payload is one shell word, so a
 	// following argument is not part of it.
 	KindInterpreted
 )
@@ -76,6 +76,20 @@ const (
 	// TargetSession requires a container: a session id, an entry name, or a locator
 	// naming a session.
 	TargetSession
+
+	// TargetChain names a channel in EITHER of its two spellings: the short handle
+	// `a1f3:1`, or a session followed by an index, `a1f3 1`.
+	//
+	// THE SECOND SPELLING IS THE POINT. A channel is not an object with its own
+	// existence — it is the index-th thing hanging off a session, exactly like
+	// `file <path>` and `forward <id>`. Writing it as a session plus a key is what
+	// makes the resource tree legible: everything under a session is addressed
+	// `<session> <kind> <key>`, and for a channel the kind is the empty string and
+	// the key is the index.
+	//
+	// The parser normalises the spaced form to the handle, so every handler below
+	// still sees one spelling and no reader has to handle two.
+	TargetChain
 )
 
 // Op is one directive's grammar.
@@ -100,8 +114,31 @@ type Op struct {
 	// nothing. The directives that DO say are the ones where the two spellings mean
 	// different things, which is exactly the set that used to guess.
 	TargetKind TargetKind
+	// Kinds lists the sub-resource names this verb accepts in the position right
+	// after the target: `read a1f3 file /etc/passwd`, `open a1f3 forward …`.
+	//
+	// THE KIND IS PART OF THE ADDRESS, NOT A FLAG. Everything under a session is
+	// named `<session> <kind> <key>` — a file by path, a forward by id, a peer by
+	// handle — and a channel by index alone, which is why the channel case needs no
+	// word here. Declaring the vocabulary in the table is what lets the parser refuse
+	// `read a1f3 flie /x` as a misspelling instead of silently reading "flie" as a
+	// path relative to nothing.
+	//
+	// The first entry is the DEFAULT: a verb whose kind can be inferred from
+	// TargetKind's shape (channels) lists none, and a verb that needs one lists it.
+	Kinds []string
 	// Flags lists the accepted option names (without the leading --).
 	Flags []string
+	// RetiredFlags documents flags that were removed, paired with their replacement.
+	// An error naming a retired flag tells the caller what to use instead of leaving
+	// them with a bare "unknown flag".
+	RetiredFlags map[string]string
+	// MaxArgs is a CEILING on positional arguments, and 0 means "not declared".
+	// It exists for the verbs whose words must arrive as a flag: `connect host sleep
+	// 5` looks exactly like `ssh host sleep 5`, but the words would be dropped, so
+	// they are refused instead of silently ignored.
+	MaxArgs int
+
 	// MinArgs is the minimum number of POSITIONAL arguments after the target,
 	// for the flag kinds (a payload kind is governed by whether a payload exists
 	// at all). It is checked so a truncated command fails here, with a usage
@@ -159,6 +196,13 @@ type Op struct {
 type Statement struct {
 	Op     string
 	Target string
+	// Kind is the sub-resource named after the target, when the verb accepts one:
+	// "file", "forward", "mcp". It is empty for a channel, whose key is the index
+	// and which is therefore addressed by the target alone.
+	Kind string
+	// Key is the sub-resource's identifier: a path for file, an id for forward, a
+	// url for a peer. It is empty when Kind is.
+	Key string
 	// Args are the positional arguments after the target.
 	Args []string
 	// Flags holds --name[=value] options.
@@ -187,6 +231,32 @@ type Statement struct {
 	// the source slice for this statement, trimmed. It is the command echo, so it
 	// is the caller's own bytes, not a canonical re-rendering.
 	Path string
+	// Cond is how this statement relates to the one before it: "" (unconditional,
+	// the first statement or one separated by `;`), "&&" or "||".
+	//
+	// IT CONNECTS TWO DIRECTIVES, NOT TWO SHELL COMMANDS. `&&` and `||` used to
+	// fall inside a payload, so `run h:1 make && echo ok` handed the whole
+	// "make && echo ok" line to the shell and the shell short-circuited it. That is
+	// still what happens when the caller writes a shell line — but a shell line now
+	// has to arrive through `$1` or `$FOO`, because those are the channels for
+	// shell text. Everything the caller writes directly in cmd is directive
+	// syntax, and `&&` between two directives means "run the next one only if this
+	// one answered 2xx".
+	//
+	// The split is not a reparse: the substitution table turns each value into one
+	// opaque token before parsing, so a `&&` inside args[0] can never be mistaken
+	// for an operator here.
+	Cond string
+
+	// Background is true when this statement was terminated with `&`, which makes it
+	// PARALLEL: it runs concurrently with the statements around it instead of waiting
+	// for them, and the reply still lists every slot in the order the caller wrote.
+	//
+	// The distinction matters because the shell parser reports `a & b` as two
+	// statements and this flag is the only record that the first one was meant to
+	// run in the background. Without it the line executed SEQUENTIALLY while reading
+	// as parallel — a silent semantic reversal, which is worse than refusing it.
+	Background bool
 }
 
 // Flag returns a flag's value and whether it was given one.
@@ -290,111 +360,151 @@ type File struct {
 // ops is the directive set. It is the whole user-facing grammar in one table,
 // so `help`, the error usage lines and the parser cannot disagree.
 var ops = []Op{
-	{Name: "run", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChannel,
-		Usage:  "run <handle> <payload>   |   payload: 原样交给 shell，协议不分词",
-		Detail: runDetail},
-	{Name: "type", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChannel,
-		Usage:  "type <handle> <payload>   |   只打字，不回车",
-		Detail: typeDetail},
-	{Name: "key", Core: true, Kind: KindFlags, Target: true, MinArgs: 1, Flags: []string{"repeat"}, TargetKind: TargetChannel,
-		Usage: "key <handle> <key> [--repeat N]"},
-	{Name: "read", Core: true, Kind: KindFlags, Target: true, TargetKind: TargetChannel,
-		Flags:     []string{"cursor", "from-line", "tail", "stream", "raw"},
-		Valueless: []string{"raw"},
-		Usage:     "read <handle> [--cursor N|--from-line N|--tail N] [--stream o|e] [--raw]",
-		Detail:    readDetail},
-	{Name: "pipe", Core: true, Kind: KindPayload, Target: true,
-		Flags: []string{"argv", "name", "on-exit", "rows", "cols"}, RestValue: []string{"argv"},
-		Usage:  "pipe <entry|session> [--name ...] [--on-exit keep|close] [--rows N] [--cols N] [--argv <command> [args…]]",
-		Detail: argvDetail},
-	{Name: "pty", Core: true, Kind: KindPayload, Target: true,
-		Flags: []string{"argv", "name", "on-exit", "size"}, RestValue: []string{"argv"},
-		Usage:  "pty <entry|session> [--name ...] [--size 24x80] [--argv <command> [args…]]",
-		Detail: argvDetail},
-	{Name: "ps", Core: true, Kind: KindFlags, Flags: []string{"shells", "all"}, Valueless: []string{"shells", "all"},
-		Usage: "ps [--shells] [--all]"},
-	{Name: "info", Core: true, Kind: KindFlags, Target: true,
-		Usage: "info <session|handle>"},
-	{Name: "resize", Kind: KindFlags, Target: true, MinArgs: 2, TargetKind: TargetChannel,
-		Usage: "resize <handle> <rows> <cols>"},
-	{Name: "close", Core: true, Kind: KindFlags, Target: true, Flags: []string{"force", "grace"}, Valueless: []string{"force"},
-		Usage:  "close <handle|session> [--force] [--grace N]",
+	// THE TABLE IS VERBS, NOT VERB-NOUN PAIRS, AND IT IS SHORT BECAUSE THE TREE IS
+	// NOT REPEATED HERE.
+	//
+	// It was 23 entries named after what each one wrapped — `pty`, `pipe`, `ps`,
+	// `fwd`, `file`, `span` — so the implementation leaked into the command
+	// language: two ways to start a shell, three ways to list things, and
+	// `--action` for the two directives that had grown sub-verbs. A caller had to
+	// learn 23 words and which of three argument shapes each one used.
+	//
+	// There is one resource tree — host → session → {channel, file, forward, peer} —
+	// and a statement names a node in it. `forward`, `mcp`, `cdp` and `jrpc` do NOT
+	// appear below because they are CHILDREN, not actions: they are made with
+	// `open <session> <kind>` and stop being verbs at all. `delete` is absent for the
+	// same reason: a host is a top-level node, so `rm host prod` already says it.
+
+	// --- on a session and what hangs off it ---
+
+	{Name: "connect", Core: true, Kind: KindFlags, Target: true,
+		Flags:     []string{"name", "mode", "argv", "rows", "cols", "size", "on-exit"},
+		RestValue: []string{"argv"},
+		MaxArgs:   1,
+		Usage:     "connect <host> [--argv <command>] [--on-exit keep|close] [--name …]",
+		Detail:    connectDetail},
+	{Name: "open", Core: true, Kind: KindFlags, Target: true, TargetKind: TargetSession,
+		Kinds: []string{"forward", "mcp", "cdp", "jrpc"},
+		Flags: []string{"pipe", "pty", "argv", "name", "on-exit", "rows", "cols", "size",
+			"bind-host", "remote-host", "remote-port", "local-port", "local-host",
+			"dynamic", "remote", "target"},
+		Valueless: []string{"pipe", "pty", "dynamic", "remote"},
+		RestValue: []string{"argv"},
+		Usage:     "open <session> [--argv <cmd> [--pty]]   |   open <session> forward …   |   open <session> mcp|cdp|jrpc <url>   |   open <session> cdp:N --target <targetId>",
+		Detail:    openDetail},
+	{Name: "ls", Core: true, Kind: KindFlags, Target: true, TargetOptional: true,
+		Kinds:     []string{"forward", "file", "host", "ext", "alias", "cdp", "mcp", "jrpc"},
+		Flags:     []string{"all"},
+		Valueless: []string{"all"},
+		Usage:     "ls   |   ls host   |   ls ext   |   ls alias   |   ls <session> [forward|file]",
+		Detail:    lsDetail},
+	{Name: "get", Core: true, Kind: KindFlags, Target: true,
+		Kinds:  []string{"file", "host", "protocol", "cdp", "mcp", "jrpc"},
+		Flags:  []string{"op"},
+		Usage:  "get <session|channel|host-name>   |   get <session> file <path> [--op stat|realpath|urls|…]   |   get <session> cdp[:N][@target] [protocol [Domain]]",
+		Detail: getDetail},
+	{Name: "close", Core: true, Kind: KindFlags, Target: true,
+		// mcp/cdp/jrpc/file are DECLARED SO THEY ARE REFUSED BY NAME. Dropping them
+		// from the list does not make `close <session> mcp 1` invalid — the word simply
+		// becomes a stray positional argument and the statement still reaches the
+		// container. A declared kind is recognised, and the dispatcher's default branch
+		// then answers with what to write instead.
+		Kinds: []string{"forward", "mcp", "cdp", "jrpc", "file"},
+		Flags: []string{"grace", "forward-id"},
+		RetiredFlags: map[string]string{
+			"force": "--force is gone. `close` stops and keeps the record, `rm` erases it.",
+		},
+		Usage:  "close <session> [<index>]   |   close <peer>",
 		Detail: closeDetail},
 	{Name: "rm", Kind: KindFlags, Target: true, TargetKind: TargetSession,
-		Flags: []string{"force"}, Valueless: []string{"force"},
-		Usage:  "rm <session> [--force]",
-		Detail: rmDetail},
-	{Name: "span", Kind: KindFlags, Target: true, TargetKind: TargetChannel,
-		Usage:  "span <handle>",
+		Kinds:     []string{"file", "host", "ext", "alias"},
+		Flags:     []string{"force", "dry-run"},
+		Valueless: []string{"force", "dry-run"},
+		Usage:     "rm <session>   |   rm <session> file <path>   |   rm host|ext|alias <name>",
+		Detail:    rmDetail},
+
+	// --- inside a channel ---
+
+	{Name: "run", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChain,
+		Usage:  "run <session> <index> <line>",
+		Detail: runDetail},
+	{Name: "input", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChain,
+		Usage:  "input <session> <index> <text>",
+		Detail: inputDetail},
+	{Name: "key", Core: true, Kind: KindFlags, Target: true, MinArgs: 1, Flags: []string{"repeat"}, TargetKind: TargetChain,
+		Usage: "key <session> <index> <key> [--repeat N]"},
+	{Name: "resize", Kind: KindFlags, Target: true, MinArgs: 2, TargetKind: TargetChain,
+		Usage: "resize <session> <index> <rows> <cols>"},
+	{Name: "span", Kind: KindFlags, Target: true, TargetKind: TargetChain,
+		Usage:  "span <session> <index>",
 		Detail: spanDetail},
-	{Name: "reader", Kind: KindFlags, Target: true, Flags: []string{"drop"}, TargetKind: TargetChannel,
-		Usage: "reader <handle>   |   reader <handle> --drop <id>"},
-	{Name: "watch", Kind: KindFlags, Target: true, TargetOptional: true, TargetKind: TargetChannel,
-		Flags:     []string{"event", "for", "off", "list", "channel"},
-		Valueless: []string{"list"},
-		Usage:     "watch <handle> [--event output|exit|silence] [--for N] [--channel resource|sampling]   |   watch --off <rule>   |   watch --list",
-		Detail:    watchDetail},
-	{Name: "notify", Kind: KindPayload, Flags: []string{"level", "sticky", "on", "title", "for"}, Valueless: []string{"sticky"},
-		Usage:  "notify [--level info|success|warn|error] [--sticky] [--on <session>] [--title T] [--for SECONDS] <body>",
-		Detail: notifyDetail},
-	{Name: "detect", Kind: KindFlags,
-		Usage: "detect"},
-	{Name: "fwd", Kind: KindFlags, Target: true, TargetOptional: true,
-		Flags:  []string{"action", "session", "bind-host", "remote-host", "remote-port", "local-port", "local-host", "forward-id"},
-		Usage:  "fwd <session> --action local|remote|dynamic|list|close …",
-		Detail: fwdDetail},
-	{Name: "file", Kind: KindFlags, Target: true,
-		Flags: []string{"action", "remote-path", "from-path", "to-path", "local-path", "data", "mode",
-			"offset", "length", "local-offset", "target", "link-path", "existing-path", "new-path",
-			"uid", "gid", "atime", "mtime", "size", "op", "action-verb"},
-		Usage:  "file <session> --action read|write|stat|delete|rename|mkdir|urls|perm|link|fs|getwd [--op <sub-action>] …",
-		Detail: fileDetail},
-	{Name: "profile", Kind: KindFlags,
-		Flags: []string{"action", "name", "host", "user", "port", "password", "private-key", "key-passphrase",
+	{Name: "reader", Kind: KindFlags, Target: true, Flags: []string{"drop"}, TargetKind: TargetChain,
+		Usage: "reader <session> <index>   |   reader <session> <index> --drop <id>"},
+
+	// --- bytes in and out of a node ---
+
+	{Name: "read", Core: true, Kind: KindFlags, Target: true,
+		Kinds:     []string{"file", "cdp", "mcp", "jrpc"},
+		Flags:     []string{"cursor", "since", "at", "offset", "bytes", "from-line", "tail", "stream", "raw", "grep", "grep-limit", "frame"},
+		Valueless: []string{"raw", "frame"},
+		Usage:     "read <session> <index> [--tail N|--from-line N|--cursor N] [--grep RE]   |   read <session> file <path>   |   read <session> cdp|mcp|jrpc[:N][@target] [--since N] [--grep RE]   |   read <session> cdp:N --at FRAME [--offset BYTES] [--bytes N]",
+		Detail:    readDetail},
+	// NO TargetKind: `write <session> file <path>` names a container and
+	// `write <handle> <frame>` names a channel, so a shape check would refuse one of
+	// the two legitimate forms. The dispatcher tells them apart by Kind.
+	{Name: "write", Kind: KindFlags, Target: true,
+		Kinds: []string{"file"},
+		// --size is the truncate target. It was missing, so `--op truncate` could not be
+		// satisfied by any spelling: the handler requires remote_path and size, and the
+		// flag for size did not exist.
+		Flags:  []string{"data", "mode", "local-path", "offset", "length", "size", "old-text", "new-text", "op", "uid", "gid", "atime", "mtime"},
+		Usage:  "write <session> file <path> [--data TEXT|--local-path FILE] [--mode …] [--op chmod|truncate|…]",
+		Detail: writeDetail},
+
+	// --- a peer: one call, or the manual send/recv pair ---
+
+	{Name: "call", Kind: KindPayload, PayloadSpan: spanVerbatim, Target: true,
+		Kinds:     []string{"cdp", "mcp", "jrpc"},
+		Flags:     []string{"send"},
+		Valueless: []string{"send"},
+		Usage:     "call <session> cdp|mcp|jrpc[:N][@target] [--send] <frame>   |   call <channel> <frame>",
+		Detail:    callDetail},
+
+	// --- configuration, which outlives any session ---
+
+	{Name: "create", Kind: KindFlags, Target: true,
+		Kinds: []string{"host", "ext", "alias", "file"},
+		Flags: []string{"name", "host", "user", "port", "password", "private-key", "key-passphrase",
 			"trust-unknown-host", "known-hosts", "dial-timeout-seconds", "proxy", "description",
-			"default-shell", "default-mode", "default-approval", "jump-host", "jump-user", "jump-port", "source"},
-		Valueless: []string{"trust-unknown-host", "default-approval"},
-		Usage:     "profile list|create|edit|copy|delete …",
-		Detail:    profileDetail + "\n\n" + profileFileFormat},
-	{Name: "ext", Kind: KindFlags,
-		Flags: []string{"action", "name", "kind", "target", "description", "command", "args", "url", "headers",
-			"mode", "rows", "cols", "allow", "paths", "notes", "enabled", "forwards"},
-		Valueless:   []string{"enabled"},
-		RestValue:   []string{"args"},
-		AlsoKnownAs: []string{"extensions"},
-		Usage:       "ext list|get|create|update|delete|retry …",
-		Detail:      extDetail},
-	{Name: "jrpc", Kind: KindPayload, PayloadSpan: spanVerbatim,
-		Usage:  "jrpc open <url>   |   jrpc call|send|recv|close <handle> …",
-		Detail: jrpcDetail},
-	{Name: "mcp", Kind: KindPayload, PayloadSpan: spanVerbatim,
-		Usage:  "mcp open <url>   |   mcp tools|send|recv|call|close <handle> …",
-		Detail: mcpDetail},
-	{Name: "cdp", Kind: KindPayload, PayloadSpan: spanVerbatim,
-		Usage:  "cdp open <url|http-endpoint>   |   cdp call|send|recv|close <handle> …",
-		Detail: cdpDetail},
-	{Name: "alias", Kind: KindPayload, PayloadSpan: spanWords,
-		Usage: "alias <name> <directive>   |   alias   |   alias <name> --off"},
+			"default-shell", "default-mode", "default-approval",
+			"jump-host", "jump-user", "jump-port", "jump-password", "jump-private-key", "jump-key-passphrase",
+			"source", "kind", "target", "command", "args", "url", "headers", "allow", "paths",
+			"notes", "enabled", "forwards", "link-path", "mode", "op"},
+		Valueless: []string{"trust-unknown-host", "default-approval", "enabled"},
+		RestValue: []string{"args"},
+		Usage:     "create host|ext|alias <name> [flags]   |   create <session> file <path> [--target <path-it-points-at> [--op link]]",
+		Detail:    createDetail + "\n\n" + hostFileFormat},
+	{Name: "edit", Kind: KindFlags, Target: true,
+		Kinds: []string{"host", "ext", "alias"},
+		Flags: []string{"name", "host", "user", "port", "password", "private-key", "key-passphrase",
+			"trust-unknown-host", "known-hosts", "dial-timeout-seconds", "proxy", "description",
+			"default-shell", "default-mode", "default-approval",
+			"jump-host", "jump-user", "jump-port", "jump-password", "jump-private-key", "jump-key-passphrase",
+			"kind", "target", "command", "args", "url", "headers", "allow", "paths", "notes", "enabled",
+			"forwards"},
+		Valueless: []string{"trust-unknown-host", "default-approval", "enabled"},
+		RestValue: []string{"args"},
+		Usage:     "edit host|ext|alias <name> [flags]",
+		Detail:    editDetail},
+
+	// --- no resource ---
+
+	{Name: "notify", Kind: KindPayload, Flags: []string{"level", "sticky", "on", "title", "for"}, Valueless: []string{"sticky"},
+		Usage:  "notify [--level info|success|warn|error] [--sticky] [--on <session>] [--title T] <body>",
+		Detail: notifyDetail},
 	{Name: "help", Core: true, Kind: KindFlags,
-		Usage: "help [directive]"},
+		Usage: "help [verb]"},
 }
-
-// watchDetail is the waiting rule, kept where a caller looks it up: the agent
-// that held a terminal at a sudo prompt polled read in a loop because nothing
-// told it waiting on a human is a supported move rather than a hang.
-const watchDetail = `Register an async wake-up rule on a handle and stop polling; you are woken when
-it fires. Events: output (any new bytes), exit (the process ended), silence (N
-seconds with no output). Human at a prompt (sudo, password, a confirmation):
-notify the human FIRST, then watch --event output on that handle — silence
-fires on nobody speaking, which is the state you are already in while you wait.
-One task's rule, not the handle's: watch --off <rule> when it is answered.
-watch wakes the Agent; notify reaches the human.
-
---channel picks how the wake-up travels: resource (a resources/updated
-notification, which any client can receive) or sampling (a createMessage the
-client must have declared support for). Omit it and the server decides.
-Defaults: --event output, --for 3 seconds (silence), --channel omitted = sampling
-when the client declared it, resource otherwise.`
 
 // spanDetail decodes the one-letter statuses, which are terse by design (they are
 // written to log.jsonl for every status change) and unreadable without this.
@@ -404,25 +514,35 @@ span, so a window can be read by position instead of by streaming.
 Two offsets, two questions. The byte range is where the COMMAND began and ended.
 The @column is where the LINE RANGE begins — earlier, by the width of the prompt
 that preceded the command on that line. Paging by position uses the @column:
-read <handle> --from-line <line> starts exactly there, while --cursor on the
+read <session> <index> --from-line <line> starts exactly there, while --cursor on the
 range start lands mid-line.
 
 status: o output (the shell's own bytes), a AI input, i human input, q approval
 asked, A approved input. i/q mean a person operated; a means the agent did.`
 
-// notifyDetail is the rule for reaching the human, stated where a caller looks it
-// up. It used to be the notify_user tool's description; with one tool there is no
-// per-operation description to hang it on, and the rule is exactly the kind of
-// thing `help` exists for: needed at the moment of use, noise before it.
 const notifyDetail = `Toasts + a system notification on every open Web UI page; --on highlights that
 session's card. Call it BEFORE asking the human for anything — password, sudo,
 MFA, passphrase, confirmation, approval, a choice, interactive input — and when
 a long task ends or fails. Blocking asks: --level warn|error --sticky. Once you
 have asked, WAIT: never poll, guess or fake an answer. A reply with no open page
 was delivered to nobody, so say the ask in your own reply too. Defaults: --level
-info; the toast lasts 10 seconds unless --sticky. --title sets the heading (the
-body is still the positional argument); --for N is the toast's lifetime in
-seconds, which --sticky overrides to "until dismissed".`
+info; the toast lasts 10 seconds unless --sticky.
+
+PUT THE ACTION IN --title. The OS notification layer collapses long text: only the
+first line or so is shown, and several notifications from the same app fold into
+"one more". A body that opens with a paragraph of context therefore arrives as a
+truncated sentence. The title is what survives, so make it the instruction —
+"Need sudo password for zfs destroy" — and let the body carry the detail.
+
+DELIVERED IS NOT ACKNOWLEDGED. The reply's delivered count is how many open pages
+the toast reached. It does not mean a human looked: Do Not Disturb, a collapsed
+notification group and a locked screen all leave delivered at 1 while nobody has
+read anything. There is no acknowledgement to wait on. If the answer matters,
+also say it in your own reply, which reaches the human wherever they actually are.
+
+--for N is the toast's lifetime in seconds; --sticky overrides it to "until
+dismissed". A sticky toast is the right choice for a blocking ask: it stays on the
+page until it is dealt with, rather than timing out while the human is away.`
 
 // readDetail states the defaults because "read" without a selector is the
 // common call: whether that means "new bytes" or "everything" decides what the
@@ -436,7 +556,47 @@ READ IS A CURSOR. A plain read CONSUMES what it returns: the next plain read of
 an unchanged channel is legitimately empty, which is not data loss and not an
 error. To see the whole log again, ask for it by position (--from-line 1); to
 peek without consuming, use bytes_limit 0 on the call (it returns the handle and
-the range it would have read).`
+the range it would have read).
+
+--grep RE FILTERS BEFORE THE WINDOW, AND THE DIFFERENCE MATTERS. The pattern runs
+over this daemon's own transcript — the command already finished, its bytes are
+here, and shipping 2000 lines so you can find three of them is the most expensive
+thing a read can do. Each returned line keeps its REAL line number ("42: ..."),
+so context is one more call away (from-line 37 tail 10). grep-limit caps the
+matches (default 200) and the reply reports the true total when it truncates.
+--tail and lines_limit then apply to the MATCHES, so tail 5 means the last
+five matching lines.
+
+This is a directive and not a tool parameter on purpose: lines_limit answers "how
+much reply will I get" while a pattern answers "which lines do I want". Folded
+together, lines_limit would mean either "the first N raw lines, then filter" —
+which finds nothing when the matches come later and reads like "no errors" — or
+"scan everything, then take N matches", which hides a full scan behind something
+that looks like a size cap.
+
+ON A PEER, --since IS THE OTHER HALF. A plain 'read a1f3 cdp:1' takes the next frame
+off the queue, once. 'read a1f3 cdp:1 --since N' reads the FRAME HISTORY — everything with a
+number greater than N — and does not consume it, so asking again gives the same
+answer. That is the only way to use CDP events: an event is never replayed, so a
+reader that was not looking at the moment it fired needs a window to look back
+into.
+
+  get internal cdp:1                 reports Latest: record it before an action
+  read internal cdp:1 --since 42     what arrived after 42, each line prefixed n
+  read internal cdp:1 --since 42 --grep Page\.   the same, filtered first
+
+The reply reports the range it returned and the latest number, so the next call
+resumes exactly where this one stopped.
+
+--at PAGES INSIDE ONE FRAME, which is the other axis. A frame too big to inline is
+answered as a receipt naming its number; --offset starts that frame at a byte and
+--bytes sets the page size (4 KB by default). Offsets are bytes, the reply reports
+Offset and Next-Offset, and a slice never ends in the middle of a character.
+
+  read internal cdp:1 --at 57 --offset 0
+  read internal cdp:1 --at 57 --offset 4096 --bytes 512
+
+--since moves through TIME; --at moves through one payload. Neither consumes.`
 
 // runDetail states what `run` can and cannot know, because the difference is
 // invisible in the reply and the wrong guess sends the caller chasing a silent
@@ -487,7 +647,186 @@ consuming cursor, so the bytes the sample already took are no longer there.
 For a program whose output you need in full, prefer pipe (--argv) on the same
 entry — its exit IS observable, so a read after it returns the whole output.`
 
-const typeDetail = `TYPING IS NOT SUBMITTING. type sends the bytes to the shell's input line and
+const openDetail = `Add a child to a session you already have: a channel, a forward, or a peer.
+
+THE MODE IS SSH'S OWN RULE, which is why it needs no remembering: ssh host gives you a
+terminal, ssh host cmd runs cmd without one, ssh -t host cmd forces a terminal back.
+
+  --argv present   a PIPE: no terminal, and the exit code is readable
+  no --argv        a PTY: a terminal that stays open
+  --pty / --pipe   override the rule either way
+
+It matters beyond bookkeeping. A pty has no "the command finished" signal, so an exit
+code cannot be read on one; a caller that asked for a single command and got a
+terminal would read an empty reply as "no output" instead of "still running".
+
+  open a1f3                        a pty
+  open a1f3 --argv make            a pipe; its exit code is observable
+  open a1f3 --argv make --pty      a pty running make
+
+--on-exit keep|close decides what happens to a PIPE channel when its process exits:
+keep leaves it readable (the default, so its output is never lost), close frees it
+immediately. It has no meaning on a pty, whose shell does not exit.
+
+The other children are named by a KIND before the key:
+
+  open a1f3 forward --local-port 8080 --remote-host db --remote-port 5432
+  open a1f3 mcp http://localhost:8080/mcp
+  open a1f3 cdp http://localhost:9222
+
+EVERY PEER IS NUMBERED, and the number names the CONNECTION:
+
+  open a1f3 cdp http://localhost:9222    answered with a1f3 cdp:1
+  open a1f3 cdp http://localhost:9333    answered with a1f3 cdp:2
+
+Two browsers on one machine are cdp:1 and cdp:2 — that is what the number is for.
+The number is given here and never reused, so an address you wrote down keeps
+meaning what it meant.
+
+A TAB INSIDE A CONNECTION IS NOT NUMBERED. One connection manages the whole browser,
+and the browser already names its tabs, so a page is <peer>@<targetId>:
+
+  open a1f3 cdp:1 --target <targetId>    answered with a1f3 cdp:1@<targetId>
+
+That address carries the CDP sessionId, so every later 'call a1f3 cdp:1@<targetId>'
+reaches that page without the caller pasting an opaque id into the JSON. With one
+connection open the number may be left out; with two it may not, because guessing
+would drive the wrong browser while the reply said it worked.
+
+TO CONNECT TO A HOST, use connect. open only ever acts on a session that exists,
+which is why it cannot be confused with one: the two words name different steps.
+
+` + mcpDetail + `
+
+` + cdpDetail + `
+
+` + jrpcDetail + "\n"
+
+const connectDetail = `Start a session: one SSH link to a host.
+
+EVERY CALL IS A NEW LINK. There is no "reuse if one is running" rule, because that
+rule would make the result of a call depend on state the caller cannot see — two
+calls would sometimes give one link and sometimes two. Calling connect twice gives
+two sessions, always.
+
+  connect prod                    a session, ready for open
+  connect prod --argv htop        ...with a first channel already running it
+
+The host must already be configured: ls host lists them, create host adds one.`
+
+const lsDetail = `List a node of the resource tree.
+
+  ls                    live sessions and channels
+  ls host               connection targets that can be connected
+  ls ext                capability already configured here
+  ls a1f3               a session's channels, each with its mode
+  ls a1f3 forward       its tunnels
+  ls a1f3 file /var/log a directory on it
+  ls a1f3 cdp           the browser connections on that session
+  ls a1f3 cdp:1         the tabs inside one, and which are attached
+
+THE NOUN IS PART OF THE ADDRESS, not a separate flag: what hangs off a session is
+addressed <session> <kind> <key>. Omitting the kind means channels, whose key is the
+index — so a1f3:1 and a1f3 1 are the same node.
+
+` + "`ls <peer>` asks the peer, not a cache: a tab list one navigation stale would\nhand out target ids that no longer attach."
+
+const getDetail = `Describe one node: a session, one of its channels, or a peer.
+
+  get a1f3              status, endpoint, mode, age
+  get a1f3:1            that channel's state
+  get a1f3 cdp:1            the connection: endpoint, frame cursor, attached tabs
+  get a1f3 cdp:1@<id>       one tab: target, url, enabled domains
+  get a1f3 cdp:1 protocol   the browser's OWN command list (the live /json/protocol)
+  get a1f3 cdp:1 protocol Page   one domain's commands and their parameters
+
+For the list of what exists, use ls.
+
+WHY THE PROTOCOL IS ASKED FOR rather than remembered: a hardcoded method table is a
+second truth, and it drifts silently the moment the browser updates — a caller fills
+in parameters that no longer exist and reads the resulting error as their own fault.
+The browser publishes its own signature; this reads it.`
+
+const callDetail = `Send one JSON-RPC frame to a peer opened with
+"open <session> mcp|cdp|jrpc <url>", and wait for the reply that answers it.
+
+  call internal mcp:1 '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+  call internal cdp:1 {"method":"Target.getTargets"}
+  call internal cdp:1@7D87AB {"method":"Page.navigate","params":{"url":"about:blank"}}
+
+THE ADDRESS IS THE WHOLE STATE. cdp:1 is which connection; @7D87AB is which tab in
+it. A tab address fills in the sessionId that the attach minted, so a page-level
+method does not have to carry it — and cannot go to the browser process by accident,
+which the browser answers with "wasn't found" instead of a refusal.
+
+THE FRAME IS VERBATIM: it is not shell-quoted, so the JSON reaches the peer exactly
+as written. That is also why a quote in it is not a quoting problem to solve.
+
+AN ERROR FROM THE PEER IS A FAILING REPLY, not a 200 with {"error":…} in the body: a
+caller branches on the status, so a silent-looking success is the worst answer this
+door can give. The message also says what to do about the two common traps (a
+page-level method sent to the browser; a sessionId whose tab closed).
+
+  --send       do not wait. The reply is 202 and the answer arrives on read <peer>.
+               This is the only way to send a notification, which never has an
+               answer to wait for.
+
+A BIG ANSWER IS A RECEIPT. Over 4 KB the reply carries the frame's number, its size
+and its first bytes instead of the payload — a JSON document cut in the middle is
+too big to have been worth the tokens and too broken to use. Page it back:
+
+  read internal cdp:1 --at 57 --offset 4096
+  read internal cdp:1 --at 57 --offset 0 --bytes 512
+
+A peer that answers with a request of its own (sampling, progress) is not answered
+here; those arrive on read <peer>. A reply that never comes times out with the
+window, and the frame stays outstanding — read <peer> may still deliver it.`
+
+const writeDetail = `Write a file on a session.
+
+  write a1f3 file /tmp/x --data hello
+  write a1f3 file /tmp/x --local-path ./x
+  write a1f3 file /tmp/x --data hex:00ff
+
+--data decodes by --mode (text by default, so \n is a newline). For binary use hex:
+or --local-path. The write is a plain overwrite, not an append: use --offset only
+when you mean to patch bytes in place.`
+
+const createDetail = `Create saved configuration. It outlives every session and needs no connection.
+
+  create host prod --host 10.0.0.5 --user deploy --private-key '…'
+  create host staging --source prod --name staging    copy an existing entry
+  create ext myserver --kind mcp --command npx --args '-y' 'some-server'
+  create alias ll 'ls a1f3'
+
+WRITES ARE GATED. An instance started without --mcp-manage-ssh-configs refuses host
+writes with 403 and names that flag. Do not retry or reword: the switch is not
+something a call can turn on.`
+
+const editDetail = `Change saved configuration.
+
+  edit host prod --port 2222
+  edit ext myserver --notes 'use for the billing repo'
+  edit alias ll 'ls a1f3'
+
+A HOST ENTRY IS REMOVED WITH rm, NOT edit: rm host prod. Configuration and live objects
+share the erase verb because they are the same intent on different halves of the tree —
+delete exists only for the composite form, rm host|ext|alias.
+
+Same gate as create: without --mcp-manage-ssh-configs a host write is refused 403.`
+
+const deleteDetail = `Remove saved configuration.
+
+  delete host prod
+  delete ext myserver
+  delete alias ll
+
+DELETE IS FOR CONFIGURATION, rm IS FOR LIVE OBJECTS. A session is a running thing and
+is removed with rm; a host entry is a saved one and is removed with delete. Keeping
+the two verbs apart is what stops "did that stop it or forget it?" from being a
+question.`
+
+const inputDetail = `TYPING IS NOT SUBMITTING. type sends the bytes to the shell's input line and
 stops there; nothing runs until something presses enter. That is what makes it
 useful for driving a TUI, where enter would confirm a menu item instead of starting
 a command — and it is the trap when you meant to run a command:
@@ -523,6 +862,16 @@ const fileDetail = `Actions and the flags each one uses.
   write                --remote-path --data | --local-path --mode text|hex|file
                        --offset is the REMOTE write position; --local-offset the
                        position inside --local-path; --length caps the transfer
+  replace              --remote-path --old-text --new-text
+
+REPLACE IS EXACT AND UNIQUE, AND THAT IS THE FEATURE. --old-text must appear in the
+file EXACTLY ONCE; zero matches and several matches are both errors, and the
+ambiguous one names the count so you can add surrounding context rather than guess.
+It reads, rewrites to a temporary file beside the original, and renames over it, so
+a reader sees the old file or the new one and never a half-written one, and the
+mode is preserved. Use it for editing a line in a file too big to rewrite by hand;
+--data on write replaces the WHOLE file, which loses anything that changed since
+you read it. Files over 16 MiB are refused: exact replace is an edit, not a copy.
 
 --mode MEANS TWO DIFFERENT THINGS, by action. For read and write it is a STRING:
 text, hex, or file ("file" reads or writes --local-path as raw bytes). For
@@ -657,52 +1006,64 @@ any interactive shell.`
 // Both are silent when got wrong. A frame sent to a stdio server goes through
 // the shell as bytes, so a malformed one produces no error — just an empty recv
 // later, which reads like the server ignoring the request.
-const mcpDetail = `Two kinds of handle, and the subcommands differ by kind.
+const mcpDetail = `A peer is a child of a session, opened through it — the URL is resolved on
+the TARGET's network, so localhost:9222 is a port on that machine, not on the one
+termcp runs on.
 
-  stdio server: the handle is the SHELL running it.
-    mcp tools <shell>                    list its tools
-    mcp send  <shell> '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-    mcp recv  <shell>                    read one complete frame back
-    The send is 202, not 200: the frame is typed into the program and submitted,
-    and its answer arrives on the program's own stdout. recv consumes: each call
-    returns the NEXT frame, so two recvs are two answers, never the same one twice.
-    It is non-blocking — a frame still being written comes back as "no complete
-    frame yet", so poll rather than treating that as an error or an empty reply.
+  open <session> mcp http://host/mcp          mount an HTTP endpoint
+  open <session> mcp ws://host/mcp            mount a websocket endpoint
+  open <session> cdp  ws://host:9222/devtools/browser/...
+  open <session> jrpc ws://host/socket        speak the envelope, no protocol on top
 
-  http endpoint: the handle is what mcp open returned.
-    mcp open https://host/mcp           -> Handle
-    mcp tools <handle>                   lists tools (sends tools/list itself)
-    mcp call  <handle> '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}'
-    mcp recv  <handle>                   always 204: HTTP answers each send, so there is nothing to receive
-    mcp close <handle>
+Opening is also the HANDSHAKE. An mcp peer gets initialize + tools/list, and the
+reply names the tools it offers, so there is no separate discovery call to make.
 
-send and call take a RAW JSON-RPC frame as the rest of the line. The frame starts
-immediately after the handle — do not put a placeholder word in front of it, and
-QUOTE IT. The terminal splits the line on whitespace before the handler sees it,
-so an unquoted frame reaches the parser as fragments and is refused as "the frame
-is not JSON" — with invalid character '\'' as the reason, which points at the
-quoting rather than at the frame.
+Talking to one:
+  call <peer> '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{...}}'
+  read <peer>            the next frame the peer sent on its own (a CDP event)
+  close <peer>
 
-On an HTTP channel the initialize handshake is done for you on the first frame.
-An HTTP channel does not spend a shell channel: opening a dozen costs no shells.`
+THE FRAME GOES ON call, NOT ON write. write is a file's content and takes flags
+(--data, --mode, --offset); a frame is a verbatim payload where quotes must survive.
+One verb cannot carry both, because the parser has one payload rule per directive.
 
-// fwdDetail is the flag set per direction, which the one-line usage cannot show:
-// `fwd <session> --action …` does not say which of --remote-host / --local-port
-// belong to which direction, and a missing one is reported by the handler as a
-// generic requirement rather than as "this direction does not take that flag".
-const fwdDetail = `Directions and their flags:
-  --action local    --local-port [--bind-host] --remote-host --remote-port
-                    termcp listens on local-port; the target dials remote-host:remote-port
-  --action remote   --local-port --remote-host --remote-port [--local-host]
-                    the TARGET listens on local-port and forwards to remote-host:remote-port
-                    from there; the reply echoes it as remote_port
-  --action dynamic  --local-port
-                    termcp listens as a SOCKS5 proxy; the target dials whatever is asked
-  --action list     no flags
-  --action close    --forward-id
+QUOTE THE FRAME. The line is split on whitespace before the handler sees it, so an
+unquoted frame arrives as fragments and is refused as "the frame is not JSON" — with
+a character error that points at the quoting rather than at the frame.
 
-The session comes from the target position (fwd <session> --action …); --session
-is accepted as an alternative.
+A SHELL RUNNING A SERVER IS THE SAME KIND OF PEER, addressed by its channel. Start
+it with --argv (a pipe), then talk to it the same way. The difference is only where
+frames come from: an HTTP peer answers each call, while a stdio peer's replies appear
+on its stdout, so reading one needs --frame:
+
+  read <channel> --frame
+
+Without --frame, read returns bytes — which is what a command's output is. Parsing
+every read as protocol would break the ordinary case to serve the rare one.
+
+An HTTP peer spends no shell channel: opening a dozen costs no shells.`
+
+// forwardDetail is the flag set per direction, which the one-line usage cannot show:
+// `open <session> forward …` does not say which of --remote-host / --local-port belong
+// to which direction, and a missing one is reported by the handler as a generic
+// requirement rather than as "this direction does not take that flag".
+const forwardDetail = `A forward is a child of a session, made with open and removed with close:
+
+  open  <session> forward --local-port 8080 --remote-host db --remote-port 5432
+  open  <session> forward --local-port 1080 --dynamic
+  open  <session> forward --local-port 9090 --remote-host x --remote-port 80 --remote
+  ls    <session> forward
+  close <session> forward <id>
+
+THE DIRECTION IS A FLAG, and local is the default — the one meant when someone says
+"forward this port" without qualifying it. What each direction means:
+  (default)         termcp listens on --local-port; it dials --remote-host:--remote-port
+                    on the far side. [--bind-host]
+  --remote          the TARGET listens on --local-port and forwards from there to
+                    --remote-host:--remote-port; the reply echoes it as remote_port.
+                    [--local-host]
+  --dynamic         termcp listens as a SOCKS5 proxy on --local-port; the target dials
+                    whatever is asked.
 
 --local-port 0 means "any free port" for local and dynamic only, and the reply's
 local_port is the one that was chosen. remote REJECTS 0 ("local_port required
@@ -714,7 +1075,8 @@ Two different addresses, because the side that listens differs:
                 "0.0.0.0" (or "*") publishes the tunnel to everything that can
                 reach this machine — that is a deliberate act, and the review
                 prompt says so.
-  --local-host  what the TARGET listens on for remote. Default 0.0.0.0.
+  --local-host  what the TARGET listens on for remote. Default 127.0.0.1;
+                "0.0.0.0" publishes it to the target's network.
 
 dynamic has no --bind-host on purpose: the SOCKS5 proxy this server runs performs
 no authentication (same as "ssh -D"), so on any other interface it would be an open
@@ -740,18 +1102,25 @@ A forward dies with its session: the session's ResourceScope closes it, so there
 is no orphaned listener to remember. A listing is a read and is not reviewed;
 opening and closing are reviewed, so expect a 202 and wait rather than retrying.`
 
-// closeDetail states the kill deadline, which otherwise looks instantaneous.
-const closeDetail = `A CHANNEL is closed by its handle: close <session>:<index> (what ps prints).
-A SESSION is terminated by its id: close <session> --force. The two are different
-actions with different lifecycles: closing a channel leaves the connection and
-other channels intact; terminating the session stops every channel and drops the
-transport, keeping the entry in the archive as exited with its output still
-readable via shell_output.
+// closeDetail states what close does to each kind of target, which is the only thing
+// that decides it.
+const closeDetail = `THE TARGET DECIDES WHAT IS CLOSED.
 
---grace N gives a process N seconds to exit before SIGKILL. Default: 5.
---force SKIPS THAT WAIT ENTIRELY: it closes the transport without sending SIGTERM
-first, so --grace has no effect next to it. Use one or the other — --grace when the
-process deserves a chance to clean up, --force when it is already wedged.`
+close <session>:<index>   stops that CHANNEL. Other channels and the connection
+                          keep running, and the channel's output stays readable
+                          with read — it is archived, not erased.
+close <session>           stops the whole SESSION: every channel ends, the
+                          transport drops, and the entry stays in the archive as
+                          exited with its output still readable.
+
+--grace N (sessions only) is how long the process gets to exit after SIGTERM
+before the transport is closed anyway. YOU DO NOT HAVE TO PASS IT: omitted means
+5 seconds, so a plain "close <session>" is already the polite form and a process
+that needs longer has to ask for it. A channel has no such phase, so --grace on a
+handle is refused rather than ignored.
+
+There is no --force. Stopping and erasing are different verbs: close stops and
+keeps the record, rm erases it. A caller who wanted the record gone wants rm.`
 
 // argvDetail is the --argv contract: a word list, not a command line. It is
 // stated on `help pipe` because both failure modes are silent or come from the
@@ -792,7 +1161,7 @@ is not a one-shot.`
 // The file format is a SEPARATE page (see help profile, which appends both)
 // because the two answer different questions: these flags act on one profile,
 // the file shape is for a batch import the caller is asked to produce.
-const profileDetail = `Actions and the flags each one uses.
+const hostDetail = `Actions and the flags each one uses.
   list                      no flags
   create                    --name and the connection fields below
   edit                      --name plus whichever fields change
@@ -825,7 +1194,7 @@ here is write-only: it is never echoed back by list or get.`
 // often the one asked to *produce* that text — a user pastes a list of hosts and
 // wants an importable file — and a format spec duplicated in prose would drift
 // from the parser the moment either is edited.
-const profileFileFormat = `profile file format (the batch import/export shape):
+const hostFileFormat = `host file format (the batch import/export shape):
 
   [[connections]]
   name = "prod"                 # letters/digits/_/- , max 64
@@ -1004,19 +1373,33 @@ func ParseWithSubst(src string, sub Subst) (*File, error) {
 		if stmt == nil || stmt.Cmd == nil {
 			continue
 		}
-		parsed, ok, err := parseStatement(src, stmt)
-		if err != nil {
-			// The first failure wins: a cmd is one instruction, and reporting the
-			// rest of a broken instruction teaches nothing. A directive the caller
-			// defined itself (an alias) surfaces as an unknown-directive error
-			// carrying Op+Rest, which is what lets the caller resolve it.
-			if derr, ok := err.(*Error); ok {
-				derr.Parsed = len(out.Statements)
-				derr.AfterPayload = trailingPayloadOp(out.Statements)
+		// A `&&`/`||` CHAIN IS SEVERAL DIRECTIVES, NOT ONE PAYLOAD.
+		//
+		// The shell parser reports `a && b` as a single Stmt holding a BinaryCmd,
+		// which is right for shell text and wrong for a directive line: the shell
+		// operators were being swallowed into run's payload, so a caller writing
+		// `run h:1 make && notify done` got one shell command line instead of two
+		// directives with a condition between them.
+		//
+		// Shell text still arrives intact — through `$1`/`$FOO`, which are replaced
+		// with opaque tokens BEFORE this parse, so a `&&` inside a value is part of
+		// that token and cannot appear here as an operator.
+		for _, part := range flattenCond(stmt) {
+			parsed, ok, err := parseStatement(src, part.stmt)
+			if err != nil {
+				// The first failure wins: a cmd is one instruction, and reporting the
+				// rest of a broken instruction teaches nothing. A directive the caller
+				// defined itself (an alias) surfaces as an unknown-directive error
+				// carrying Op+Rest, which is what lets the caller resolve it.
+				if derr, ok := err.(*Error); ok {
+					derr.Parsed = len(out.Statements)
+					derr.AfterPayload = trailingPayloadOp(out.Statements)
+				}
+				return nil, err
 			}
-			return nil, err
-		}
-		if ok {
+			if !ok {
+				continue
+			}
 			filled := sentinels.expandStatement(parsed)
 			if err := checkTargetKindAfterSubst(filled); err != nil {
 				if derr, ok := err.(*Error); ok {
@@ -1024,6 +1407,15 @@ func ParseWithSubst(src string, sub Subst) (*File, error) {
 				}
 				return nil, err
 			}
+			// The first statement of the whole cmd has nothing to be conditional on,
+			// and a `;`-separated statement starts a fresh chain: flattenCond reports
+			// "" for those, so the executor never waits on a result that is not there.
+			if len(out.Statements) == 0 {
+				filled.Cond = ""
+			} else {
+				filled.Cond = part.cond
+			}
+			filled.Background = part.stmt.Background
 			out.Statements = append(out.Statements, filled)
 		}
 	}
@@ -1031,6 +1423,45 @@ func ParseWithSubst(src string, sub Subst) (*File, error) {
 		return &File{Empty: true}, nil
 	}
 	return out, nil
+}
+
+// condPart is one directive in a `&&`/`||` chain: the statement to parse and the
+// operator that connects it to the one before it.
+type condPart struct {
+	stmt *syntax.Stmt
+	cond string // "" (unconditional), "&&", "||"
+}
+
+// flattenCond splits a shell BinaryCmd into the directives it connects.
+//
+// `a && b || c` parses as BinaryCmd(||, BinaryCmd(&&, a, b), c), so the left spine
+// is the chain in source order: walk X while it is a BinaryCmd with an operator this
+// language gives meaning to, then emit the leaves.
+//
+// ONLY `&&` AND `||` ARE SPLIT. `|` is a pipeline, and a pipeline is one command
+// line whose parts run concurrently — there is no "did the left succeed" to gate on,
+// so it stays inside the payload. `&` and `;` never reach here: the shell parser
+// already made them separate Stmts, which is what makes `;` start a fresh chain.
+func flattenCond(stmt *syntax.Stmt) []condPart {
+	var parts []condPart
+	var walk func(s *syntax.Stmt, cond string)
+	walk = func(s *syntax.Stmt, cond string) {
+		if b, ok := s.Cmd.(*syntax.BinaryCmd); ok {
+			switch b.Op {
+			case syntax.AndStmt, syntax.OrStmt:
+				walk(b.X, cond)
+				op := "&&"
+				if b.Op == syntax.OrStmt {
+					op = "||"
+				}
+				walk(b.Y, op)
+				return
+			}
+		}
+		parts = append(parts, condPart{stmt: s, cond: cond})
+	}
+	walk(stmt, "")
+	return parts
 }
 
 // trailingPayloadOp names the last statement's directive when it was one that
@@ -1328,10 +1759,34 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 		})
 	}
 
+	// A KIND MAY OCCUPY THE TARGET'S POSITION.
+	//
+	// Everything below a session is addressed `<session> <kind> <key>`, and for the
+	// verbs that also work on top-level collections the kind can stand alone:
+	// `ls host` has no session, `rm host prod` names the entry itself. So the word in
+	// second position is read as a kind when the table declares it, and as a target
+	// otherwise — one rule, no verb-specific special cases.
+	//
+	// The KEY is the single word after the kind, and only when it is not a flag:
+	// `open a1f3 forward --local-port 8080` declares no key, while
+	// `read a1f3 file /etc/passwd` declares one.
+	tookKind := false
+	if kind, inline, ok := kindWordWithKey(op, rest); ok {
+		out.Kind = kind
+		rest = rest[1:]
+		tookKind = true
+		if inline != "" {
+			out.Key = inline
+		} else if !op.keyIsThePayload() && len(rest) > 0 && !strings.HasPrefix(rest[0].text, "--") {
+			out.Key = rest[0].text
+			rest = rest[1:]
+		}
+	}
+
 	// Word 2 is the target, for the directives that take one. A flag here is
 	// refused rather than read as a target: `key --repeat 3 a1f3:1 up` would
 	// otherwise silently target "--repeat", and the error has to say why.
-	if op.Target {
+	if op.Target && !tookKind {
 		switch {
 		case len(rest) == 0:
 			if !op.TargetOptional {
@@ -1361,6 +1816,32 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 					return Statement{}, false, err
 				}
 			}
+			// `<session> <index>` is the spaced spelling of a channel. Fold it into the
+			// handle form here so that one address exists downstream: the colon and the
+			// space are two ways to write the same node, not two code paths.
+			// EVERY VERB, NOT ONLY TargetChain: `read a1f3 1` and `close a1f3 1` name a
+			// channel too, and the spaced spelling has to work wherever the colon does.
+			// The fold only fires when the target is not already a handle and the next
+			// word is a bare index, so a session followed by a path or a name is
+			// untouched.
+			if !isSentinel(out.Target) && !NamesAChannel(out.Target) && len(rest) > 0 {
+				if idx, ok := channelIndexWord(rest[0].text); ok {
+					out.Target = out.Target + ":" + idx
+					rest = rest[1:]
+				}
+			}
+			// A kind may also follow the target: `open a1f3 forward`,
+			// `read a1f3 file /x`, `rm a1f3 file /x`.
+			if kind, inline, ok := kindWordWithKey(op, rest); ok {
+				out.Kind = kind
+				rest = rest[1:]
+				if inline != "" {
+					out.Key = inline
+				} else if !op.keyIsThePayload() && len(rest) > 0 && !strings.HasPrefix(rest[0].text, "--") {
+					out.Key = rest[0].text
+					rest = rest[1:]
+				}
+			}
 		}
 	}
 
@@ -1374,9 +1855,13 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 		for i < len(rest) && strings.HasPrefix(rest[i].text, "--") {
 			key, val := splitFlag(rest[i].text)
 			if !allowedFlag(op, key) {
+				msg := "unknown flag for " + name + ": --" + key
+				if hint, ok := op.RetiredFlags[key]; ok {
+					msg += "\n" + hint
+				}
 				return Statement{}, false, &Error{
 					Op:    name,
-					Msg:   "unknown flag for " + name + ": --" + key,
+					Msg:   msg,
 					Usage: op.Usage,
 				}
 			}
@@ -1459,9 +1944,13 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 			}
 			key, val := splitFlag(w.text)
 			if !allowedFlag(op, key) {
+				msg := "unknown flag for " + name + ": --" + key
+				if hint, ok := op.RetiredFlags[key]; ok {
+					msg += "\n" + hint
+				}
 				return Statement{}, false, &Error{
 					Op:    name,
-					Msg:   "unknown flag for " + name + ": --" + key,
+					Msg:   msg,
 					Usage: op.Usage,
 				}
 			}
@@ -1508,6 +1997,14 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 			} else {
 				storeFlag(out.Flags, key, val)
 			}
+		}
+	}
+
+	if op.Kind == KindFlags && op.MaxArgs > 0 && len(out.Args) > op.MaxArgs {
+		return Statement{}, false, &Error{
+			Op:    name,
+			Msg:   name + " takes its words as a flag, not as bare arguments — the rest of the line was \"" + strings.Join(out.Args, " ") + "\". Use --argv.",
+			Usage: op.Usage,
 		}
 	}
 
@@ -1602,6 +2099,88 @@ func ChannelTargetProblem(op Op, target string) string {
 // are therefore NOT channel targets. That is the breaking change: `run <session>`
 // used to work by falling back to the primary channel, and now it is refused at
 // parse time.
+// kindWord reports whether the next word names a sub-resource this verb accepts.
+//
+// Only a DECLARED word counts. A path, a url or a session id may look like anything,
+// and quietly promoting one of them to a kind would turn `read a1f3 /etc/passwd`
+// into "the file /etc/passwd of session a1f3" when the caller meant the channel read
+// whose target they mistyped. Requiring the declaration keeps the reading obvious.
+func kindWord(op Op, rest []word) (string, bool) {
+	kind, _, ok := kindWordWithKey(op, rest)
+	return kind, ok
+}
+
+// kindWordWithKey reads a KIND, including the two compact forms that attach a key
+// to it: `<peer>:<index>` names one attached session (the same colon a channel uses
+// to carry its index), and `<peer>@<targetId>` names a one-shot session on a target.
+//
+// THEY ARE ONE WORD BECAUSE THEY ARE ONE NODE. `a1f3:1` is a channel, not a session
+// plus a suffix; `a1f3 cdp:1` is an attached page, not a peer plus a suffix. Keeping
+// the key attached to the kind is what lets the address be copied out of a reply and
+// pasted back into the next command.
+func kindWordWithKey(op Op, rest []word) (kind, key string, ok bool) {
+	if len(op.Kinds) == 0 || len(rest) == 0 {
+		return "", "", false
+	}
+	w := rest[0].text
+	if isSentinel(w) {
+		return "", "", false
+	}
+	for _, k := range op.Kinds {
+		if k == w {
+			return w, "", true
+		}
+		if strings.HasPrefix(w, k+"@") {
+			target := strings.TrimPrefix(w, k+"@")
+			if target == "" {
+				return "", "", false
+			}
+			return k, "@" + target, true
+		}
+		if strings.HasPrefix(w, k+":") {
+			// `<kind>:<index>` names a connection; `<kind>:<index>@<target>` names one
+			// target inside it. Both are ONE word because they are ONE address — the
+			// split happens downstream, where the peer's own state says whether the
+			// target exists.
+			rest2 := strings.TrimPrefix(w, k+":")
+			idx := rest2
+			if at := strings.IndexByte(rest2, '@'); at >= 0 {
+				idx = rest2[:at]
+				if rest2[at+1:] == "" {
+					return "", "", false
+				}
+			}
+			if _, isIndex := channelIndexWord(idx); !isIndex {
+				return "", "", false
+			}
+			return k, rest2, true
+		}
+	}
+	return "", "", false
+}
+
+// channelIndexWord reports whether word is a bare channel index and returns it
+// normalised. Only digits qualify: a channel's key is its position in the session,
+// and accepting anything else would let `run a1f3 file` name a channel called "file".
+func ChannelIndex(word string) (string, bool) { return channelIndexWord(word) }
+
+func channelIndexWord(word string) (string, bool) {
+	w := strings.TrimSpace(word)
+	if w == "" {
+		return "", false
+	}
+	for _, r := range w {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	if w == "0" {
+		// Channel indices start at 1; 0 would be a name no reply ever prints.
+		return "", false
+	}
+	return w, true
+}
+
 func NamesAChannel(target string) bool {
 	entries := strings.Split(target, ",")
 	for _, entry := range entries {
@@ -1915,6 +2494,12 @@ session is left untouched, so the guard costs one extra word rather than a mista
 
   rm <session>              a stopped session, no ceremony
   rm <session> --force      a running one; its channels and forwards are released first
+  rm <session> --dry-run    say what would be erased, erase nothing
+
+--dry-run is the cautious call, and it comes first: it is answered even for a RUNNING
+session, because that is exactly when a caller wants to ask before passing --force.
+The reply is 200 with a Dry-Run header and a sentence naming what the real call would
+destroy. Use it whenever you are not certain which session a handle belongs to.
 
 The target is the SESSION, not a channel. rm <session>:1 is refused: a caller who
 named a channel asked about that channel, and erasing the container is a bigger
@@ -1926,3 +2511,15 @@ answer than the question. Use close <session>:1 to stop one channel.`
 // word list no matter what the directive's payload would have been — so the flag's
 // own rule wins over the declaration.
 func (op Op) payloadSpanMode() spanMode { return op.PayloadSpan }
+
+// keyIsThePayload reports whether a verb's words after the kind ARE its payload.
+//
+// `call a1f3 cdp '{"method":"Page.enable"}'` is a peer address followed by a frame,
+// and the frame is the whole rest of the statement. Reading the first word as a KEY
+// (the rule for `read a1f3 file /etc/passwd`) ate the frame and then answered "needs
+// a JSON-RPC frame" about the frame it had just swallowed. A payload verb therefore
+// takes its key only in the attached spellings — `cdp:1`, `cdp@ABC123` — where the
+// boundary is a colon or an `@`, not a space.
+func (op Op) keyIsThePayload() bool {
+	return op.Kind == KindPayload || op.Kind == KindInterpreted
+}

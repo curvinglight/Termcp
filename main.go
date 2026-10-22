@@ -19,7 +19,6 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/auth"
 	"github.com/open-mcp-ai/termcp/internal/config"
 	"github.com/open-mcp-ai/termcp/internal/daemon"
@@ -389,7 +388,7 @@ func runServer(cfg *config.Config, idleTimeoutArg string, idleTimeout time.Durat
 	// (it registers later, and ServeMux refuses overlaps rather than overriding),
 	// so no existing route can be shadowed by it.
 	mux.Handle("POST /api/term", mcpSrv.TermHandler())
-	webuiH := &webui.Handler{Sessions: sessMgr, MsgMgr: msgMgr, SSH: sshStore, ForwardMgr: forwardMgr, NotifyMgr: mcpSrv.NotifyManager(), Extensions: extReconciler, NoInternal: cfg.NoInternal, Version: versionString(), Daemon: isDaemonChild, StartedAt: time.Now().UTC().Format(time.RFC3339)}
+	webuiH := &webui.Handler{Sessions: sessMgr, MsgMgr: msgMgr, SSH: sshStore, ForwardMgr: forwardMgr, Extensions: extReconciler, NoInternal: cfg.NoInternal, Version: versionString(), Daemon: isDaemonChild, StartedAt: time.Now().UTC().Format(time.RFC3339)}
 	// The effective countdown is published at GET /api/daemon so the stdio
 	// bridge can ping faster than it (see daemon.InstanceInfo.IdleTimeoutMS).
 	if isDaemonChild {
@@ -425,11 +424,6 @@ func runServer(cfg *config.Config, idleTimeoutArg string, idleTimeout time.Durat
 	// learns the outcome without polling. Fan-out stays in one place: the web UI
 	// keeps its own listener (installed in Register) and this one forwards the
 	// same transitions to the notify subsystem's rules.
-	sessMgr.AddApprovalListener(func(sessionID string, req approval.Request) {
-		if req.ShellID != "" {
-			mcpSrv.NotifyManager().OnApprovalChange(req.ShellID, "approval "+string(req.State))
-		}
-	})
 	if verifier != nil {
 		mainSrv.Handler = auth.Middleware(verifier, mux)
 	}

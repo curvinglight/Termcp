@@ -20,7 +20,7 @@ func TestTermExtCarriesArgvHeadersAndForwards(t *testing.T) {
 	s := newExtensionTestServer(t)
 
 	body := termText(t, s, map[string]any{
-		"cmd": `ext create wire --kind mcp --target internal --mode pipe ` +
+		"cmd": `create ext wire --kind mcp --target internal --mode pipe ` +
 			`--command node --description 'a,b' --headers '{"X-Api-Key":"k1"}' ` +
 			`--forwards '[{"kind":"dynamic","local_port":1080}]' ` +
 			`--args /srv/mcp.js --stdio --label 'x,y'`,
@@ -89,7 +89,7 @@ func TestTermExtRefusesABadArgsFlag(t *testing.T) {
 		}
 		// And nothing was created: the refusal happens before the tool call.
 		for _, name := range []string{"broken1", "broken2"} {
-			got := termText(t, s, map[string]any{"cmd": "ext get " + name})
+			got := termText(t, s, map[string]any{"cmd": "edit ext get " + name})
 			if !strings.Contains(got, "not found") {
 				t.Errorf("%s: the refused template must not exist; got %q", name, got)
 			}
@@ -105,8 +105,8 @@ func TestTermAcceptsExtensionsSynonym(t *testing.T) {
 		"action": "create", "name": "via-alias", "kind": "skill", "target": "internal",
 		"paths": []any{"/srv/"},
 	})
-	body := termText(t, s, map[string]any{"cmd": `extensions list`})
+	body := termText(t, s, map[string]any{"cmd": `ls ext`})
 	if !strings.Contains(body, "via-alias") {
-		t.Errorf("`extensions list` should reach the ext directive; got %q", body)
+		t.Errorf("`ls ext` should reach the extension layer; got %q", body)
 	}
 }

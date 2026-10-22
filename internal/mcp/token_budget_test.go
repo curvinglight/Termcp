@@ -49,8 +49,14 @@ func TestTokenBudgetGuard(t *testing.T) {
 	if len(b) >= 2500 {
 		t.Errorf("the %s schema serialises to %d B, over the 2500 B budget", tools[0].Name, len(b))
 	}
-	if n := len(mcpServerInstructions); n > 1600 {
-		t.Errorf("instructions %d B exceeds 1600 B budget", n)
+	// 1800 rather than 1600: rule 0 now states what cmd IS (a DSL that imitates a
+	// shell but is not one) instead of listing rules about it. That framing is the
+	// cheapest defence against the most common misread — writing shell syntax into
+	// the line and reading the resulting split as "termcp has no ls" — and it costs
+	// about 85 bytes per turn. Paying it once in instructions replaces a whole class
+	// of corrective replies.
+	if n := len(mcpServerInstructions); n > 1800 {
+		t.Errorf("instructions %d B exceeds 1800 B budget", n)
 	}
 
 	// The description must not enumerate directives (issue #117 33d): the

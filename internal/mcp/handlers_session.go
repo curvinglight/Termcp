@@ -55,7 +55,7 @@ func (s *Server) handleTerminateSession(ctx context.Context, request mcpgo.CallT
 	}
 	// Close only: the process/transport stops and the entry becomes DEAD, but it
 	// stays in the registry (and in the Web UI as a read-only tile) so its output
-	// remains readable via shell_output. session_delete removes it for good.
+	// remains readable with `read`. session_delete removes it for good.
 	s.sessMgr.Terminate(sess.ID, force, time.Duration(gracePeriod*float64(time.Second)))
 	return successResult(), nil
 }

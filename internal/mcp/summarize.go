@@ -288,20 +288,20 @@ func summarizeProfile(action string, args map[string]any) string {
 	switch action {
 	case "create":
 		if target == "" {
-			return "create profile " + name
+			return "create host " + name
 		}
-		return "create profile " + name + " for " + target
+		return "create host " + name + " for " + target
 	case "edit":
 		if target == "" {
-			return "edit profile " + name
+			return "edit host " + name
 		}
-		return "edit profile " + name + " -> " + target
+		return "edit host " + name + " -> " + target
 	case "copy":
-		return "copy profile " + name
+		return "copy host " + name
 	case "delete":
-		return "delete profile " + name
+		return "delete host " + name
 	}
-	return action + " profile " + name
+	return action + " host " + name
 }
 
 // describeBytes says how much a write carries, in the unit a human reads.

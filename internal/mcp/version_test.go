@@ -184,3 +184,59 @@ func TestServerJSONMatchesChangelog(t *testing.T) {
 		t.Errorf("server.json packages[0].identifier = %q, want it to end in %q", got, want)
 	}
 }
+
+// TestUnreleasedDoesNotRepeatAPublishedEntry pins the mechanical half of the release
+// process: an entry that already appears in a dated section must not sit in
+// `## Unreleased` as well.
+//
+// This is the failure that happens when `make prepare-release` runs on the release
+// branch and the commit never comes back to dev — dev keeps the notes it wrote and
+// the dated section lives only on main, so the next release ships them twice. It has
+// now happened twice (v0.2.7, then v0.2.8-rc.3), which is why it is a test and not
+// another paragraph in docs/releasing.md. The doc already said it.
+//
+// Comparison is on the entry's opening text rather than the whole line: the dated
+// section is a copy, and a copy can drift by a trailing character without becoming a
+// different entry.
+func TestUnreleasedDoesNotRepeatAPublishedEntry(t *testing.T) {
+	changelog, err := os.ReadFile("../../CHANGELOG.md")
+	if err != nil {
+		t.Skipf("read CHANGELOG.md: %v", err)
+	}
+	text := string(changelog)
+
+	const head = "## Unreleased"
+	i := strings.Index(text, head)
+	if i < 0 {
+		t.Fatalf("CHANGELOG.md has no %q section", head)
+	}
+	rest := text[i+len(head):]
+	end := strings.Index(rest, "\n## ")
+	if end < 0 {
+		t.Fatalf("the Unreleased section is never closed by another heading")
+	}
+	unreleased, published := rest[:end], rest[end:]
+
+	fingerprint := func(line string) string {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "- "))
+		if r := []rune(line); len(r) > 60 {
+			return string(r[:60])
+		}
+		return line
+	}
+
+	seen := map[string]bool{}
+	for _, line := range strings.Split(published, "\n") {
+		if strings.HasPrefix(line, "- ") {
+			seen[fingerprint(line)] = true
+		}
+	}
+	for _, line := range strings.Split(unreleased, "\n") {
+		if !strings.HasPrefix(line, "- ") {
+			continue
+		}
+		if fp := fingerprint(line); seen[fp] {
+			t.Errorf("this entry is already in a dated section, so the release commit never came back to dev:\n  %s", fp)
+		}
+	}
+}

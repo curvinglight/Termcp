@@ -13,7 +13,7 @@ func TestSpanListsLineStartOffset(t *testing.T) {
 
 	// A pipe whose command prints several lines.
 	text := termText(t, s, map[string]any{
-		"cmd": "pipe internal --argv printf 'HELLO\\nWORLD\\n'",
+		"cmd": "connect internal --argv printf 'HELLO\\nWORLD\\n'",
 	})
 	h := handleFrom(t, text)
 

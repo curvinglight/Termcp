@@ -42,7 +42,7 @@ func TestFileResultZeroLengthKeepsShape(t *testing.T) {
 // must resolve symlinks through to their real target, like a real SSH host does.
 func TestInternalRealpathResolvesSymlink(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "pty internal --name live"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --name live"})
 	h := handleFrom(t, text)
 	sid := strings.SplitN(h, ":", 2)[0]
 
@@ -57,7 +57,7 @@ func TestInternalRealpathResolvesSymlink(t *testing.T) {
 	}
 
 	got := termText(t, s, map[string]any{
-		"cmd": "file " + sid + " --action fs --op realpath --remote-path " + link,
+		"cmd": "get " + sid + " file " + link + " --op realpath",
 	})
 	// COMPARE WHAT THE DIRECTIVE MEANS, NOT THE BYTES IT PRINTS.
 	//

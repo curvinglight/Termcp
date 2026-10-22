@@ -20,6 +20,12 @@ import (
 // SSH_FX_FAILURE from the same reader is a genuine fault and stays a 500.
 var ErrIsDirectory = errors.New("is a directory")
 
+// ReplaceInFile errors: exact matching only.
+var (
+	ErrPatternNotFound  = errors.New("pattern not found in file")
+	ErrPatternAmbiguous = errors.New("pattern matched more than once; must match uniquely")
+)
+
 // FileResult holds the result of a file_read operation.
 type FileResult struct {
 	// Data is a POINTER so "the inline body is empty" and "this read has no inline

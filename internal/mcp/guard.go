@@ -96,14 +96,7 @@ func (g toolGuard) check(ctx context.Context, toolName string, c gate, request m
 			return g.checkSession(sess, toolName, c, args)
 		}
 	}
-	if id := getString(args, "rule_id", ""); id != "" {
-		if sess := g.sessionForRuleID(id); sess != nil {
-			if bad := refuseForeignNamespace(sess, callerNS); bad != nil {
-				return bad
-			}
-			return g.checkSession(sess, toolName, c, args)
-		}
-	}
+
 	return nil
 }
 
@@ -164,25 +157,6 @@ func (g toolGuard) sessionForForwardID(id string) *session.Session {
 		if fw.ForwardID == id {
 			return g.server.sessMgr.Get(fw.SessionID)
 		}
-	}
-	return nil
-}
-
-// sessionForRuleID resolves the session a shell_notify rule belongs to. The rule
-// carries both ids, and the session is the container whose whitelist governs it;
-// the shell is the fallback for a rule registered without one.
-func (g toolGuard) sessionForRuleID(id string) *session.Session {
-	if g.server.notifyMgr == nil {
-		return nil
-	}
-	for _, r := range g.server.notifyMgr.List("") {
-		if r.ID != id {
-			continue
-		}
-		if sess := g.server.sessMgr.Get(r.SessionID); sess != nil {
-			return sess
-		}
-		return g.sessionForShellID(r.ShellID)
 	}
 	return nil
 }

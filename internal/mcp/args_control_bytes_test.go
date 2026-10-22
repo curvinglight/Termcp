@@ -61,6 +61,16 @@ func TestControlBytesPassWhenAllowed(t *testing.T) {
 	h := openPty(t, s)
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
+	// Prime the shell so the marker below has something to find.
+	termText(t, s, map[string]any{"cmd": "run " + h + " echo READY", "timeout": 2})
+
+	// WAIT FOR THE SHELL BEFORE INTERRUPTING IT. 0x03 is SIGINT to the foreground
+	// process group: sent to a shell that is still starting up, it kills the shell
+	// itself and the reply is a 5xx about a dead channel — which reads like the gate
+	// refusing the byte. CI caught this on a loaded runner; the marker makes the
+	// platform's timing irrelevant.
+	waitForGrepContent(t, s, h, "READY")
+
 	got := termText(t, s, map[string]any{
 		"cmd": "run " + h + " echo $1", "args": []any{"x\x03y"}, "allow_escapes": true,
 	})

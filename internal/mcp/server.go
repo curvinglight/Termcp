@@ -12,7 +12,6 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/extensions"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/message"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
@@ -27,7 +26,6 @@ type Server struct {
 	sshConfigs   *sshconfig.Store
 	forwardMgr   *forward.ForwardManager
 	extensions   *extensions.Reconciler
-	notifyMgr    *notify.Manager
 	baseURL      string // http://host:port, set from Start()
 	docsFS       fs.FS  // embedded agent docs, set via SetDocsFS
 	NoInternal   bool   // when true, hide and refuse the built-in loopback profile
