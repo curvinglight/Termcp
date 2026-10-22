@@ -23,6 +23,30 @@ type captureHandler struct {
 func (c *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (c *captureHandler) Level() slog.Level                            { return slog.LevelDebug } // required by Go 1.24+ slog optimization
 func (c *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	// THIS HANDLER IS GLOBAL, SO IT SEES THE WHOLE PROCESS.
+	//
+	// withCapturedLogger swaps slog.Default(), and slog.Default() is read by every
+	// goroutine that outlives the test that started it: a session watcher, a reader
+	// pump, a forward's accept loop. One Debug line from any of them lands in this
+	// slice, and every assertion in this file reads records[0] — so a foreign record
+	// arrives as "entry: expected args attr" on a test whose own record was second.
+	//
+	// That is why this failed on macOS CI and nowhere else: the runner is slower, so a
+	// leftover goroutine from an earlier test gets its word in first. It is a race
+	// with a leftover goroutine, not a property of the shuffle order — the same seed
+	// passes locally.
+	//
+	// The fix keeps the handler dumb and makes the FILTER explicit: these tests are
+	// about the tool-call log, so only tool-call records are kept. The messages are
+	// the contract of withLogging (internal/mcp/logging.go) and of the panic recovery
+	// that reports through the same log, so they cannot drift without the tests
+	// noticing — which is the point: a filter by message is a second copy of a
+	// literal, and this one is pinned by the tests it serves.
+	switch r.Message {
+	case "tool call start", "tool call end", "panic recovered in tool handler":
+	default:
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.records = append(c.records, r)
@@ -87,6 +111,37 @@ func TestWithLogging_PassesThroughResultAndError(t *testing.T) {
 // the default level. It used to be Debug, which meant a support report of a broken
 // reply could not be matched to a command: everything that worked was invisible and
 // the log's last line was an unrelated failure.
+// A RECORD WRITTEN BY ANY OTHER GOROUTINE MUST NOT REACH THE CAPTURE.
+//
+// The handler is installed as the process-wide default, and everything else in
+// the package logs through that same default: watchers, forward loops, reader
+// pumps. This asserts the filter directly rather than through a timing accident,
+// because the accident is what the rest of this file used to depend on -- it
+// passed locally and failed on macOS CI with "entry: expected args attr" when a
+// leftover goroutine got its record in first.
+func TestCaptureHandlerIgnoresOtherGoroutines(t *testing.T) {
+	cap := withCapturedLogger(t)
+
+	// The kind of line a leftover watcher writes between this test's two lines.
+	slog.Debug("child shell created", "shell_id", "s1")
+	slog.Info("something unrelated")
+
+	h := func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return mcpgo.NewToolResultText("ok"), nil
+	}
+	if _, err := withLogging("session_start", h, nil)(context.Background(), mcpgo.CallToolRequest{}); err != nil {
+		t.Fatalf("wrapped returned error: %v", err)
+	}
+
+	records := cap.snapshot()
+	if len(records) != 2 {
+		t.Fatalf("captured %d records, want only the 2 tool-call ones: %v", len(records), records)
+	}
+	if records[0].Message != "tool call start" {
+		t.Fatalf("records[0] is %q, so a foreign record got in ahead of the call under test", records[0].Message)
+	}
+}
+
 func TestWithLogging_LogsEntryAndExitAtInfo(t *testing.T) {
 	cap := withCapturedLogger(t)
 

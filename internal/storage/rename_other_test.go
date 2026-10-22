@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestRenamingOverAnOpenFileIsImmediateOnPosix pins the platform half of the
@@ -40,13 +39,23 @@ func TestRenamingOverAnOpenFileIsImmediateOnPosix(t *testing.T) {
 	}
 	defer held.Close()
 
-	started := time.Now()
 	if err := renameOver(tmp, target); err != nil {
 		t.Fatalf("renaming over an open file must succeed on POSIX: %v", err)
 	}
-	if took := time.Since(started); took > 5*time.Millisecond {
-		t.Errorf("the rename took %v; the retry budget must not be spent on POSIX", took)
-	}
+	// NO WALL-CLOCK ASSERTION HERE, and the reason is not that it was flaky — it is
+	// that the number could never have tested the thing it claimed.
+	//
+	// "The retry budget must not be spent on POSIX" reads as a timing property, but
+	// renameOver only sleeps after IsSharingViolation says yes, and on POSIX nothing
+	// is a sharing violation (pinned by TestNoRenameErrorIsRetriedOnPosix). With
+	// renameAttempts=1 and renameBackoff=0 the loop cannot spend a budget even if it
+	// wanted to, so a fast rename proves nothing and a slow one disproves nothing:
+	// the 5ms budget this replaced was measuring the scheduler, and on a loaded
+	// ubuntu runner it reported "took 12.69ms" for a rename that never retried.
+	//
+	// What is left is the behaviour that is real: the rename went through while the
+	// file was held open, and the target holds the new bytes. The predicate side —
+	// which is the part that would regress — is asserted next door.
 	got, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatal(err)

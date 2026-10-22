@@ -69,6 +69,9 @@ func TestRealBrowserThroughTheCdpDoor(t *testing.T) {
 	if chrome == "" {
 		t.Skip("no Chrome or Edge installed")
 	}
+	// Named, because "never wrote DevToolsActivePort" on a runner with both Chrome
+	// and Edge installed does not say which one was asked.
+	t.Logf("driving %s", chrome)
 	// NOT t.TempDir(): Chrome's crashpad helper holds CrashpadMetrics-active.pma
 	// for seconds after the browser exits, and TempDir's cleanup runs the instant
 	// the test returns, so it fails the TEST with an "Access is denied" unlink
@@ -87,28 +90,59 @@ func TestRealBrowserThroughTheCdpDoor(t *testing.T) {
 		}
 	})
 	cmd := exec.Command(chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
-		"--no-first-run", "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+		"--no-first-run", "--no-default-browser-check",
+		"--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
 		"--user-data-dir="+profile, "about:blank")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+	// WAIT FOR THE PROCESS AS WELL AS FOR ITS FILE, and report which happened.
+	//
+	// The loop below watches for DevToolsActivePort; on a loaded windows runner it
+	// reported "browser never wrote DevToolsActivePort" after 30s, which is true and
+	// useless -- the browser may have exited instantly with a message, or still be
+	// starting. cmd.Wait in a goroutine separates those two: an early exit is a
+	// broken launch and its error is the answer, while a live process that is merely
+	// slow gets the whole budget. internal/webui's browser probe learned this the
+	// same way and is the shape copied here.
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = cmd.Wait()
+		close(done)
+	}()
+	defer func() {
+		_ = cmd.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}()
 
 	// DevToolsActivePort: line 1 is the port the browser chose, which is what
 	// makes --remote-debugging-port=0 usable without guessing a free one.
+	//
+	// 60s, not 30s: launching a browser on a cold runner is the slowest thing in this
+	// package, and the same 30s was measured on a warm machine before it expired on
+	// CI in internal/webui (see renderedProbeDOM). Not more, because the package has
+	// to fit the workflow's -timeout 240s alongside every other test here.
 	var port string
-	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+	deadline := time.Now().Add(60 * time.Second)
+	for port == "" {
 		if data, err := os.ReadFile(filepath.Join(profile, "DevToolsActivePort")); err == nil {
-			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-			if len(lines) == 2 {
+			if lines := strings.Split(strings.TrimSpace(string(data)), "\n"); len(lines) == 2 {
 				port = strings.TrimSpace(lines[0])
 				break
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if port == "" {
-		t.Fatal("browser never wrote DevToolsActivePort")
+		select {
+		case <-done:
+			t.Fatalf("browser exited before its debugger started: %v", waitErr)
+		case <-time.After(20 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("browser never wrote DevToolsActivePort in 60s (still running: %v)", waitErr == nil)
+		}
 	}
 
 	s := newTestServer(t)
@@ -254,6 +288,9 @@ func startHeadlessChrome(t *testing.T) string {
 	if chrome == "" {
 		t.Skip("no Chrome or Edge installed")
 	}
+	// Named, because "never wrote DevToolsActivePort" on a runner with both Chrome
+	// and Edge installed does not say which one was asked.
+	t.Logf("driving %s", chrome)
 	// NOT t.TempDir(): Chrome holds CrashpadMetrics-active.pma for seconds after it
 	// exits, and TempDir's cleanup runs the instant the test returns.
 	profile, err := os.MkdirTemp("", "termcp-cdp-")

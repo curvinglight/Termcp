@@ -118,7 +118,20 @@ func dumpReconciler(t *testing.T, r *Reconciler, name string) {
 // "something else happened".
 func waitForFailureReason(t *testing.T, r *Reconciler, name, substr string) Status {
 	t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
+	// 20s, and the two constants below are why 8s was not enough.
+	//
+	// probeGrace is 700ms: a process that takes longer than that to die is
+	// reported AVAILABLE first, and its death is only noticed by the next walk,
+	// which is loopInterval (5s) away. On a cold Windows runner powershell.exe
+	// spends 1-2s just starting, so the sequence is grace miss (0.7s), cold start
+	// (up to 2s), next walk (up to 5s), plus a channel reopen — already 8s with no
+	// margin, which is exactly where this failed: "never recorded a failure
+	// containing exit code (last: {Status:available ... Failures:[]})".
+	//
+	// The deadline is not the thing being tested; it is the backstop. Two walks
+	// leave room for a loaded runner without hiding a real regression, which would
+	// never record a failure at all.
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if st, ok := r.Status(name); ok {
 			for _, f := range st.Failures {
