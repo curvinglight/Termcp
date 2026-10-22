@@ -11,7 +11,7 @@ import (
 // through to the registration branch, answering 200 with a newly minted reader id.
 func TestReaderDropWithoutValueFailsCleanly(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "pty internal --name live"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --name live"})
 	h := handleFrom(t, text)
 
 	// Bare --drop must be refused at 400.

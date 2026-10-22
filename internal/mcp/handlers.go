@@ -1,12 +1,15 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/open-mcp-ai/termcp/internal/jrpc"
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/ns"
 	"github.com/open-mcp-ai/termcp/internal/session"
@@ -180,7 +183,7 @@ func (s *Server) requireRunningSession(sessionID string) (*session.Session, *mcp
 		return nil, bad
 	}
 	if info := sess.Info(); info.Status != api.SessionRunning {
-		return nil, toolError(CodeSessionNotRunning, "%s", fmt.Sprintf("Session '%s' is closed (status %s); this operation needs a running session — read its output via shell_output", sessionID, info.Status))
+		return nil, toolError(CodeSessionNotRunning, "%s", fmt.Sprintf("Session '%s' is closed (status %s); this operation needs a running session — read its output with `read`", sessionID, info.Status))
 	}
 	return sess, nil
 }
@@ -198,6 +201,90 @@ func (s *Server) sshClientForSession(sessionID string) (*session.Session, *ssh.C
 		return nil, nil, toolError(CodeSessionNotRunning, "%s", fmt.Sprintf("Session '%s' is not running or has no active SSH connection", sessionID))
 	}
 	return sess, cli, nil
+}
+
+// dialerForSession returns a jrpc.DialFunc that reaches the network THROUGH the
+// session's SSH connection.
+//
+// THIS IS WHAT A GATEWAY URL MEANS. "localhost:9222" passed to `cdp open` names a
+// port on the machine the session is connected to, not on the machine termcp runs on.
+// Every gateway (mcp, cdp, jrpc) therefore needs a session before it can have a URL,
+// and the dialer is the only place that distinction is made.
+//
+// An SSH connection that has already gone away answers here rather than at the far
+// end of a five-second TCP timeout: the caller is told the session is not running,
+// which is the true reason and the one it can act on.
+func (s *Server) dialerForSession(name string) (jrpc.DialFunc, *mcpgo.CallToolResult) {
+	sess, bad := s.resolveTunnelSession(name)
+	if bad != nil {
+		return nil, bad
+	}
+	cli := sess.SSHClient()
+	if cli == nil {
+		return nil, toolError(CodeSessionNotRunning, "%s", fmt.Sprintf(
+			"session %s has no live SSH connection, so there is no tunnel", sess.ID))
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Wrapped because an SSH channel has no deadlines: see jrpc's
+		// deadlineFreeConn for why that is dropped rather than propagated.
+		conn, err := cli.Dial(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return jrpc.NoDeadlineConn(conn), nil
+	}, nil
+}
+
+// resolveTunnelSession accepts EITHER a session id or a host name.
+//
+// `mcp open` needs a session, and the two names a caller has at that moment are
+// different things: an id (64e9e022-428) that `ps` just printed, and a host
+// (internal, prod) that it typed from memory. Requiring the id would make every
+// gateway call a two-step lookup for no reason — the id identifies a LINK, but what
+// the caller actually means is "the network of prod", and there is usually exactly
+// one running link per host.
+//
+// So a host name resolves to that host's running session when there is exactly one.
+// Two running links to the same host is genuinely ambiguous — they can differ in jump
+// host, proxy or user — and answering with either would silently pick a network the
+// caller did not choose. That case names both ids and lets the caller say which.
+func (s *Server) resolveTunnelSession(name string) (*session.Session, *mcpgo.CallToolResult) {
+	if sess, bad := s.requireSession(name); bad == nil {
+		return sess, nil
+	}
+	// Not an id: try it as a host name.
+	var matches []*session.Session
+	for _, info := range s.sessMgr.ListAll() {
+		if info.SSHConfig != name || info.Status != api.SessionRunning {
+			continue
+		}
+		if live := s.sessMgr.Get(info.ID); live != nil {
+			matches = append(matches, live)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return nil, toolError(CodeSessionNotRunning, "%s", fmt.Sprintf(
+			"no running session for %q. A gateway tunnels through a session, so open one first: `pty %s`. `ps` lists what exists.",
+			name, name))
+	default:
+		ids := make([]string, 0, len(matches))
+		for _, m := range matches {
+			ids = append(ids, m.ID)
+		}
+		return nil, toolError(CodeInvalidArgument, "%s", fmt.Sprintf(
+			"%q has %d running sessions, so the tunnel target is ambiguous: %s. Pass one of those ids instead.",
+			name, len(matches), strings.Join(ids, ", ")))
+	}
+}
+
+// sshClientOnly is sshClientForSession without the session record, for callers that
+// need the transport and not the metadata.
+func (s *Server) sshClientOnly(sessionID string) (*ssh.Client, *mcpgo.CallToolResult) {
+	_, cli, bad := s.sshClientForSession(sessionID)
+	return cli, bad
 }
 
 // sftpClient resolves a session and creates an SFTP client over it.
@@ -232,14 +319,14 @@ func (s *Server) requireShell(shellID string) (*session.ChildShell, *mcpgo.CallT
 	if cs := s.sessMgr.GetChildShell(shellID); cs != nil {
 		if sess := s.sessMgr.Get(cs.ParentSessionID()); sess != nil {
 			if status := sess.Info().Status; status != api.SessionRunning {
-				return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' is closed (status %s); its output is read-only via shell_output", sess.ID, status))
+				return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' is closed (status %s); its output is still readable with `read`", sess.ID, status))
 			}
 		}
 		return cs, nil
 	}
 	if sess := s.sessMgr.Get(shellID); sess != nil {
 		if sess.Info().Status != api.SessionRunning {
-			return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' is closed (status %s); its output is read-only via shell_output", shellID, sess.Info().Status))
+			return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' is closed (status %s); its output is still readable with `read`", shellID, sess.Info().Status))
 		}
 		// A SESSION IS NOT A CHANNEL, and resolving it to the primary one is what
 		// made `close <session> --force` a silent no-op (#132) and `run <session>`
@@ -284,7 +371,7 @@ func (s *Server) requireShell(shellID string) (*session.ChildShell, *mcpgo.CallT
 	if h := locator.SplitHandle(shellID); h.Index > 0 {
 		if sess := s.sessMgr.Get(h.SessionID); sess != nil {
 			if sess.Info().Status != api.SessionRunning {
-				return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' is closed (status %s); its output is read-only via shell_output", sess.ID, sess.Info().Status))
+				return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' is closed (status %s); its output is still readable with `read`", sess.ID, sess.Info().Status))
 			}
 			cs, err := s.shellFromIndex(sess, h.Index)
 			if err != nil {

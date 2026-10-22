@@ -31,7 +31,7 @@ func TestAliasSelfReferenceIsACycle(t *testing.T) {
 
 // A chain that resolves is NOT a cycle, and cyclePath must not claim otherwise.
 func TestAliasChainWithoutCycleHasNoCyclePath(t *testing.T) {
-	a := &aliasTable{m: map[string]string{"mx": "ps --all"}}
+	a := &aliasTable{m: map[string]string{"mx": "ls --all"}}
 	if path := a.cyclePath("mx"); len(path) != 0 {
 		t.Fatalf("cyclePath = %v, want none", path)
 	}

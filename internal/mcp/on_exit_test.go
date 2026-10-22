@@ -161,7 +161,7 @@ func TestSessionStartRejectsAnUnknownOnExit(t *testing.T) {
 
 // TestOnExitIsDiscoverableOnTheWire pins the other half of the feature: a policy
 // the model cannot see is one it will never use. The rule is asserted through
-// what the model actually reads — help pipe, reached over the wire — rather than
+// what the model actually reads — help open, reached over the wire — rather than
 // against the source table, because a flag documented in one place and trimmed in
 // another would leave the feature existing but unused.
 func TestOnExitIsDiscoverableOnTheWire(t *testing.T) {
@@ -169,28 +169,28 @@ func TestOnExitIsDiscoverableOnTheWire(t *testing.T) {
 	// one tool now, so the flag's semantics live in the directive that takes it,
 	// and the assertion follows the knowledge instead of the old wire shape.
 	s := newTestServer(t)
-	help := termText(t, s, map[string]any{"cmd": "help pipe"})
+	help := termText(t, s, map[string]any{"cmd": "help open"})
 
 	for _, want := range []string{"on-exit", "keep", "close"} {
 		if !strings.Contains(help, want) {
-			t.Errorf("help pipe misses %q; a model deciding how to start a one-shot command reads this:\n%s", want, help)
+			t.Errorf("help open misses %q; a model deciding how to start a one-shot command reads this:\n%s", want, help)
 		}
 	}
 
 	// The flag must be accepted by the parser, and an unknown value must not be
 	// silently coerced: the handler validates it, so a typo is an error rather
 	// than a session that quietly stays in the running list.
-	if _, err := directive.Parse("pipe internal --on-exit close"); err != nil {
-		t.Errorf("--on-exit is not accepted by the pipe grammar: %v", err)
+	if _, err := directive.Parse("connect internal --on-exit close"); err != nil {
+		t.Errorf("--on-exit is not accepted by the connect grammar: %v", err)
 	}
-	if _, err := directive.Parse("pipe internal --on-exit bogus"); err != nil {
+	if _, err := directive.Parse("connect internal --on-exit bogus"); err != nil {
 		t.Errorf("--on-exit must parse even with an unknown value (the handler validates it): %v", err)
 	}
 
 	// And the default is still the old behaviour: a model must not think every
 	// session now auto-closes.
 	guide := termText(t, s, map[string]any{})
-	if !strings.Contains(guide, "pipe") {
+	if !strings.Contains(guide, "open") {
 		t.Errorf("the guide does not mention pipe, so a caller never learns how to open a channel:\n%s", guide)
 	}
 }

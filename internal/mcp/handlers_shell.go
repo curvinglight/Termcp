@@ -374,6 +374,38 @@ func (s *Server) handleCloseShell(_ context.Context, request mcpgo.CallToolReque
 	return successResult(), nil
 }
 
+// handleArchiveShell closes ONE channel and keeps its record readable.
+//
+// This is what the `close <handle>` directive means, and it is deliberately not
+// handleCloseShell: that one erases the shell's metadata, so a closed channel
+// answered 404 afterwards and the caller could not tell "I closed it" from "it never
+// existed" — while the transcript sat on disk with nothing addressing it.
+//
+// The internal-primary no-op that handleCloseShell applies does NOT belong here.
+// That rule exists for the browser tab: closing a tab must not kill a loopback
+// process. A directive that names a channel is asking for the channel to end, and a
+// silent success that leaves everything running is the failure this whole change
+// exists to remove. The tab's behaviour stays where it belongs, in the Web UI route.
+func (s *Server) handleArchiveShell(_ context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	args := request.GetArguments()
+	shellID := getString(args, "shell_id", "")
+	if shellID == "" {
+		return toolError(CodeInvalidArgument, "%s", "shell_id is required"), nil
+	}
+	shell, bad := s.requireShell(shellID)
+	if bad != nil {
+		return bad, nil
+	}
+	found, err := s.sessMgr.ArchiveChildShell(shell.ID)
+	if err != nil {
+		return toolError(CodeOperationFailed, "%s", err.Error()), nil
+	}
+	if !found {
+		return toolError(CodeShellNotFound, "%s", fmt.Sprintf("Shell '%s' not found", shell.ID)), nil
+	}
+	return successResult(), nil
+}
+
 // handleReadOutput is the ONE unified output reader. It serves live shells
 // (in-memory buffer), exited-but-retained shells, and closed/restored-DEAD
 // sessions (persisted log.bin) with identical byte-stream cursor semantics.
@@ -708,6 +740,16 @@ func (s *Server) handleRegisterReader(ctx context.Context, request mcpgo.CallToo
 	shell, bad := s.requireShell(sessionID)
 	if bad != nil {
 		return bad, nil
+	}
+	// A CHANNEL WHOSE PROCESS HAS EXITED CANNOT TAKE A READER, and that is a fact about
+	// the channel, not a failure inside termcp. It used to surface as "buffer: closed"
+	// with a 500, which reads as a bug in the server; the caller's mistake was asking a
+	// finished channel to start a stream, and the answer should say so — along with what
+	// still works, which is reading what it already produced.
+	if status := shell.Info().Status; status != api.SessionRunning {
+		return toolError(CodeConflict, "%s", fmt.Sprintf(
+			"channel %s has %s, so no reader can be attached; its output is still readable with `read`",
+			shell.ID, status)), nil
 	}
 	readerID, err := shell.RegisterReader()
 	if err != nil {

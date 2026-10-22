@@ -199,7 +199,11 @@ func (f *ForwardDecl) Normalize() {
 		f.RemoteHost = "localhost"
 	}
 	if f.Kind == ForwardRemote && f.LocalHost == "" {
-		f.LocalHost = "0.0.0.0"
+		// LOOPBACK, LIKE EVERY OTHER DEFAULT HERE. The port is opened on the TARGET,
+		// and 0.0.0.0 there publishes an authenticated tunnel to that machine's whole
+		// network — which is a decision, not a default. `ssh -R` made the same move for
+		// the same reason; a caller that means to publish says so with --local-host.
+		f.LocalHost = "127.0.0.1"
 	}
 	// A template that wrote local_host on a -L/-D declaration meant the address
 	// this host listens on -- the reading the field now has under its own name.

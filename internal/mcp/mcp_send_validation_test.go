@@ -14,7 +14,7 @@ func TestMCPSendRefusesANonJSONFrame(t *testing.T) {
 	// The handle only has to name a channel; the gate runs before any write.
 	handle := startPipeSession(t, s) + ":1"
 
-	text := termText(t, s, map[string]any{"cmd": "mcp send " + handle + " 'not json'"})
+	text := termText(t, s, map[string]any{"cmd": "call " + handle + " 'not json'"})
 	if !strings.Contains(text, "not JSON") {
 		t.Fatalf("a non-JSON frame was accepted:\n%s", text)
 	}
@@ -27,7 +27,7 @@ func TestMCPSendAcceptsAValidFrame(t *testing.T) {
 	s := newTestServer(t)
 	handle := startPipeSession(t, s) + ":1"
 
-	text := termText(t, s, map[string]any{"cmd": `mcp send ` + handle + ` '{"jsonrpc":"2.0","id":1,"method":"ping"}'`})
+	text := termText(t, s, map[string]any{"cmd": `call ` + handle + ` '{"jsonrpc":"2.0","id":1,"method":"ping"}'`})
 	if strings.Contains(text, "not JSON") {
 		t.Fatalf("a valid frame was refused as non-JSON:\n%s", text)
 	}

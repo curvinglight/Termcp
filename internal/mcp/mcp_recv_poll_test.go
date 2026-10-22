@@ -23,7 +23,7 @@ func TestRecvWaitsForTheFrameInsteadOfSamplingOnce(t *testing.T) {
 
 	// A frame that is not there at the instant of the read: the peer sleeps first.
 	h := openPipe(t, s, `sh -c 'sleep 0.3; printf "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n"'`)
-	got := termText(t, s, map[string]any{"cmd": "mcp recv " + h})
+	got := termText(t, s, map[string]any{"cmd": "read " + h + " --frame"})
 	if strings.Contains(got, "no complete frame") {
 		t.Errorf("recv sampled once instead of waiting:\n%s", got)
 	}
@@ -55,7 +55,7 @@ func TestRecvDeliversAFrameLargerThanTheReadWindow(t *testing.T) {
 	// Wait for the writer to finish so the frame is complete in the buffer.
 	waitForShellToExit(t, s, shellIDFromHandle(t, s, h))
 
-	got := termText(t, s, map[string]any{"cmd": "mcp recv " + h})
+	got := termText(t, s, map[string]any{"cmd": "read " + h + " --frame"})
 	payload := strings.Repeat("x", n)
 	if !strings.Contains(got, payload) {
 		t.Errorf("a %d byte frame was not delivered (window should be 1 MiB):\n%.300s", n, got)
@@ -68,7 +68,7 @@ func TestRecvDeliversAFrameLargerThanTheReadWindow(t *testing.T) {
 func TestRecvStillReportsAbsenceWhenNothingArrives(t *testing.T) {
 	s := newTestServer(t)
 	h := openPipe(t, s, `sh -c 'sleep 10'`)
-	got := termText(t, s, map[string]any{"cmd": "mcp recv " + h})
+	got := termText(t, s, map[string]any{"cmd": "read " + h + " --frame"})
 	if !strings.Contains(got, "no complete frame") {
 		t.Errorf("an empty channel should report absence:\n%s", got)
 	}
@@ -91,7 +91,7 @@ func TestRecvStillReportsAbsenceWhenNothingArrives(t *testing.T) {
 func TestRecvFindsAFrameBehindStartupNoise(t *testing.T) {
 	s := newTestServer(t)
 	h := openPipe(t, s, `sh -c 'printf "npm warn Unknown user config\nStarting default (STDIO) server...\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n"; sleep 3'`)
-	got := termText(t, s, map[string]any{"cmd": "mcp recv " + h})
+	got := termText(t, s, map[string]any{"cmd": "read " + h + " --frame"})
 	if strings.Contains(got, "no complete frame") {
 		t.Fatalf("a frame behind startup noise was reported absent:\n%s", got)
 	}

@@ -21,9 +21,11 @@ func TestPayloadIsSlicedNotReparsed(t *testing.T) {
 		want string
 	}{
 		{
-			name: "a pipeline with quotes and && survives byte for byte",
-			cmd:  `run a1f3:1 ls -la | grep -c '\.go$' && echo "rc=$?"`,
-			want: `ls -la | grep -c '\.go$' && echo "rc=$?"`,
+			// A pipeline is still ONE shell line: `|` runs its parts concurrently,
+			// so there is no left-hand success to gate on and nothing to split.
+			name: "a pipeline with quotes survives byte for byte",
+			cmd:  `run a1f3:1 ls -la | grep -c '\.go$'`,
+			want: `ls -la | grep -c '\.go$'`,
 		},
 		{
 			name: "adjacent quoted parts are not merged",
@@ -123,7 +125,7 @@ func TestFlagValueIsByteFaithful(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f, err := Parse(`file h --action write --data ` + tc.word)
+			f, err := Parse(`write h file /tmp/x --data ` + tc.word)
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
@@ -154,11 +156,11 @@ func TestFlagWithNoValueIsNotAnEmptyValue(t *testing.T) {
 		value string
 		has   bool
 	}{
-		{"file h --data ''", "data", FlagValueSet, "", true},
-		{`file h --data ""`, "data", FlagValueSet, "", true},
-		{"file h --data=", "data", FlagValueSet, "", true},
-		{"file h --data", "data", FlagNoValue, "", false},
-		{"file h --action read", "data", FlagAbsent, "", false},
+		{"write h file /tmp/x --data ''", "data", FlagValueSet, "", true},
+		{`write h file /tmp/x --data ""`, "data", FlagValueSet, "", true},
+		{"write h file /tmp/x --data=", "data", FlagValueSet, "", true},
+		{"write h file /tmp/x --data", "data", FlagNoValue, "", false},
+		{"read h:1 file /tmp/x", "data", FlagAbsent, "", false},
 		// A valueless flag is SET: `--raw` needs no value and means the flag was
 		// written, which is the whole question it asks.
 		{"read h:1 --raw", "raw", FlagValueSet, "", true},
@@ -223,7 +225,7 @@ func TestHashIsNotATargetPrefix(t *testing.T) {
 
 // TestQuotedTargetNamesTheSameThing pins that quoting is not part of a target: it
 // is what the shell strips before the directive sees the word. Quoting is also the
-// only way to write a word-initial '#', so this is the spelling `info '#sid'` — the
+// only way to write a word-initial '#', so this is the spelling `get '#sid'` — the
 // one a caller reaches for when the target is a `#<session>` locator — must not
 // lose its target.
 //
@@ -232,9 +234,9 @@ func TestHashIsNotATargetPrefix(t *testing.T) {
 // reply was `Session ” not found` with nothing pointing at the quotes.
 func TestQuotedTargetNamesTheSameThing(t *testing.T) {
 	for _, cmd := range []string{
-		`info a1f3:1`,
-		`info 'a1f3:1'`,
-		`info "a1f3:1"`,
+		`get a1f3:1`,
+		`get 'a1f3:1'`,
+		`get "a1f3:1"`,
 	} {
 		f, err := Parse(cmd)
 		if err != nil {
@@ -302,7 +304,7 @@ func TestFlagsComeAfterTheTarget(t *testing.T) {
 // after it belong to the program, so flags must come before it and a bare
 // payload is refused rather than dropped.
 func TestArgvTakesTheRestOfTheStatement(t *testing.T) {
-	f, err := Parse(`pipe internal --name chat --argv sh -c 'echo hi'`)
+	f, err := Parse(`connect internal --name chat --argv sh -c 'echo hi'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,13 +319,13 @@ func TestArgvTakesTheRestOfTheStatement(t *testing.T) {
 		t.Errorf("payload = %q; --argv consumed it", st.Payload)
 	}
 
-	if _, err := Parse(`pipe internal --argv echo hi --name chat`); err == nil {
+	if _, err := Parse(`connect internal --argv echo hi --name chat`); err == nil {
 		t.Fatal("a known flag after --argv must be refused, not passed to the program")
 	} else if !strings.Contains(err.Error(), "flags come before --argv") {
 		t.Errorf("error = %v", err)
 	}
 
-	if _, err := Parse(`pipe internal sleep 5`); err == nil {
+	if _, err := Parse(`connect internal sleep 5`); err == nil {
 		t.Fatal("a bare payload must be refused, not silently dropped")
 	} else if !strings.Contains(err.Error(), "--argv") {
 		t.Errorf("error = %v, want it to name --argv", err)
@@ -373,39 +375,6 @@ func TestSplitArgvRefusesACommandLine(t *testing.T) {
 		if _, _, err := SplitArgv(raw); err == nil {
 			t.Errorf("SplitArgv(%q) accepted a command line", raw)
 		}
-	}
-}
-
-// TestTargetOptionalFlagForms pins `watch --off <rule>` and `watch --list`:
-// the documented flag-only forms have no target, so the positional rule must
-// not read `--off` as one.
-func TestTargetOptionalFlagForms(t *testing.T) {
-	f, err := Parse(`watch --off notif_1`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := f.Statements[0]
-	if st.Target != "" {
-		t.Errorf("target = %q, want empty for --off", st.Target)
-	}
-	if got := flagOf(t, st, "off"); got != "notif_1" {
-		t.Errorf("off = %q", got)
-	}
-
-	f, err = Parse(`watch --list`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !boolFlagSet(f.Statements[0], "list") {
-		t.Error("--list must be present")
-	}
-
-	f, err = Parse(`watch a1f3:1 --event output`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := flagOf(t, f.Statements[0], "event"); f.Statements[0].Target != "a1f3:1" || got != "output" {
-		t.Errorf("target/event = %q/%q", f.Statements[0].Target, got)
 	}
 }
 
@@ -484,15 +453,29 @@ func TestStatementsSplitOnSemicolonNotOnAnd(t *testing.T) {
 		t.Errorf("targets = %q, %q", f.Statements[0].Target, f.Statements[1].Target)
 	}
 
-	f, err = Parse(`run a1f3:1 make && echo ok`)
+	// `&&` IS A DIRECTIVE OPERATOR NOW, not part of a shell line.
+	//
+	// It used to stay inside the payload, so the shell short-circuited it and
+	// termcp had no opinion. That made `run h:1 make && notify done` mean "hand the
+	// shell the text 'make && notify done'" — never what a caller writing a chain
+	// of DIRECTIVES meant. Shell text now travels through $1/$FOO, the channels
+	// built for it, and everything written directly in cmd is directive syntax.
+	f, err = Parse(`run a1f3:1 make && notify done`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(f.Statements) != 1 {
-		t.Fatalf("`&&` split into %d statements; it is one command line", len(f.Statements))
+	if len(f.Statements) != 2 {
+		t.Fatalf("`&&` did not split into two statements: got %d", len(f.Statements))
 	}
-	if got := f.Statements[0].Payload; got != "make && echo ok" {
-		t.Errorf("payload = %q", got)
+	if got := f.Statements[0].Payload; got != "make" {
+		t.Errorf("first payload = %q, want the left side only", got)
+	}
+	if f.Statements[0].Cond != "" || f.Statements[1].Cond != "&&" {
+		t.Errorf("conds = %q, %q; the operator belongs to the statement it guards",
+			f.Statements[0].Cond, f.Statements[1].Cond)
+	}
+	if f.Statements[1].Op != "notify" {
+		t.Errorf("second op = %q, want notify", f.Statements[1].Op)
 	}
 }
 
@@ -593,7 +576,10 @@ func fillUsageStubs(s string) string {
 			break
 		}
 		stub := "x"
-		if strings.Contains(s[start:start+end+1], "handle") {
+		// A CHANNEL is addressed <session>:<index>, so its stub needs the colon: a
+		// bare word is refused by the very directives that take one, which would make
+		// this test report the refusal as a broken usage line.
+		if placeholder := s[start : start+end+1]; strings.Contains(placeholder, "handle") || strings.Contains(placeholder, "channel") {
 			stub = "x:1"
 		}
 		s = s[:start] + stub + s[start+end+1:]
@@ -662,7 +648,7 @@ func TestTrailingSemicolonIsNotPayload(t *testing.T) {
 
 	// --argv takes the rest of the statement: the separator stays out of the
 	// program's last argument.
-	f, err = Parse(`pipe mac --argv printf '[%s]' 'a';`)
+	f, err = Parse(`connect mac --argv printf '[%s]' 'a';`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,8 +666,8 @@ func TestTrailingSemicolonIsNotPayload(t *testing.T) {
 // only working spelling was the undocumented `--session`, which the usage line
 // does not mention — a documented form that cannot work and a working form that
 // is not documented.
-func TestFwdTakesItsSessionAsTheTarget(t *testing.T) {
-	f, err := Parse("fwd a1f3 --action dynamic --local-port 11080")
+func TestForwardTakesItsSessionAsTheTarget(t *testing.T) {
+	f, err := Parse("open a1f3 forward --local-port 11080 --remote-host db --remote-port 5432")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -692,47 +678,44 @@ func TestFwdTakesItsSessionAsTheTarget(t *testing.T) {
 	if st.Target != "a1f3" {
 		t.Errorf("Target = %q, want %q", st.Target, "a1f3")
 	}
-	if got := flagOf(t, st, "action"); got != "dynamic" {
-		t.Errorf("action = %q, want %q", got, "dynamic")
+	// THE KIND IS `forward`, and the session is the target — no --session flag, no
+	// --action. What the forward DOES is its own set of flags; whether it is a forward
+	// at all is the word `forward`.
+	if got := st.Kind; got != "forward" {
+		t.Errorf("Kind = %q, want %q", got, "forward")
 	}
 	if got := flagOf(t, st, "local-port"); got != "11080" {
 		t.Errorf("local-port = %q, want %q", got, "11080")
-	}
-
-	// The flag form still works: it is the one existing callers may be using.
-	f, err = Parse("fwd --session a1f3 --action list")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := flagOf(t, f.Statements[0], "session"); got != "a1f3" {
-		t.Errorf("--session = %q, want %q", got, "a1f3")
 	}
 }
 
 // TestEveryFlagIsDocumented pins the flag table against the help text.
 //
-// A flag that exists but appears in no usage line and no Detail page is a flag
-// only the source knows about, which is the same as not having it: the caller
-// who needs `file --local-offset` reads `help file`, does not find it, and
-// concludes the capability is missing. The reverse is worse and is caught in the
-// mcp package, where a flag can be listed here and consumed nowhere.
-func TestEveryFlagIsDocumented(t *testing.T) {
+// TestEveryFlagHasAValueRule pins the half of flag bookkeeping that lives in the
+// table: every declared flag is either given a value or declared valueless, and the
+// two sets do not overlap.
+//
+// DISCOVERY IS NOT CHECKED HERE ANY MORE. `help <verb>` prints a list derived from
+// this same table (flagList in internal/mcp/term_generated.go), so "is it written
+// down somewhere" is true by construction; the check that earns its place is that
+// the derived list actually reaches the caller, and that one lives in the mcp
+// package where help is rendered.
+func TestEveryFlagHasAValueRule(t *testing.T) {
 	for _, op := range Ops() {
-		if len(op.Flags) == 0 {
-			continue
-		}
-		// Usage may name flags; Detail is where the ones that do not fit belong.
-		documented := op.Usage + "\n" + op.Detail
-		var missing []string
-		for _, f := range op.Flags {
-			if !strings.Contains(documented, "--"+f) {
-				missing = append(missing, "--"+f)
+		valueless := make(map[string]bool, len(op.Valueless))
+		for _, v := range op.Valueless {
+			if !slices.Contains(op.Flags, v) {
+				t.Errorf("%s: %q is Valueless but not declared in Flags", op.Name, v)
 			}
+			if valueless[v] {
+				t.Errorf("%s: %q is listed in Valueless twice", op.Name, v)
+			}
+			valueless[v] = true
 		}
-		if len(missing) > 0 {
-			t.Errorf("%s: %d flag(s) documented nowhere (neither Usage nor Detail): %s\n"+
-				"add them to the Detail page, or drop them from Flags if nothing consumes them",
-				op.Name, len(missing), strings.Join(missing, ", "))
+		for _, f := range op.Flags {
+			if f == "" {
+				t.Errorf("%s: an empty flag name", op.Name)
+			}
 		}
 	}
 }
@@ -760,7 +743,7 @@ func TestValuelessFlagsAreReal(t *testing.T) {
 // startup error that named no flag — so the shape is pinned here, where the
 // parser can refuse it before anything runs.
 func TestExtArgsTakesTheRestOfTheLine(t *testing.T) {
-	f, err := Parse(`ext create srv --kind mcp --target internal --mode pipe --command node --args /srv/mcp.js --stdio --label 'a,b'`)
+	f, err := Parse(`create ext srv --kind mcp --target internal --mode pipe --command node --args /srv/mcp.js --stdio --label 'a,b'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -778,34 +761,9 @@ func TestExtArgsTakesTheRestOfTheLine(t *testing.T) {
 	}
 
 	// A known flag after --args is the caller's mistake, not a program argument.
-	if _, err := Parse(`ext create srv --args mcp --name srv`); err == nil {
+	if _, err := Parse(`create ext srv --args mcp --name srv`); err == nil {
 		t.Fatal("a flag after --args must be refused, not handed to the program")
 	} else if !strings.Contains(err.Error(), "flags come before --args") {
 		t.Errorf("error = %v, want it to name the ordering rule", err)
-	}
-}
-
-// TestExtensionsIsABuiltinSpellingOfExt pins the synonym.
-//
-// A caller reaches for `extensions` before reading help — it is the tool's own
-// name for the thing — and an unknown-directive error at that moment is the
-// documentation failing, not the caller. The synonym resolves to the canonical
-// name, so every downstream lookup (dispatch, capability) sees one spelling.
-func TestExtensionsIsABuiltinSpellingOfExt(t *testing.T) {
-	if _, ok := Lookup("extensions"); !ok {
-		t.Fatal("`extensions` must resolve; it is the tool's own name for `ext`")
-	}
-	f, err := Parse(`extensions list`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := f.Statements[0].Op; got != "ext" {
-		t.Errorf("op = %q, want the canonical %q", got, "ext")
-	}
-	// help lists canonical names only: a synonym is a way in, not a second entry.
-	for _, name := range Names() {
-		if name == "extensions" {
-			t.Error("`extensions` must not appear as its own help entry")
-		}
 	}
 }

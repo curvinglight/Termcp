@@ -8,7 +8,7 @@ import (
 )
 
 // Issue #80: one command to a fleet. The lifecycle commands already accepted a
-// comma-separated id list; input did not, so "type this into all ten shells" was
+// comma-separated id list; input did not, so "input this into all ten shells" was
 // ten round trips — and an agent's turns are the scarce resource, not its calls.
 //
 // Two properties are worth pinning and neither is visible from the tool

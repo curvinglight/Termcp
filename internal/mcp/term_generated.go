@@ -38,6 +38,19 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 	if !boolFlag(stmt, "all") {
 		sessions = listableSessions(sessions, callerNS)
 	}
+	// `ls <session>` narrows the same listing to one link. Done here rather than in a
+	// second function because the columns, the caps and the emptiness message must
+	// stay identical: two listings of the same tree that disagree are worse than one
+	// that needs a flag.
+	if only, ok := stmt.Flag("only-session"); ok && only != "" {
+		narrowed := sessions[:0]
+		for _, sess := range sessions {
+			if sess.ID == only || sess.SSHConfig == only {
+				narrowed = append(narrowed, sess)
+			}
+		}
+		sessions = narrowed
+	}
 
 	var b strings.Builder
 	for _, sess := range sessions {
@@ -64,8 +77,35 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 		}
 	}
 	body := b.String()
-	if body == "" {
+	// PEERS ARE NODES ON THE SAME LISTING. `ls <session>` is the only place a caller
+	// can find out what an instance is holding without having memorised a reply, and a
+	// peer that exists but is invisible there is an address lost the moment you look
+	// away. They are printed with the address that addresses them, so column 1 is
+	// copyable for either kind of node.
+	if peers := peerLines(sessions); peers != "" {
+		body += peers
+	}
+	if strings.TrimSpace(body) == "" {
 		body = "(nothing is running)\n"
+	}
+	// PS IS THE STATE, SO ITS learn_mode TEACHES THE STATE VERBS.
+	//
+	// `learn_mode` attaches the CURRENT directive's usage line, which is right for a
+	// reply about one command and useless here: a caller that just ran `ps` is holding
+	// addresses and wondering what can be done with them. The verbs that consume an
+	// address are exactly the ones worth naming at that moment — and they are not
+	// discoverable from the listing, which shows ids and states but never says that
+	// `close a1f3:1` archives one and `rm a1f3` erases the other.
+	//
+	// This is the manual's own ordering: learn what exists, then what can be done to
+	// it. One `ps learn_mode:true` replaces four `help` round trips.
+	if win.LearnMode {
+		body += "\nwhat an address in column 1 can be used for:\n"
+		for _, name := range []string{"get", "close", "rm", "read", "resize", "span", "open", "run"} {
+			if op, ok := directive.Lookup(name); ok {
+				body += "  " + op.Usage + "\n"
+			}
+		}
 	}
 	// A generated reply is capped by the same window as a byte stream: a listing is
 	// exactly as capable of flooding a context as a log is, and the directives with
@@ -162,53 +202,120 @@ func (s *Server) directiveResize(ctx context.Context, stmt directive.Statement, 
 // first is exactly the question that answers yes for a session id and buries the
 // caller's --force.
 func (s *Server) directiveClose(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
-	// --force and --grace are session-only vocabulary: shell_close accepts neither,
-	// so a caller who wrote one is terminating a container, not closing a channel.
+	// THE TARGET DECIDES WHAT IS CLOSED. NOTHING ELSE.
 	//
-	// --grace counts even without --force: it is the deadline for a termination
-	// (SIGTERM, then kill), which has no meaning for closing a channel.
-	wantsSession := boolFlag(stmt, "force") || stmt.FlagState("grace") != directive.FlagAbsent
+	// This used to route on INTENT recovered from the flags — `--force` or `--grace`
+	// meant "a session" — to escape issue #132, where `close <session> --force` was a
+	// silent no-op because requireShell resolved a session id to its primary channel.
+	// Reading intent out of a flag is the wrong lever: a flag modifies HOW an action
+	// happens, never WHICH object it happens to. `close a1f3:1 --force` therefore
+	// terminated the whole session and answered 204, taking every other channel down
+	// with it — a caller naming one channel had no way to see the blast radius.
+	//
+	// So: a `sid:N` handle names a channel, a bare session id names the container, and
+	// the two vocabularies belong to their own object. `--grace` is a session's
+	// deadline; `--force` is gone entirely (see below).
+	h := locator.SplitHandle(stmt.Target)
+	isChannel := h.Index > 0
 
-	// A target that names a session and NOT one of its channels is the container
-	// too. GetChildShell answers the channel question directly, and the `sid:N`
-	// form is excluded because it names a channel by construction — a caller who
-	// copied a handle out of `ps` asked about that channel.
-	if !wantsSession {
-		h := locator.SplitHandle(stmt.Target)
-		wantsSession = h.Index == 0 && s.sessMgr.Get(h.SessionID) != nil
-	}
-
-	if wantsSession {
-		args := argsOf("session_id", stmt.Target)
+	if isChannel {
+		// `--grace` has no meaning for a channel: closing one closes one SSH channel,
+		// which has no SIGTERM-then-wait protocol. Refusing is better than ignoring it,
+		// because a caller who wrote it expects a deadline that will never exist.
+		if stmt.FlagState("grace") != directive.FlagAbsent {
+			return badRequest(stmt, "`--grace` is a session deadline; `"+stmt.Target+
+				"` is a channel, and closing a channel has no SIGTERM-then-wait phase.\n"+
+				"To close the whole connection use `close "+h.SessionID+" --grace N`.")
+		}
 		if boolFlag(stmt, "force") {
-			args["force"] = true
+			return badRequest(stmt, "`--force` is gone: `close` stops a session and keeps it readable, `rm` erases it.\n"+
+				"`"+stmt.Target+"` is a channel — `close "+stmt.Target+"` stops just that channel and keeps its output.")
 		}
-		if slot, bad := numericFlags(args, stmt, [2]string{"grace", "grace_period"}); bad {
-			return slot
+		if _, bad := s.requireShell(stmt.Target); bad != nil {
+			return s.slotFromFailure(ctx, stmt, failureFromResult(bad))
 		}
-		// The handler resolves the id itself (including a locator or a `sid:N`
-		// handle) and reports a session it cannot find as session_not_found rather
-		// than succeeding silently — Terminate is a no-op for an id it cannot see,
-		// which is the same class of lie this function exists to stop telling.
-		if _, fail := s.callTool(ctx, "session_terminate", args); fail != nil {
+		// ARCHIVE, NOT ERASE. shell_close deletes the shell's metadata, which leaves
+		// the transcript on disk with nothing that addresses it: the caller reads 404
+		// afterwards and cannot tell a closed channel from one that never existed.
+		// Closing a channel is not asking for its record to be destroyed — `rm` is.
+		if _, fail := s.callTool(ctx, "shell_archive", argsOf("shell_id", stmt.Target)); fail != nil {
 			return s.slotFromFailure(ctx, stmt, fail)
 		}
+		// A CHANNEL'S PEER STATE GOES WITH IT. If a stdio peer was being read through
+		// this channel, its cursor is keyed by the handle and would otherwise outlive
+		// the channel: handles are minted monotonically, so nothing ever reclaims the
+		// entry and a long-lived instance grows one per channel it ever opened.
+		s.dropRecvCursor(stmt.Target)
 		return noContent(stmt)
 	}
 
-	if _, bad := s.requireShell(stmt.Target); bad != nil {
-		// Neither a session nor a channel: report the handler's own diagnostic
-		// instead of pretending something was closed.
+	// A bare session id, or a locator naming one: terminate the container.
+	//
+	// EXISTENCE IS CHECKED BEFORE THE HANDLER, because Terminate is a no-op for an id
+	// it cannot see — and the handler reports that as an operation failure, which
+	// reads like "the terminate broke" rather than "there is nothing by that name".
+	// Every other close path answers 404 for an unknown target (rm, fwd close,
+	// profile delete); this one has to agree.
+	sess, bad := s.requireSession(stmt.Target)
+	if bad != nil {
 		return s.slotFromFailure(ctx, stmt, failureFromResult(bad))
 	}
-	if _, fail := s.callTool(ctx, "shell_close", argsOf("shell_id", stmt.Target)); fail != nil {
+	if boolFlag(stmt, "force") {
+		return badRequest(stmt, "`--force` is gone. `close` stops a session and leaves it readable;\n"+
+			"`rm "+stmt.Target+"` erases it (and needs --force while it is running).")
+	}
+	args := argsOf("session_id", stmt.Target)
+	if slot, bad := numericFlags(args, stmt, [2]string{"grace", "grace_period"}); bad {
+		return slot
+	}
+	// The handler resolves the id itself (including a locator) and reports a session
+	// it cannot find as session_not_found rather than succeeding silently —
+	// Terminate is a no-op for an id it cannot see, which is the same class of lie
+	// this function exists to stop telling.
+	if _, fail := s.callTool(ctx, "session_terminate", args); fail != nil {
 		return s.slotFromFailure(ctx, stmt, fail)
+	}
+	// A SESSION'S PEERS GO WITH IT, for the same reason its channels' cursors do: the
+	// transport they talk through is this session's SSH channel, so a peer that outlives
+	// it is a socket to nowhere that still holds its frame ring. Doing it HERE rather
+	// than only on the DEAD hook is deliberate — a graceful close is not a dead
+	// transition, and this function already releases what it releases by name.
+	if sess != nil {
+		closePeersBySession(sess.Info().ID)
 	}
 	return noContent(stmt)
 }
 
 // directiveRemove deletes a session and its logs.
 func (s *Server) directiveRemove(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+	// --dry-run ANSWERS WHAT WOULD HAPPEN WITHOUT DOING IT, and it runs FIRST.
+	//
+	// FIRST, because a preview that can itself be refused is not a preview: the
+	// running-session guard below answered 409 to a `--dry-run` call, which is
+	// exactly the call a cautious caller makes BEFORE deciding whether to pass
+	// --force. The preview is the place where "it is running, you will need --force"
+	// is stated, not the place where it is enforced.
+	//
+	// The shape exists now, before review mode does: a destructive directive either
+	// supports a preview or it does not, and leaving it for later means the calls
+	// written today cannot use it.
+	if boolFlag(stmt, "dry-run") {
+		what := "session '" + stmt.Target + "' does not exist, so nothing would be erased"
+		if sess, bad := s.requireSession(stmt.Target); bad == nil && sess != nil {
+			info := sess.Info()
+			what = "would erase session '" + stmt.Target + "' (status " + string(info.Status) +
+				"): manifests, transcript and every trace. This cannot be undone."
+			if info.Status == api.SessionRunning {
+				what += "\nIt is running, so the real call needs --force."
+			}
+		}
+		return envelope.Slot{
+			Code:    200,
+			Headers: map[string]string{"Path": stmt.Path, "Dry-Run": "true"},
+			Body:    what,
+		}
+	}
+
 	// A RUNNING SESSION NEEDS --force.
 	//
 	// The distinction rm draws is not "is it alive" but "is the record recoverable",
@@ -336,50 +443,6 @@ func (s *Server) directiveReader(ctx context.Context, stmt directive.Statement, 
 	}
 }
 
-// directiveWatch manages wake-up rules.
-func (s *Server) directiveWatch(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
-	args := map[string]any{}
-	switch off, hasOff := stmt.Flag("off"); {
-	case boolFlag(stmt, "list"):
-		args["action"] = "list"
-	case hasOff && off != "":
-		args["action"] = "unregister"
-		args["rule_id"] = off
-	default:
-		// TargetOptional is true on watch so `--list` and `--off <rule>` need no
-		// target. The register form DOES need one, and reporting it here gives the
-		// caller the same syntax-level message as the other channel directives rather
-		// than a handler-internal "shell_id is required".
-		if stmt.Target == "" {
-			return badRequest(stmt, "watch needs a target: `watch <handle> [--event <name>]`")
-		}
-		args["action"] = "register"
-		args["shell_id"] = stmt.Target
-		if v, ok := stmt.Flag("event"); ok {
-			args["event"] = v
-		}
-		if v, ok := stmt.Flag("for"); ok {
-			secs, err := flagNumber(v)
-			if err != nil {
-				return numericFlagProblem(stmt, "for", err)
-			}
-			args["silence_seconds"] = secs
-		}
-		if v, ok := stmt.Flag("channel"); ok {
-			args["channel"] = v
-		}
-	}
-	res, fail := s.callTool(ctx, "shell_notify", args)
-	if fail != nil {
-		return s.slotFromFailure(ctx, stmt, fail)
-	}
-	doc, ok := toolResultMap(res)
-	if !ok {
-		return s.slotFromFailure(ctx, stmt, &toolFailure{code: CodeOperationFailed, msg: toolResultText(res)})
-	}
-	return generatedSlot(stmt, win, compactDocument(doc))
-}
-
 // directiveNotify posts a notification to the human.
 func (s *Server) directiveNotify(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
 	args := argsOf("message", stmt.Payload)
@@ -402,16 +465,6 @@ func (s *Server) directiveNotify(ctx context.Context, stmt directive.Statement, 
 		args["duration_seconds"] = secs
 	}
 	res, fail := s.callTool(ctx, "notify_user", args)
-	if fail != nil {
-		return s.slotFromFailure(ctx, stmt, fail)
-	}
-	doc, _ := toolResultMap(res)
-	return generatedSlot(stmt, win, compactDocument(doc))
-}
-
-// directiveDetect probes the termcp host for a shell.
-func (s *Server) directiveDetect(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
-	res, fail := s.callTool(ctx, "shell_detect", map[string]any{})
 	if fail != nil {
 		return s.slotFromFailure(ctx, stmt, fail)
 	}
@@ -489,7 +542,7 @@ func (s *Server) directiveFile(ctx context.Context, stmt directive.Statement, wi
 	action, _ := stmt.Flag("action")
 	tool, capID, ok := fileToolForAction(action)
 	if !ok {
-		return badRequest(stmt, "file needs --action read|write|stat|delete|rename|mkdir|urls|perm|link|fs|getwd, got "+quoteOrDash(action))
+		return badRequest(stmt, "file needs --action read|write|replace|stat|delete|rename|mkdir|urls|perm|link|fs|getwd, got "+quoteOrDash(action))
 	}
 	if slot, refused := s.refuseAction(ctx, stmt, capID); refused {
 		return slot
@@ -524,12 +577,15 @@ func (s *Server) directiveFile(ctx context.Context, stmt directive.Statement, wi
 		[2]string{"link-path", "link_path"},
 		[2]string{"existing-path", "existing_path"},
 		[2]string{"new-path", "new_path"},
+		[2]string{"old-text", "old_text"},
+		[2]string{"new-text", "new_text"},
 	); bad {
 		return slot
 	}
 	if slot, bad := numericFlags(args, stmt,
 		[2]string{"offset", "offset"},
 		[2]string{"length", "length"},
+		[2]string{"size", "size"},
 		[2]string{"local-offset", "local_offset"},
 		[2]string{"uid", "uid"},
 		[2]string{"gid", "gid"},
@@ -597,6 +653,8 @@ func fileToolForAction(action string) (tool, capID string, ok bool) {
 		return "file_read", capability.FileRead, true
 	case "write":
 		return "file_write", capability.FileWrite, true
+	case "replace":
+		return "file_replace", capability.FileWrite, true
 	case "stat":
 		return "file_stat", capability.FileStat, true
 	case "delete":
@@ -619,12 +677,29 @@ func fileToolForAction(action string) (tool, capID string, ok bool) {
 	return "", "", false
 }
 
-// directiveProfile maps `profile` onto ssh_config.
-func (s *Server) directiveProfile(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+// directiveHost maps `host` onto the stored connection targets.
+func (s *Server) directiveHost(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
 	action, rest := resolveAction(stmt, "list")
+	if action == "get" {
+		// Reading one entry needs no capability: it is the same information as the
+		// listing, with the secrets redacted.
+		name := strings.TrimSpace(stmt.Key)
+		if name == "" && len(rest) > 0 {
+			name = rest[0]
+		}
+		if name == "" {
+			return badRequest(stmt, "get host needs a name: `get host <name>`")
+		}
+		res, fail := s.callTool(ctx, "ssh_config", map[string]any{"action": "get", "name": name})
+		if fail != nil {
+			return s.slotFromFailure(ctx, stmt, fail)
+		}
+		doc, _ := toolResultMap(res)
+		return generatedSlot(stmt, win, compactDocument(doc))
+	}
 	capID, ok := profileCapability(action)
 	if !ok {
-		return badRequest(stmt, "profile needs --action list|create|edit|copy|delete, got "+quoteOrDash(action))
+		return badRequest(stmt, "host needs --action list|get|create|edit|copy|delete, got "+quoteOrDash(action))
 	}
 	if slot, refused := s.refuseAction(ctx, stmt, capID); refused {
 		return slot
@@ -664,6 +739,16 @@ func (s *Server) directiveProfile(ctx context.Context, stmt directive.Statement,
 	if slot, bad := numericFlags(args, stmt,
 		[2]string{"jump-port", "jump_port"},
 		[2]string{"dial-timeout-seconds", "dial_timeout_seconds"},
+	); bad {
+		return slot
+	}
+	// A BASTION CARRIES ITS OWN CREDENTIAL. validateDialSpec requires one, and until
+	// these flags existed every jump `create host` could express was refused — the
+	// three jump flags above were reachable only in theory.
+	if slot, bad := stringFlags(args, stmt,
+		[2]string{"jump-password", "jump_password"},
+		[2]string{"jump-private-key", "jump_private_key"},
+		[2]string{"jump-key-passphrase", "jump_key_passphrase"},
 	); bad {
 		return slot
 	}
@@ -855,6 +940,11 @@ func (s *Server) refuseAction(ctx context.Context, stmt directive.Statement, cap
 // own spaces (`"name": "x"` becomes two words), and the payload keeps the
 // caller's quoting, so a quoted frame reached json.Unmarshal with its quotes
 // still on and was refused as "not JSON".
+// looksLikeURL reports whether a word carries a scheme, which is how a bare URL is
+// told apart from a session name in `open`. Session ids are hex and host names are
+// identifiers; neither can contain "://".
+func looksLikeURL(word string) bool { return strings.Contains(word, "://") }
+
 func (s *Server) directiveJRPC(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
 	payload := strings.TrimSpace(stmt.Payload)
 	if payload == "" {
@@ -863,8 +953,23 @@ func (s *Server) directiveJRPC(ctx context.Context, stmt directive.Statement, wi
 	sub, rest := splitWord(payload)
 	switch sub {
 	case "open":
-		url, _ := splitWord(rest)
-		return s.jrpcOpen(ctx, stmt, stmt.Op, unquoteWord(url))
+		// open <session> <url>. The session is FIRST because it is the larger
+		// decision: it decides which network the URL is resolved on, and a caller
+		// that has not chosen one has not yet said what the URL means.
+		//
+		// ONE WORD IS NOT A SESSION AND AN EMPTY URL. A caller that typed a bare URL
+		// has already named the thing it wants to reach and merely omitted the network;
+		// reporting "needs a URL" would answer a sentence it did not say. Recognising a
+		// scheme is how the two mistakes stay distinguishable.
+		first, tail := splitWord(rest)
+		if tail = strings.TrimSpace(tail); tail == "" {
+			if looksLikeURL(first) {
+				return s.jrpcOpen(ctx, stmt, stmt.Op, "", unquoteWord(first))
+			}
+			return s.jrpcOpen(ctx, stmt, stmt.Op, unquoteWord(first), "")
+		}
+		rawURL, _ := splitWord(tail)
+		return s.jrpcOpen(ctx, stmt, stmt.Op, unquoteWord(first), unquoteWord(rawURL))
 	case "tools", "send", "recv", "call", "close":
 		handle, tail := splitWord(rest)
 		args := []string{}
@@ -912,6 +1017,13 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 				Body: "unknown directive: " + stmt.Args[0]}
 		}
 		body := op.Usage + "\n"
+		// THE FLAG LIST IS DERIVED, NOT WRITTEN. A verb with twenty-five flags cannot
+		// spell them out in a usage line, and a hand-kept list drifts the moment one is
+		// added — the check that each flag is documented somewhere then fails late and
+		// vaguely. Printing the declared set makes the page true by construction.
+		if flags := flagList(op); flags != "" {
+			body += "\n" + flags + "\n"
+		}
 		if op.Detail != "" {
 			// The detail is a page, so it follows the one-line template instead of
 			// replacing it: the template is what a caller scans, the page is what it
@@ -937,50 +1049,57 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 // the recovery path must not depend on remembering anything.
 func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 	var b strings.Builder
-	b.WriteString("termcp terminal. Syntax:\n")
-	// Two examples, and only two: the batching line says something the directive
-	// table below CANNOT express (that `;` runs several statements in one call and
-	// gives one slot each), and the pty line shows what a reply's handle is for.
-	// The other examples that used to sit here (`run … one command, one call`,
-	// `read … read, list, inspect`, the pty/pipe usage) repeated the table verbatim
-	// — 308 bytes of the same information written twice, which is what a caller
-	// pays for on every recovery call.
-	b.WriteString("  pty internal                                  open an interactive shell -> Handle\n")
-	b.WriteString("  ps; read a1f3:1; info a1f3:1                 several statements, one call: one slot each\n")
-	b.WriteString("Handles are <session>:<index> (always with :N); copy one from ps or ext list into the next command.\n")
-	b.WriteString("Every reply is TERM/1 <code>: 2xx ok, 4xx bad request, 5xx the command failed.\n")
 
-	// The CORE directive table, plus the pointer to the rest.
-	//
-	// This reply is read by a caller that has not decided what to do yet, so the
-	// lines it needs come first and the other eighteen are one `help` away. Both
-	// halves matter:
-	//
-	//   - Listing all 24 here cost the recovery path ~900 bytes of capability the
-	//     caller has no use for at that moment, on every wake-up.
-	//   - Listing ONLY the core ones and stopping there would make file/forward/
-	//     extension work invisible to anyone who never suspects there is more —
-	//     the failure the old "7 of 23 examples" had, one layer down.
-	//
-	// The pointer line is what keeps both true. It names `help` in the same wording
-	// `help` uses for itself, so a caller that follows it lands on the full table
-	// rather than on a detail page, and it says how many are waiting. Generated
-	// from the same ops array `help` prints, so the two cannot disagree.
-	b.WriteString("\ndirectives (core; `help` lists all " + strconv.Itoa(len(directive.Ops())) + "):\n")
+	b.WriteString("termcp — a shell-like DSL controlling hosts over SSH.\n")
+	b.WriteString("Local (\"internal\", if enabled) and remote targets are treated identically.\n\n")
+
+	b.WriteString("cmd = the DSL.  sh = a shell command.\n")
+	b.WriteString("cmd holds directives only. sh never appears in cmd — it enters as a value through\n")
+	b.WriteString("args ($1, $2) or vars ($NAME). cmd supports &&, ||, ;, and &.\n")
+	b.WriteString("  run a1f3:1 $1   args: [\"make && test\"]   one sh line, operators live\n")
+	b.WriteString("  run a1f3:1 make && notify done           two cmd directives\n\n")
+
+	// THE TREE IS THE GRAMMAR. Every statement is a verb plus the address of the
+	// node it works on, so learning the tree teaches the whole surface: a caller who
+	// knows `host -> session -> child` can read any usage line without being told
+	// which word is a verb and which is a noun.
+	b.WriteString("STRUCTURE — one tree, and every verb names the node it acts on:\n")
+	b.WriteString("  host     a saved connection target. `ls host` shows them.\n")
+	b.WriteString("  session  one SSH link. `connect <host>` makes one; `ls` lists live ones.\n")
+	b.WriteString("  channel  one shell on that link, <session>:<index> (e.g. a1f3:1).\n")
+	b.WriteString("           `open <session>` adds one; the mode follows ssh — --argv means\n")
+	b.WriteString("           a command with no terminal, no --argv means a terminal.\n")
+	b.WriteString("  file     <session> file <path>      — write/get/read/rm/create\n")
+	b.WriteString("  forward  <session> forward <id>     — open/close/ls\n")
+	b.WriteString("  peer     <session> mcp|cdp|jrpc <url> — open/read/call/close, through that\n")
+	b.WriteString("           session's network, so localhost means the host's localhost.\n")
+	b.WriteString("  Copy addresses from `ls`; never spell one.\n\n")
+
+	b.WriteString("TWO CENTRES:\n")
+	b.WriteString("  ls ext  CAPABILITY HUB — start here. Lists resident, capability-trimmed\n")
+	b.WriteString("          extensions: mcp servers, skills (read-only SFTP), prompts.\n")
+	b.WriteString("          Notes inside an extension are its operating manual.\n")
+	b.WriteString("  ls      SSH STATE & LIFECYCLE — every link, channel, forward and peer.\n")
+	b.WriteString("          Pass learn_mode:true and it expands the verbs that take the\n")
+	b.WriteString("          addresses it just printed.\n\n")
+
+	b.WriteString("ACTIONS:\n")
 	for _, op := range directive.Ops() {
 		if !op.Core {
 			continue
 		}
 		b.WriteString("  " + op.Usage + "\n")
 	}
-	b.WriteString("\n")
+	b.WriteString("  notify <text>           reach human before sudo/password/choice, then wait\n\n")
 
-	// What is running right now, in the same columns `ps` prints: the recovery path
-	// is "ask, then copy a handle", not "ask, then translate".
-	ps := s.directivePS(ctx, directive.Statement{Op: "ps", Path: "ps"}, win)
-	b.WriteString("running now:\n")
+	b.WriteString("`help` lists all " + strconv.Itoa(len(directive.Ops())) + " verbs; `help <verb>` is a page.\n")
+	b.WriteString("Pass learn_mode:true on any call and its usage arrives with the reply.\n")
+
+	// Live state: ps listing
+	ps := s.directivePS(ctx, directive.Statement{Op: "ls", Path: "ls"}, win)
+	b.WriteString("\nrunning now (from ls):\n")
 	if strings.TrimSpace(ps.Body) == "" {
-		b.WriteString("  (nothing)\n")
+		b.WriteString("  (nothing — `connect internal` opens a local shell; `ls host` shows targets)\n")
 	} else {
 		for _, line := range strings.Split(strings.TrimRight(ps.Body, "\n"), "\n") {
 			b.WriteString("  " + line + "\n")
@@ -990,9 +1109,6 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 	return termReply{win: win, slots: []envelope.Slot{{Code: code, Body: body}}}
 }
 
-// --- small helpers ---
-
-// dash renders an empty field as a placeholder, so columns stay aligned.
 func dash(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "-"
@@ -1391,31 +1507,86 @@ func setFlagJSONList(args map[string]any, stmt directive.Statement, flag, arg st
 	return nil
 }
 
-// resolveAction settles WHERE a profile/ext action came from, and returns the
-// positional words that remain once it is consumed.
+// resolveAction reads the action the dispatcher put on the statement, and returns
+// whatever positional words are left over.
 //
-// THE AMBIGUITY WAS REAL AND THIS REMOVES IT. These two forms both exist:
-//
-//	profile create demo …        the action is the first positional word
-//	profile demo --action edit   the action is a flag
-//
-// so "which positional word is the name" depended on where the action came from —
-// the old code hardcoded the first shape and answered "name is required" to every
-// call spelled the second way. Tracking that with a boolean at the name site (as a
-// first attempt did) only moved the conditional around.
-//
-// Consuming the action word instead makes the two shapes converge: whatever is left
-// at Args[0] IS the name, in both of them. Same idea as Op.Target in the directive
-// parser — a word that names grammar is removed from the argument list, so the words
-// that remain all mean data.
+// IT USED TO GUESS. Two spellings existed — `profile create demo` (action as the
+// first positional word) and `profile demo --action edit` (action as a flag) — so
+// "which word is the name" depended on which spelling was used, and the old code
+// hardcoded one of them. The dispatcher now derives the action from the resource
+// tree rather than from the caller's word order, so there is nothing left to guess:
+// the action is always a flag, always set, and the words that remain are data.
 func resolveAction(stmt directive.Statement, fallback string) (action string, rest []string) {
 	if v, ok := stmt.Flag("action"); ok && v != "" {
-		// Spelled as a flag: every positional word is data.
 		return v, stmt.Args
 	}
-	if len(stmt.Args) > 0 {
-		// Spelled positionally: consume it, so Args[0] is the name again.
-		return stmt.Args[0], stmt.Args[1:]
-	}
 	return fallback, stmt.Args
+}
+
+// flagList renders a verb's declared flags, marking the ones that take no value.
+//
+// It reads the SAME table the parser reads, so a flag that appears here is a flag
+// that parses: there is no second list to keep in step.
+func flagList(op directive.Op) string {
+	if len(op.Flags) == 0 {
+		return ""
+	}
+	valueless := make(map[string]bool, len(op.Valueless))
+	for _, v := range op.Valueless {
+		valueless[v] = true
+	}
+	w := make([]string, 0, len(op.Flags))
+	for _, f := range op.Flags {
+		if valueless[f] {
+			w = append(w, "--"+f)
+			continue
+		}
+		w = append(w, "--"+f+" <value>")
+	}
+	sort.Strings(w)
+	return "Flags: " + strings.Join(w, "  ")
+}
+
+// peerLines renders the open peers of the sessions in a listing.
+//
+// The address is `<session> <kind>` and is printed verbatim: it is what `call`,
+// `read`, `get` and `close` accept, so a caller can copy a line out of `ls` into the
+// next command without translating anything. The session half is the id in column 1
+// of the session's own line, which is why the id is repeated rather than implied.
+func peerLines(sessions []api.Session) string {
+	if len(sessions) == 0 {
+		return ""
+	}
+	want := make(map[string]bool, len(sessions))
+	for _, sess := range sessions {
+		want[sess.ID] = true
+	}
+	jrpcChannelsMu.Lock()
+	handles := make([]*jrpcHandle, 0, len(jrpcChannels))
+	for _, h := range jrpcChannels {
+		if want[h.sessionID] {
+			handles = append(handles, h)
+		}
+	}
+	jrpcChannelsMu.Unlock()
+	if len(handles) == 0 {
+		return ""
+	}
+	sort.Slice(handles, func(i, j int) bool {
+		if handles[i].sessionID != handles[j].sessionID {
+			return handles[i].sessionID < handles[j].sessionID
+		}
+		return handles[i].kind < handles[j].kind
+	})
+	var b strings.Builder
+	b.WriteString("\npeers (address, transport, endpoint, attached):\n")
+	for _, h := range handles {
+		b.WriteString("  " + peerAddress(h.sessionID, h.kind, h.index) + "\t" +
+			h.ch.Transport().String() + "\t" + h.ch.URL())
+		if h.cdp != nil {
+			b.WriteString(fmt.Sprintf("\t%d page(s) attached", len(h.cdp.snapshot())))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }

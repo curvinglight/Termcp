@@ -91,7 +91,7 @@ func TestRemoteForwardOnInternalEndpoint(t *testing.T) {
 	}
 }
 
-// TestRemoteForwardWildcardAllowed pins the boundary where it actually is.
+// TestRemoteForwardBindIsGranted pins the boundary where it actually is.
 //
 // An earlier version of this file asserted the opposite -- that the server refuses
 // a non-loopback bind because the address arrives in the client's request. That
@@ -105,7 +105,7 @@ func TestRemoteForwardOnInternalEndpoint(t *testing.T) {
 // forward.open capability queues the request and the review prompt names the
 // address (see summarizeOperation). This test locks in that the transport does not
 // second-guess a bind the reviewed layer already allowed.
-func TestRemoteForwardWildcardAllowed(t *testing.T) {
+func TestRemoteForwardBindIsGranted(t *testing.T) {
 	s := New()
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
@@ -115,12 +115,15 @@ func TestRemoteForwardWildcardAllowed(t *testing.T) {
 	cli := dialServer(t, s, mintCfg(t, s))
 	defer cli.Close()
 
-	// 0.0.0.0 is the address a published tunnel uses; it must reach a real
-	// listener rather than a denial. The port is released immediately: what is
-	// under test is that the request is GRANTED, not what is served on it.
-	ln, err := cli.Listen("tcp", "0.0.0.0:0")
+	// THE BIND IS LOOPBACK, AND THE ASSERTION IS ABOUT THE DECISION, NOT THE ADDRESS.
+	// A wildcard bind asks the OS to open a port to the network, which on Windows is
+	// a firewall dialog shown to whoever is at the machine. What this test pins is
+	// that the server GRANTS what the reviewed layer allowed instead of second-
+	// guessing it; the address mapping itself is covered by forward/bind_test.go,
+	// where it costs no socket.
+	ln, err := cli.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("the server refused a wildcard reverse-forward bind: %v", err)
+		t.Fatalf("the server refused a reverse-forward bind: %v", err)
 	}
 	defer ln.Close()
 	if got := ln.Addr().String(); got == "" || strings.HasSuffix(got, ":0") {

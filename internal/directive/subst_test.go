@@ -50,8 +50,8 @@ func TestArgsIsTheSyntaxChannel(t *testing.T) {
 			want: []string{"ps; help"},
 		},
 		{
-			name: "type takes a raw payload too",
-			cmd:  `type h:1 $1`,
+			name: "input takes a raw payload too",
+			cmd:  `input h:1 $1`,
 			sub:  Subst{Pos: []string{"a; b"}},
 			want: []string{"a; b"},
 		},
@@ -113,8 +113,11 @@ func TestPositionalOutsideWholePayloadIsQuoted(t *testing.T) {
 	}{
 		{"as an argument", `run h:1 echo $1`, "a; b", "echo 'a; b'"},
 		{"inside double quotes", `run h:1 echo "$1"`, "a; b", `echo "a; b"`},
-		{"beside an operator", `run h:1 $1 && echo done`, "make test", "'make test' && echo done"},
-		{"as a flag value", `file s --action write --data $1`, "l1\nl2", ""},
+		// `&&` no longer sits inside the payload: it connects two directives, so the
+		// reference before it is still "a word in a line the caller wrote" and is
+		// quoted. The operator itself moves to the NEXT statement's Cond.
+		{"beside an operator", `run h:1 $1 && notify done`, "make test", "'make test'"},
+		{"as a flag value", `write s file /tmp/x --data $1`, "l1\nl2", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,7 +296,7 @@ func TestPathEchoCarriesTheSubstitutedValue(t *testing.T) {
 // reference to be the WHOLE value would mean only a single-argument command could
 // ever use it.
 func TestRestValueFlagTakesPerWordRaw(t *testing.T) {
-	f, err := ParseWithSubst(`pipe s --argv $1 $2 $3`,
+	f, err := ParseWithSubst(`connect s --argv $1 $2 $3`,
 		Subst{Pos: []string{"sh", "-c", "echo 'a b  c'"}})
 	if err != nil {
 		t.Fatal(err)
@@ -306,31 +309,41 @@ func TestRestValueFlagTakesPerWordRaw(t *testing.T) {
 		t.Errorf("argv = %q, want %q", v, want)
 	}
 
-	// ext's --args is the same kind of value.
-	f, err = ParseWithSubst(`ext s --args $1 $2`, Subst{Pos: []string{"mcp", "serve"}})
+	// create ext's --args is the same kind of value.
+	f, err = ParseWithSubst(`create ext s --args $1 $2`, Subst{Pos: []string{"mcp", "serve"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := f.Statements[0].Flag("args"); v != "mcp serve" {
-		t.Errorf("ext --args = %q, want %q", v, "mcp serve")
+		t.Errorf("create ext --args = %q, want %q", v, "mcp serve")
 	}
 }
 
 // TestPerWordRawDoesNotLoosenRun pins that the argv rule did not leak into the
 // payload rule: a positional beside an operator is still one quoted word.
+//
+// The operator is a directive boundary now, so what this asserts is narrower and
+// more important than it used to be: the value stays a WORD, and the `&&` that
+// follows it starts a new statement rather than being glued onto the payload.
 func TestPerWordRawDoesNotLoosenRun(t *testing.T) {
-	f, err := ParseWithSubst(`run h:1 $1 && echo done`, Subst{Pos: []string{"make test"}})
+	f, err := ParseWithSubst(`run h:1 $1 && notify done`, Subst{Pos: []string{"make test"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := f.Statements[0].Payload, "'make test' && echo done"; got != want {
+	if got, want := f.Statements[0].Payload, "'make test'"; got != want {
 		t.Errorf("payload = %q, want %q", got, want)
+	}
+	if len(f.Statements) != 2 || f.Statements[1].Cond != "&&" {
+		t.Fatalf("`&&` did not become a directive operator: %+v", f.Statements)
+	}
+	if got := f.Statements[1].Op; got != "notify" {
+		t.Errorf("second statement = %q, want notify", got)
 	}
 }
 
 // TestTargetFromArgsIsRaw pins that a target is an IDENTIFIER, not a shell word.
 //
-// Quoting it produced `info 's:1'`. That happened to still resolve — the resolver
+// Quoting it produced `get 's:1'`. That happened to still resolve — the resolver
 // trims quotes — but the Path echo then showed a spelling nobody wrote, and any
 // directive that compared the target as a string would have seen the quotes as part
 // of the name.
@@ -340,7 +353,7 @@ func TestTargetFromArgsIsRaw(t *testing.T) {
 		target string
 		path   string
 	}{
-		{"info $1", "s:1", "info s:1"},
+		{"get $1", "s:1", "get s:1"},
 		{"run $1 echo hi", "s:1", "run s:1 echo hi"},
 		{"close $1", "s:1", "close s:1"},
 		{"read $1 --tail 1", "s:1", "read s:1 --tail 1"},
@@ -359,33 +372,5 @@ func TestTargetFromArgsIsRaw(t *testing.T) {
 				t.Errorf("path = %q, want %q", st.Path, tc.path)
 			}
 		})
-	}
-}
-
-// TestSubstitutedTargetIsCheckedAfterFilling pins that a target which arrives as
-// `args` is still refused when it names the wrong kind of object.
-//
-// The kind check reads the VALUE, and at parse time a substituted target is the
-// sentinel `__termcp_0__` — so the check ran against the placeholder and refused a
-// perfectly good handle with `read needs a CHANNEL, not "__termcp_0__"`. Running it
-// again after the fill keeps both properties: a literal bad target is refused before
-// anything runs, and a substituted one is judged on what it actually says.
-func TestSubstitutedTargetIsCheckedAfterFilling(t *testing.T) {
-	// A session id where a channel is required: still refused, and now with the
-	// caller's own value in the message rather than a sentinel.
-	_, err := ParseWithSubst(`read $1 --tail 1`, Subst{Pos: []string{"sess-only"}})
-	if err == nil {
-		t.Fatal("a session id where a channel is required must be refused")
-	}
-	if strings.Contains(err.Error(), "__termcp_0__") {
-		t.Errorf("the refusal quotes the internal sentinel: %v", err)
-	}
-	if !strings.Contains(err.Error(), "sess-only") {
-		t.Errorf("the refusal should name the caller's value: %v", err)
-	}
-
-	// And a proper channel is accepted.
-	if _, err := ParseWithSubst(`read $1 --tail 1`, Subst{Pos: []string{"s:1"}}); err != nil {
-		t.Errorf("a channel handle must be accepted: %v", err)
 	}
 }

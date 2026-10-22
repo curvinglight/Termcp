@@ -6,53 +6,50 @@ import (
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 )
 
-// SendResourceNotification broadcasts an MCP resource update event.
-func (s *Server) SendResourceNotification(ctx context.Context, shellID string) error {
-	uri := ResourceURLScheme + "shells/" + shellID
-	s.mcpServer.SendNotificationToAllClients("notifications/resources/updated", map[string]any{
-		"uri": uri,
-	})
-	return nil
-}
+// Sampling passthrough: a sub-MCP borrows the host Agent's model.
+//
+// This is what `sampling/createMessage` is FOR. The protocol's own description is
+// "the server asks the client's LLM to generate" — the direction is upstream, from
+// the thing being driven to the thing driving it. A sub-MCP started on a shell
+// channel (`pipe mac --argv npx -y …`, or an extension declared with kind=mcp) has
+// no model of its own, so it asks its host; Termcp sits between them and forwards.
+//
+//	sub-MCP  ──sampling/createMessage──▶  Termcp  ──▶  Agent (MCP client)
+//	sub-MCP  ◀────────result────────────  Termcp  ◀──  Agent
+//
+// Termcp adds no policy and inspects no prompt: it has no opinion about what the
+// sub-MCP wants generated, and inventing one would make it a participant in a
+// conversation it was only asked to carry.
+//
+// WHAT THIS REPLACED, and why the difference matters. This function used to be
+// SendSamplingNotification, which issued a createMessage on a timer to WAKE the
+// agent up. That is the wrong direction twice over: the protocol asks the client
+// to GENERATE, not to be nudged, and a wake-up that costs a model call is a strange
+// price for a notification. A notification channel is the right tool for a
+// notification, and Termcp does not have one the client is obliged to listen on —
+// which is why `watch` is gone rather than repaired.
 
-// SendSamplingNotification issues an MCP sampling/createMessage request to the
-// client session that registered the rule, waking the AI. target is the opaque
-// handle captured by shell_notify(action=register); notifications are dispatched
-// from timer/exit goroutines, so the client session cannot be recovered from the
-// dispatch context and must be carried on the rule.
-func (s *Server) SendSamplingNotification(ctx context.Context, shellID string, target any, event notify.Event, status string) error {
+// ForwardSampling proxies one createMessage request to the Agent that is driving
+// this server, and returns its answer unchanged.
+//
+// target carries the client session because dispatch happens off a goroutine that
+// has no request context to recover it from: the caller that received the sub-MCP's
+// frame captures the session and hands it here.
+//
+// An error means one of exactly two things, and both are the caller's to report:
+// the captured target is not a sampling-capable session (the Agent never declared
+// the capability), or the Agent answered with an error.
+func (s *Server) ForwardSampling(ctx context.Context, target any, req mcpgo.CreateMessageRequest) (*mcpgo.CreateMessageResult, error) {
 	sess, ok := target.(mcpserver.SessionWithSampling)
 	if !ok || sess == nil {
-		return fmt.Errorf("no sampling-capable client session for shell %q", shellID)
+		return nil, fmt.Errorf("this Agent did not declare sampling capability, so a sub-MCP's createMessage cannot be forwarded")
 	}
-	prompt := fmt.Sprintf("[termcp reminder] Shell '%s' emitted event '%s' (status: %s). Inspect output via shell_output if needed.", shellID, event, status)
-	req := mcpgo.CreateMessageRequest{
-		CreateMessageParams: mcpgo.CreateMessageParams{
-			SystemPrompt: "termcp notification daemon",
-			Messages: []mcpgo.SamplingMessage{
-				{
-					Role:    mcpgo.RoleUser,
-					Content: mcpgo.NewTextContent(prompt),
-				},
-			},
-			MaxTokens: 50,
-		},
-	}
-	_, err := sess.RequestSampling(ctx, req)
-	return err
+	return sess.RequestSampling(ctx, req)
 }
 
 // SetUINotifier wires the Web UI notification delivery end (notify_user tool).
 func (s *Server) SetUINotifier(fn func(level, title, message, sessionID string, durationSec int) int) {
 	s.uiNotify = fn
-}
-
-// NotifyManager exposes the shell notification rule manager so other subsystems
-// (e.g. the Web UI) can list and unregister rules. May return nil in tests that
-// construct a bare Server.
-func (s *Server) NotifyManager() *notify.Manager {
-	return s.notifyMgr
 }

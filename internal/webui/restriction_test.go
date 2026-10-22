@@ -12,7 +12,6 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/extensions"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/message"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 	"github.com/open-mcp-ai/termcp/internal/sshserver"
@@ -29,7 +28,6 @@ type restProbe struct {
 	shellID    string
 	dataDir    string
 	forwardMgr *forward.ForwardManager
-	notifyMgr  *notify.Manager
 }
 
 // withExtensions swaps in a handler that carries the extension reconciler, so the
@@ -79,11 +77,10 @@ func newRestProbe(t *testing.T, allow, paths []string) restProbe {
 		t.Fatal(err)
 	}
 	fwdMgr := forward.NewForwardManager()
-	notifyMgr := notify.NewManager(nil)
-	h := &Handler{Sessions: sessMgr, MsgMgr: msgMgr, ForwardMgr: fwdMgr, NotifyMgr: notifyMgr}
+	h := &Handler{Sessions: sessMgr, MsgMgr: msgMgr, ForwardMgr: fwdMgr}
 	mux := http.NewServeMux()
 	h.Register(mux)
-	return restProbe{mux: mux, sess: sess, sessMgr: sessMgr, shellID: sess.PrimaryShellID(), dataDir: dir, forwardMgr: fwdMgr, notifyMgr: notifyMgr}
+	return restProbe{mux: mux, sess: sess, sessMgr: sessMgr, shellID: sess.PrimaryShellID(), dataDir: dir, forwardMgr: fwdMgr}
 }
 
 func (p restProbe) post(t *testing.T, path, body string) int {
@@ -176,13 +173,6 @@ func TestRESTRespectsSessionRestriction(t *testing.T) {
 	}
 	if code := p.del(t, "/api/forwards/"+fw.ForwardID); code != http.StatusForbidden {
 		t.Errorf("REST forward close on a session that granted no forwards = %d, want 403", code)
-	}
-	rule, err := p.notifyMgr.Register(sid, p.shellID, notify.ChannelResource, notify.EventOutput, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if code := p.del(t, "/api/notifications/"+rule.ID); code != http.StatusForbidden {
-		t.Errorf("REST rule delete on a session that granted no shell_notify = %d, want 403", code)
 	}
 }
 

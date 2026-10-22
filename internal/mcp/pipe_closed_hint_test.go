@@ -14,7 +14,7 @@ import (
 // one-shot program, and its output is still there to read.
 func TestWriteToFinishedPipeSaysWhatHappened(t *testing.T) {
 	s := newTestServer(t)
-	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "pipe internal --argv sh -c 'echo hi'"}))
+	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "connect internal --argv sh -c 'echo hi'"}))
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	// THE RACE THIS PINS IS "process gone, status not yet reaped" — so the process
@@ -24,12 +24,12 @@ func TestWriteToFinishedPipeSaysWhatHappened(t *testing.T) {
 	// first and the program happily read it.
 	waitForShellToExit(t, s, shellIDFromHandle(t, s, h))
 
-	for _, cmd := range []string{"run " + h + " extra", "type " + h + " extra"} {
+	for _, cmd := range []string{"run " + h + " extra", "input " + h + " extra"} {
 		got := termText(t, s, map[string]any{"cmd": cmd, "timeout": 2})
 		if !strings.HasPrefix(got, "TERM/1 5") {
 			t.Fatalf("%s: expected a failure, got:\n%s", cmd, got)
 		}
-		for _, want := range []string{"PIPE channel", "read " + h, "pty"} {
+		for _, want := range []string{"PIPE channel", "read " + h, "open <session>"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s: the refusal does not mention %q:\n%s", cmd, want, got)
 			}
@@ -70,7 +70,7 @@ func TestDeadPtyIsNotToldToReadItsExitCode(t *testing.T) {
 // nothing is promised about the transcript.
 func TestFinishedPipeRefusesTheWriteNotTheRead(t *testing.T) {
 	s := newTestServer(t)
-	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "pipe internal --argv sh -c 'echo kept'"}))
+	h := handleFrom(t, termText(t, s, map[string]any{"cmd": "connect internal --argv sh -c 'echo kept'"}))
 
 	// The process must have exited, or this tests the wrong state: the refusal is
 	// about a FINISHED pipe, and a live one accepts the write (200 OK on CI).

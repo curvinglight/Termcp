@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -211,6 +212,76 @@ func (s *Server) handleListSSHConfigs(ctx context.Context, request mcpgo.CallToo
 		arr = append(arr, n)
 	}
 	return jsonResult(map[string]any{"ssh_configs": arr}), nil
+}
+
+// handleGetSSHConfig returns one entry, with the secrets REDACTED.
+//
+// `ls host` only ever answered names, and nothing in the surface could answer "what is
+// actually in this entry?" — so a caller editing a host had to guess at its current
+// values, which is how a partial edit turns into a silent overwrite.
+//
+// Reading is not a mutation, so it is not behind --mcp-manage-ssh-configs: the list is
+// already visible without it, and hiding the fields while showing the name protects
+// nothing.
+//
+// THE SECRETS DO NOT COME BACK. A password or key passphrase returned here would end up
+// in a transcript, a log line, or an assistant's context, and the caller's actual
+// question — "is a password set?" — is answered by a boolean.
+func (s *Server) handleGetSSHConfig(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	if s.sshConfigs == nil {
+		return toolError(CodeOperationFailed, "%s", "ssh config store not configured"), nil
+	}
+	name := strings.TrimSpace(getString(request.GetArguments(), "name", ""))
+	if name == "" {
+		return toolError(CodeInvalidArgument, "%s", "name is required"), nil
+	}
+	ent, err := s.sshConfigs.Load(name)
+	if err != nil {
+		if errors.Is(err, sshconfig.ErrNotFound) {
+			return toolError(CodeSessionNotFound, "%s", "ssh config \""+name+"\" not found"), nil
+		}
+		return toolError(CodeOperationFailed, "%s", err.Error()), nil
+	}
+
+	dial := func(d sshconfig.DialSpec) map[string]any {
+		m := map[string]any{
+			"host":           d.Host,
+			"port":           d.Port,
+			"user":           d.User,
+			"has_password":   d.Password != "",
+			"private_key":    d.PrivateKey,
+			"known_hosts":    d.KnownHosts,
+			"proxy":          d.Proxy,
+			"dial_timeout":   d.DialTimeoutSeconds,
+			"has_passphrase": d.KeyPassphrase != "",
+		}
+		if d.TrustUnknownHost != nil {
+			m["trust_unknown_host"] = *d.TrustUnknownHost
+		}
+		return m
+	}
+
+	out := map[string]any{
+		"name":        name,
+		"kind":        ent.Kind,
+		"description": ent.Description,
+	}
+	for k, v := range dial(ent.DialSpec) {
+		out[k] = v
+	}
+	if ent.DefaultShell != "" {
+		out["default_shell"] = ent.DefaultShell
+	}
+	if ent.DefaultMode != "" {
+		out["default_mode"] = ent.DefaultMode
+	}
+	if ent.DefaultApproval {
+		out["default_approval"] = true
+	}
+	if ent.Jump != nil {
+		out["jump"] = dial(ent.Jump.DialSpec)
+	}
+	return jsonResult(out), nil
 }
 
 func (s *Server) handleDetectShell(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {

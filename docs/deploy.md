@@ -31,7 +31,7 @@ docker run -d --name termcp -p 127.0.0.1:18765:18765 -v termcp-data:/home/termcp
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-ARG GO_IMAGE=golang:1.25-alpine
+ARG GO_IMAGE=golang:1.27-alpine
 FROM ${GO_IMAGE} AS termcp-build
 
 # 模块代理；海外环境可换 https://proxy.golang.org,direct

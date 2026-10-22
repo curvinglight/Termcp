@@ -106,8 +106,11 @@ func TestStoreForwardNormalization(t *testing.T) {
 	if got.Forwards[0].RemoteHost != "localhost" {
 		t.Errorf("local forward default RemoteHost = %q, want localhost", got.Forwards[0].RemoteHost)
 	}
-	if got.Forwards[1].LocalHost != "0.0.0.0" {
-		t.Errorf("remote forward default LocalHost = %q, want 0.0.0.0", got.Forwards[1].LocalHost)
+	// LOOPBACK IS THE DEFAULT FOR -R TOO: the port is opened on the TARGET, and
+	// publishing an authenticated tunnel to that machine's network is a decision the
+	// caller makes with --local-host, not something a missing field decides.
+	if got.Forwards[1].LocalHost != "127.0.0.1" {
+		t.Errorf("remote forward default LocalHost = %q, want 127.0.0.1", got.Forwards[1].LocalHost)
 	}
 }
 

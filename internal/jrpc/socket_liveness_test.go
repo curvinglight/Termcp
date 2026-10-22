@@ -18,7 +18,7 @@ import (
 func TestIdleRecvDoesNotPoisonTheSocket(t *testing.T) {
 	srv, _ := wsPeer(t)
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ch, err := Open(t.Context(), url)
+	ch, err := Open(t.Context(), url, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestIdleRecvDoesNotPoisonTheSocket(t *testing.T) {
 func TestAFrameSkippedByNextIsStillReachable(t *testing.T) {
 	srv, _ := wsPeer(t)
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ch, err := Open(t.Context(), url)
+	ch, err := Open(t.Context(), url, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestAFrameSkippedByNextIsStillReachable(t *testing.T) {
 func TestCloseReleasesAWaitingReader(t *testing.T) {
 	srv, _ := wsPeer(t)
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ch, err := Open(t.Context(), url)
+	ch, err := Open(t.Context(), url, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestRepeatedCloseIsCheap(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		srv, _ := wsPeer(t)
 		url := "ws" + strings.TrimPrefix(srv.URL, "http")
-		ch, err := Open(t.Context(), url)
+		ch, err := Open(t.Context(), url, localDial)
 		if err != nil {
 			t.Fatal(err)
 		}

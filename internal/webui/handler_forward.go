@@ -8,7 +8,6 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/forward"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -23,57 +22,15 @@ func (h *Handler) handleListForwards(w http.ResponseWriter, r *http.Request) {
 // handleListNotifications returns active shell notification rules, optionally
 // filtered by shell_id and/or session_id query parameters.
 func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request) {
-	if h.NotifyMgr == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"notifications": []any{}})
-		return
-	}
-	q := r.URL.Query()
-	rules := h.NotifyMgr.List(q.Get("shell_id"))
-	if sessionID := q.Get("session_id"); sessionID != "" {
-		filtered := make([]notify.RuleView, 0, len(rules))
-		for _, rule := range rules {
-			if rule.SessionID == sessionID {
-				filtered = append(filtered, rule)
-			}
-		}
-		rules = filtered
-	}
-	if rules == nil {
-		rules = []notify.RuleView{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"notifications": rules})
+	// Shell notification rules (the retired `watch` directive) are gone. The
+	// endpoint stays so an older Web UI build reading it gets an empty list
+	// instead of a 404.
+	writeJSON(w, http.StatusOK, map[string]any{"notifications": []any{}})
 }
 
-// handleDeleteNotification unregisters one notification rule by id.
+// handleDeleteNotification answers 404: there are no rules left to delete.
 func (h *Handler) handleDeleteNotification(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "notification rule id required"})
-		return
-	}
-	if h.NotifyMgr == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "notification manager not available"})
-		return
-	}
-	// The route names the rule, not the session, so the owner is looked up the way
-	// the forward-close route does it: a rule is a capability of the session that
-	// registered it, and an extension granted no shell_notify must not have one
-	// removed — or, more to the point, a caller with a restricted handle must not
-	// be able to reach a rule belonging to a session it may not touch.
-	for _, rule := range h.NotifyMgr.List("") {
-		if rule.ID != id {
-			continue
-		}
-		if restRefuseTool(w, h.sessionOwning(rule.SessionID, rule.ShellID), capability.ShellNotify) {
-			return
-		}
-		break
-	}
-	if !h.NotifyMgr.Unregister(id) {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "notification rule not found"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule_id": id})
+	writeJSON(w, http.StatusNotFound, map[string]any{"error": "notification rule not found"})
 }
 
 func (h *Handler) handleDeleteForward(w http.ResponseWriter, r *http.Request) {

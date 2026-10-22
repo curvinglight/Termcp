@@ -197,7 +197,7 @@ var termArgDecls = []termArgDecl{
 		// text instead; `content_only` was the same intent spelled backwards, which
 		// made "no duplicate" the thing you had to ask for. One positive flag with the
 		// quiet default says what it does: pass true and you get the JSON twin.
-		Desc:    "Also send structuredContent. Default: false (both carry the same bytes).",
+		Desc:    "Also send structuredContent: header keys mirrored, values untouched. Default: false.",
 		DocNote: "Also send the JSON projection as `structuredContent`. **Off by default**: the two projections carry the same bytes, so the JSON copy is a duplicate a human sees on every call. Pass `true` for a client that reads structured content",
 		Def:     false,
 		DefText: "false",

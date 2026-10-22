@@ -54,6 +54,8 @@ func (s *Server) handlerFor(tool string) toolHandler {
 		return s.handleListSubshells
 	case "shell_close":
 		return s.handleCloseShell
+	case "shell_archive":
+		return s.handleArchiveShell
 	case "shell_input":
 		return s.handleSendInput
 	case "shell_key":
@@ -68,8 +70,6 @@ func (s *Server) handlerFor(tool string) toolHandler {
 		return s.handleRegisterReader
 	case "shell_reader_unregister":
 		return s.handleUnregisterReader
-	case "shell_notify":
-		return s.handleShellNotifyOps
 	case "message":
 		return s.handleMessageOps
 	case "notify_user":
@@ -80,6 +80,8 @@ func (s *Server) handlerFor(tool string) toolHandler {
 		return s.handleFileRead
 	case "file_write":
 		return s.handleFileWrite
+	case "file_replace":
+		return s.handleFileReplace
 	case "file_stat":
 		return s.handleFileStat
 	case "file_delete":

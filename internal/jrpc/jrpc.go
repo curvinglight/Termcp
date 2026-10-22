@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -119,42 +120,117 @@ type Channel struct {
 
 	// ev holds frames that arrived while a call waited for its own answer. A channel
 	// rather than a slice: it is the only structure that lets one goroutine append
-	// while another pops without a lock.
-	ev chan string
+	// while another pops without a lock. Each entry carries the sequence number the
+	// wire reader gave it, so a caller that takes one can say WHICH frame it got and
+	// resume from there.
+	ev chan Framed
+
+	// log is the receive history: every frame, numbered, retained in a bounded
+	// ring. The ev channel above is a QUEUE (popped once, then gone); this is the
+	// other question — "what arrived after n" — which has to stay answerable twice
+	// because CDP never replays an event.
+	log *frameLog
 
 	// shut reports that Close ran.
 	shut atomic.Bool
 
 	// in carries every frame the socket delivers; readErr carries why it stopped.
-	in      chan string
+	in      chan Framed
 	readErr chan error
 	done    chan struct{} // closed by onceClose, releasing blocked readers and senders
 	closeIn sync.Once     // closes c.in exactly once, whichever path ends the loop
 }
 
-// Open connects rawURL, choosing the transport by scheme: http(s) posts one
-// frame per request, ws(s) opens a socket.
-func Open(ctx context.Context, rawURL string) (*Channel, error) {
+// deadlineFreeConn wraps a net.Conn whose SetDeadline is unimplemented.
+//
+// THE SSH PACKAGE DOES NOT IMPLEMENT DEADLINES, and the net.Conn it returns answers
+// both SetDeadline methods with "ssh: tcpChan: deadline not supported". Callers that
+// set a deadline and check the error — gorilla's websocket dialer does exactly this —
+// therefore fail against an SSH tunnel with a message about the transport rather than
+// about anything the caller did.
+//
+// The deadline is what is being dropped, not the timeout. Cancellation still works,
+// because every dial through this seam already carries a context: the SSH channel is
+// torn down when that context ends, which is the guarantee the deadline was reaching
+// for. Pretending to accept a deadline we cannot honour is the lesser evil here —
+// the alternative is refusing every websocket tunnel outright, and a websocket over
+// SSH is the main reason the seam exists.
+// NoDeadlineConn wraps conn so deadline calls succeed silently.
+func NoDeadlineConn(c net.Conn) net.Conn { return deadlineFreeConn{c} }
+
+type deadlineFreeConn struct{ net.Conn }
+
+func (c deadlineFreeConn) SetDeadline(time.Time) error      { return nil }
+func (c deadlineFreeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c deadlineFreeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// DialFunc opens a TCP connection to addr. It is the single seam through which a
+// gateway reaches its peer.
+//
+// THE URL IS NOT RESOLVED HERE. Every address a gateway dials — "localhost:9222",
+// "mcp.internal:8080" — is a name on the network OF THE HOST THE SESSION POINTS AT,
+// not on the network of the termcp process. A devtools port bound to 127.0.0.1 on a
+// remote box is not reachable from here and never was; the whole point of running an
+// SSH session to that box is that its loopback is the loopback the URL means.
+//
+// Dialling from the process instead would be a second, silent rule: the same URL
+// would work or fail depending on where termcp happens to run, and a caller could
+// only discover which by trying. So the session is not a convenience parameter — it
+// is what the URL is relative to.
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// Transport timeouts. They are named rather than left as zero values because a
+// zero IdleConnTimeout keeps dead sockets forever and a zero TLSHandshakeTimeout
+// lets a half-open peer hold a call until the caller's context expires.
+const (
+	maxIdleConn           = 30 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+	expectContinueTimeout = 1 * time.Second
+)
+
+// Open connects rawURL over dial, choosing the transport by scheme: http(s) posts
+// one frame per request, ws(s) opens a socket.
+//
+// dial is required. A nil dial is refused rather than defaulted to the process's own
+// network, because that default is exactly the silent second rule DialFunc describes:
+// it would make `mcp open url` mean "connect from termcp" for some callers and
+// "connect from the host" for others, with nothing in the request to tell them apart.
+func Open(ctx context.Context, rawURL string, dial DialFunc) (*Channel, error) {
+	if dial == nil {
+		return nil, fmt.Errorf("no dialer: a gateway reaches its peer through the session's SSH connection, so a session is required")
+	}
 	u, err := neturl.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("not a URL: %s", rawURL)
 	}
 	c := &Channel{
 		url:      rawURL,
-		client:   &http.Client{},
 		callGate: make(chan struct{}, 1),
-		ev:       make(chan string, maxEvents),
+		ev:       make(chan Framed, maxEvents),
 		done:     make(chan struct{}),
+		log:      newFrameLog(maxEvents*8, 8<<20),
 	}
+	// The default transport dials from this process. Replacing its DialContext is the
+	// whole of the change: every request the channel makes, and every socket it opens,
+	// then travels inside the SSH connection.
+	c.client = &http.Client{Transport: &http.Transport{
+		DialContext:           dial,
+		MaxIdleConns:          4,
+		IdleConnTimeout:       maxIdleConn,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ExpectContinueTimeout: expectContinueTimeout,
+	}}
 	switch u.Scheme {
 	case "ws", "wss":
 		c.transport = WS
-		conn, _, err := websocket.DefaultDialer.DialContext(ctx, rawURL, nil)
+		d := *websocket.DefaultDialer
+		d.NetDialContext = dial
+		conn, _, err := d.DialContext(ctx, rawURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("dial %s: %w", rawURL, err)
 		}
 		c.conn = conn
-		c.in = make(chan string, maxEvents)
+		c.in = make(chan Framed, maxEvents)
 		c.readErr = make(chan error, 1)
 		go c.readLoop()
 	case "http", "https":
@@ -196,11 +272,16 @@ func (c *Channel) readLoop() {
 		if payload == "" {
 			continue
 		}
+		// RECORDED AT THE WIRE, before anything consumes it. Every later reader
+		// (the destructive read, a call waiting for its answer) sees a subset or
+		// a copy of this; numbering here is what makes `since n` mean "what the
+		// peer sent after n" rather than "what was still queued".
+		rec := c.record(payload)
 		// The send can block when nobody is reading and the buffer is full, and
 		// closing the socket does NOT release it — the read already succeeded. done is
 		// what Close closes, so this goroutine always ends.
 		select {
-		case c.in <- payload:
+		case c.in <- rec:
 		case <-c.done:
 			c.closeIn.Do(func() { close(c.in) })
 			return
@@ -213,20 +294,20 @@ func (c *Channel) readLoop() {
 // nil and true mean a frame arrived; "" and false mean the wait itself expired (or
 // the socket is gone) — which is an answer about THIS WINDOW, not about the socket.
 // Nothing here can damage the connection.
-func (c *Channel) awaitFrame(ctx context.Context) (string, bool) {
+func (c *Channel) awaitFrame(ctx context.Context) (Framed, bool) {
 	select {
 	case frame, ok := <-c.in:
 		if !ok {
-			return "", false
+			return Framed{}, false
 		}
 		return frame, true
 	case <-c.done:
 		// Close ran, so nothing more will arrive. Without this arm a waiting reader
 		// would only ever see its window expire, turning "stop now" into "stop in a few
 		// seconds".
-		return "", false
+		return Framed{}, false
 	case <-ctx.Done():
-		return "", false
+		return Framed{}, false
 	}
 }
 
@@ -238,8 +319,8 @@ func (c *Channel) awaitAnswer(ctx context.Context, want any) (string, error) {
 			if !ok {
 				return "", c.readFailure()
 			}
-			if carriesID(frame, want) {
-				return frame, nil
+			if carriesID(frame.Data, want) {
+				return frame.Data, nil
 			}
 			c.buffer(frame)
 		case <-c.done:
@@ -341,7 +422,8 @@ func (c *Channel) Send(ctx context.Context, frame map[string]any) error {
 	// A notification is owed no answer, but a peer that answers anyway must not have
 	// its frame dropped on the floor: Send is "do not wait", not "do not look".
 	if body := strings.TrimSpace(string(raw)); body != "" {
-		c.buffer(body)
+		rec := c.record(body)
+		c.buffer(rec)
 	}
 	return nil
 }
@@ -351,7 +433,10 @@ func (c *Channel) Send(ctx context.Context, frame map[string]any) error {
 // bytes are only buffered as a side effect of a Call or a Next, so a reader that
 // wants new events has to wait for them.
 func (c *Channel) Recv() (string, bool) {
-	return c.pop()
+	if f, ok := c.pop(); ok {
+		return f.Data, true
+	}
+	return "", false
 }
 
 // Take returns the next frame of ANY kind: a buffered one first, then whatever the
@@ -365,14 +450,24 @@ func (c *Channel) Recv() (string, bool) {
 // Buffered frames come first because they arrived first; the socket is only touched
 // when nothing is already in hand.
 func (c *Channel) Take(ctx context.Context) (string, bool) {
+	if f, ok := c.TakeFramed(ctx); ok {
+		return f.Data, true
+	}
+	return "", false
+}
+
+// TakeFramed is Take returning the whole Framed record: data, sequence number, and
+// whether it is an event. That sequence number is what lets the caller report the
+// cursor it just consumed.
+func (c *Channel) TakeFramed(ctx context.Context) (Framed, bool) {
 	if c.shut.Load() {
-		return "", false
+		return Framed{}, false
 	}
 	if frame, ok := c.pop(); ok {
 		return frame, true
 	}
 	if c.transport != WS {
-		return "", false
+		return Framed{}, false
 	}
 	return c.awaitFrame(ctx)
 }
@@ -393,7 +488,7 @@ func (c *Channel) Next(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	if frame, ok := c.pop(); ok {
-		return frame, true
+		return frame.Data, true
 	}
 	if c.transport != WS {
 		return "", false
@@ -406,22 +501,22 @@ func (c *Channel) Next(ctx context.Context) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		if hasID(frame) {
+		if hasID(frame.Data) {
 			// An answer to a call nobody is waiting for is still data: keep it.
 			c.buffer(frame)
 			continue
 		}
-		return frame, true
+		return frame.Data, true
 	}
 }
 
-// pop takes the oldest buffered frame. The caller holds mu.
-func (c *Channel) pop() (string, bool) {
+// pop takes the oldest buffered frame.
+func (c *Channel) pop() (Framed, bool) {
 	select {
 	case frame := <-c.ev:
 		return frame, true
 	default:
-		return "", false
+		return Framed{}, false
 	}
 }
 
@@ -475,7 +570,9 @@ func (c *Channel) httpCall(ctx context.Context, frame map[string]any, id any) (s
 		if err != nil {
 			return "", err
 		}
-		return strings.TrimSpace(string(raw)), nil
+		body := strings.TrimSpace(string(raw))
+		c.record(body)
+		return body, nil
 	}
 	br := bufio.NewReader(io.LimitReader(resp.Body, maxFrameBytes))
 	for {
@@ -486,10 +583,11 @@ func (c *Channel) httpCall(ctx context.Context, frame map[string]any, id any) (s
 			}
 			return "", err
 		}
+		rec := c.record(payload)
 		if carriesID(payload, id) {
 			return payload, nil
 		}
-		c.buffer(payload)
+		c.buffer(rec)
 	}
 }
 
@@ -524,8 +622,8 @@ func (c *Channel) httpPost(ctx context.Context, frame map[string]any) (*http.Res
 // A non-blocking send: a full backlog means the reader is not draining, and the
 // documented policy for that is "lose the oldest" — blocking here would stall the
 // only socket reader instead.
-func (c *Channel) buffer(frame string) {
-	if frame == "" {
+func (c *Channel) buffer(frame Framed) {
+	if frame.Data == "" {
 		return
 	}
 	for {

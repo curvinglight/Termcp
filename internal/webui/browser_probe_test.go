@@ -93,7 +93,11 @@ func renderedProbeDOM(t *testing.T, chrome, path string) string {
 	defer cancel()
 	profile := browserProfileDir(t)
 	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
-		"--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0",
+		"--no-first-run", "--no-default-browser-check",
+		// THE DEBUG PORT MUST NOT LISTEN ON EVERY INTERFACE. Without this flag
+		// Chrome binds 0.0.0.0, and Windows asks the human to approve a firewall
+		// rule for a port this test uses for a few seconds and then closes.
+		"--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
 		"--user-data-dir="+profile, "about:blank")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

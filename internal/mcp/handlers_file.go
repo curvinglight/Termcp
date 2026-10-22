@@ -80,6 +80,46 @@ func (s *Server) handleFileWrite(ctx context.Context, request mcpgo.CallToolRequ
 	return jsonResult(map[string]any{"ok": true, "bytes_written": n}), nil
 }
 
+// handleFileReplace performs an exact, unique, atomic replacement inside a file.
+//
+// WHY THIS EXISTS AT ALL: without it, changing one line of a config means reading the
+// whole file and writing it back, which is both token-expensive and dangerous — the
+// round trip loses anything that changed in between, and a partial write leaves a
+// truncated file. The uniqueness rule is what makes it safe: the caller must describe
+// the target precisely enough to match once.
+func (s *Server) handleFileReplace(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	args := request.GetArguments()
+	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
+	remotePath := getString(args, "remote_path", "")
+	oldText := getString(args, "old_text", "")
+	newText := getString(args, "new_text", "")
+
+	if sessionID == "" {
+		return toolError(CodeInvalidArgument, "%s", "session_id required"), nil
+	}
+	if remotePath == "" {
+		return toolError(CodeInvalidArgument, "%s", "remote_path required"), nil
+	}
+	if oldText == "" {
+		return toolError(CodeInvalidArgument, "%s", "old_text required; it must identify exactly one location"), nil
+	}
+
+	sftpCli, bad := s.sftpClient(sessionID)
+	if bad != nil {
+		return bad, nil
+	}
+	defer sftpCli.Close()
+
+	n, err := sftpCli.ReplaceInFile(remotePath, oldText, newText)
+	if err != nil {
+		return fileErr(err), nil
+	}
+	// bytes_written is the whole point of reporting here: the caller can confirm the
+	// edit landed without a second stat, and a replace that reports nothing leaves
+	// "did it work?" to be answered by re-reading the file.
+	return jsonResult(map[string]any{"ok": true, "bytes_written": n, "remote_path": remotePath}), nil
+}
+
 func (s *Server) handleFileStat(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))

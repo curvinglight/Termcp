@@ -228,7 +228,7 @@ func TestProfileHelpAdvertisesTheFormatTheStoreAccepts(t *testing.T) {
 	// surface. It now lives in `help profile`, reached on request: it is a page of
 	// text, not a rule the model needs before every call.
 	s := newTestServer(t)
-	help := termText(t, s, map[string]any{"cmd": "help profile"})
+	help := termText(t, s, map[string]any{"cmd": "help create"})
 	for _, want := range []string{
 		"[[connections]]",
 		`kind = "remote"`,
@@ -242,7 +242,7 @@ func TestProfileHelpAdvertisesTheFormatTheStoreAccepts(t *testing.T) {
 		"name-2",
 	} {
 		if !strings.Contains(help, want) {
-			t.Errorf("help profile misses %q: %s", want, help)
+			t.Errorf("help create misses %q: %s", want, help)
 		}
 	}
 

@@ -32,7 +32,7 @@ func TestAliasTableIsSafeUnderConcurrency(t *testing.T) {
 			defer wg.Done()
 			for n := 0; n < 200; n++ {
 				name := fmt.Sprintf("a%d", n%4)
-				a.set(name, "ps")
+				a.set(name, "ls")
 				_, _ = a.get(name)
 				_ = a.snapshot()
 				_, _ = a.Expand(directive.Statement{Op: name, Target: "h"})
@@ -59,7 +59,7 @@ func TestLearnModeUsageIsPerReply(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = s.Term(t.Context(), "ps; info nosuchhandle", map[string]any{"learn_mode": true}).Text()
+			results[i] = s.Term(t.Context(), "ls; info nosuchhandle", map[string]any{"learn_mode": true}).Text()
 		}(i)
 	}
 	wg.Wait()

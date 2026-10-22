@@ -27,7 +27,7 @@ func TestByteFoldEmptiesAnIncompleteWindow(t *testing.T) {
 		"total_bytes":  float64(500),
 		"has_more":     true,
 	}
-	slot := s.windowSlot(stmt, win, doc)
+	slot := s.windowSlot(stmt, win, doc, 0)
 	if slot.Body != "" {
 		t.Fatalf("fold kept %d bytes of an incomplete window", len(slot.Body))
 	}
@@ -51,7 +51,7 @@ func TestByteTruncateKeepsTheWindow(t *testing.T) {
 		"total_bytes":  float64(500),
 		"has_more":     true,
 	}
-	slot := s.windowSlot(stmt, win, doc)
+	slot := s.windowSlot(stmt, win, doc, 0)
 	if len(slot.Body) == 0 {
 		t.Fatal("truncate dropped a window it should have kept")
 	}
@@ -73,7 +73,7 @@ func TestFoldDoesNothingWhenTheWindowIsComplete(t *testing.T) {
 		"total_bytes":  float64(6),
 		"has_more":     false,
 	}
-	slot := s.windowSlot(stmt, win, doc)
+	slot := s.windowSlot(stmt, win, doc, 0)
 	if slot.Body == "" {
 		t.Fatal("a complete window was folded away")
 	}

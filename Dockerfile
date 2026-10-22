@@ -1,6 +1,6 @@
 # Registry ownership marker — must match the server name in server.json:
 # io.github.open-mcp-ai/termcp
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG VERSION=dev
 ENV GOPROXY=${GOPROXY}

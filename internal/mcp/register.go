@@ -7,7 +7,6 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/open-mcp-ai/termcp/internal/forward"
 	"github.com/open-mcp-ai/termcp/internal/message"
-	"github.com/open-mcp-ai/termcp/internal/notify"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
@@ -30,6 +29,12 @@ func New(sessMgr *session.Manager, msgMgr *message.Manager, sshConfigs *sshconfi
 	// composition point shared by the MCP and Web UI surfaces.
 	if sessMgr != nil && forwardMgr != nil {
 		sessMgr.AddOnDeadHook(forwardMgr.CloseBySession)
+	}
+	// A peer (mcp/cdp/jrpc) tunnels through the session's SSH channel, so a DEAD
+	// session leaves it a socket to nowhere that still holds its frame ring. Same
+	// cascade as forwards, for the same reason.
+	if sessMgr != nil {
+		sessMgr.AddOnDeadHook(closePeersBySession)
 	}
 	s := &Server{
 		sessMgr:     sessMgr,
@@ -102,10 +107,6 @@ func New(sessMgr *session.Manager, msgMgr *message.Manager, sshConfigs *sshconfi
 		withPanicRecovery(),
 	)
 
-	s.notifyMgr = notify.NewManager(s)
-	if sessMgr != nil {
-		sessMgr.SetNotifyHooks(s.notifyMgr.OnOutput, s.notifyMgr.OnExit, s.notifyMgr.ClearShell)
-	}
 	registerTermTools(mcpServer, s)
 
 	s.mcpServer = mcpServer

@@ -149,27 +149,29 @@ func Resolve(sessMgr *session.Manager, msgMgr *message.Manager, id string) (*Sou
 		if sess == nil {
 			return nil, errf(ErrSessionNotFound, "session %q not found", id)
 		}
-		// The live map answers first whenever it holds any shell. Keying this on the
-		// primary shell instead would drop a session whose first channel was closed
-		// into the snapshot branch, resolving :N from a different set than the one
-		// the Web UI is showing.
-		if sess.HasLiveShells() {
-			cs, err := shellFromIndex(sess, shellIdx)
-			if err != nil {
-				return nil, errf(ErrShellNotFound, "%s", err.Error())
-			}
-			if cs == nil {
-				return nil, errf(ErrShellNotFound, "Session '%s' has no shell", sess.ID)
-			}
+		// THIS CHANNEL DECIDES THE BRANCH, NOT THE SESSION.
+		//
+		// The test used to be `sess.HasLiveShells()` — "does this session still hold
+		// any live shell" — which is a question about the SESSION being asked about
+		// ONE channel. A closed channel is REMOVED from the live map and moved to the
+		// retained snapshot, so on a session whose other channels are still running
+		// that test said "live", the index lookup searched only the live map, and the
+		// archived channel came back as "index out of range" — its transcript intact
+		// on disk and unreachable through the handle the caller had just used.
+		//
+		// Asking about the channel fixes it and keeps the property the old comment
+		// was protecting: the live map answers whenever it holds THIS index, so a
+		// session whose first channel was closed still resolves :N from the same set
+		// the Web UI shows.
+		if cs, ok := sess.ShellByIndex(shellIdx); ok {
 			info := cs.Info()
 			return &Source{Live: cs, SessID: sess.ID, ShellID: cs.ID, MsgMgr: msgMgr, Status: info.Status, Created: info.CreatedAt}, nil
 		}
-		// DEAD / restored session without live shells: resolve by the channel index
-		// retained in the snapshot, which is the same number the live session gave
-		// that channel before it went away.
+		// Not live: a closed-but-kept channel, or a DEAD/restored session. Both are
+		// addressed by the channel index retained in the snapshot, which is the same
+		// number the channel carried while it ran.
 		shells := sess.SnapshotShells()
-		if _, ok := sess.SnapshotShellByIndex(shellIdx); ok {
-			sh, _ := sess.SnapshotShellByIndex(shellIdx)
+		if sh, ok := sess.SnapshotShellByIndex(shellIdx); ok {
 			return &Source{SessID: sess.ID, ShellID: sh.ID, MsgMgr: msgMgr, Status: sess.Info().Status}, nil
 		}
 		return nil, errf(ErrShellNotFound, "%s", session.ShellIndexOutOfRangeError(sess.ID, shellIdx, len(shells)).Error())

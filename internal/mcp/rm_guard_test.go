@@ -13,7 +13,7 @@ import (
 // flight.
 func TestRmRunningSessionNeedsForce(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "pty internal --name live"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --name live"})
 	h := handleFrom(t, text)
 	sid := strings.Split(h, ":")[0]
 
@@ -29,7 +29,7 @@ func TestRmRunningSessionNeedsForce(t *testing.T) {
 	}
 
 	// 2. The session survived the refusal.
-	got = termText(t, s, map[string]any{"cmd": "info " + sid})
+	got = termText(t, s, map[string]any{"cmd": "get " + sid})
 	if !strings.HasPrefix(got, "TERM/1 200") {
 		t.Fatalf("the session should still exist after refusal:\n%s", got)
 	}
@@ -41,7 +41,7 @@ func TestRmRunningSessionNeedsForce(t *testing.T) {
 	}
 
 	// 4. Gone.
-	got = termText(t, s, map[string]any{"cmd": "info " + sid})
+	got = termText(t, s, map[string]any{"cmd": "get " + sid})
 	if !strings.HasPrefix(got, "TERM/1 404") {
 		t.Fatalf("the session should be gone after rm --force:\n%s", got)
 	}
@@ -51,12 +51,12 @@ func TestRmRunningSessionNeedsForce(t *testing.T) {
 // to lose, so ceremony is not added where no danger exists.
 func TestRmStoppedSessionDoesNotNeedForce(t *testing.T) {
 	s := newTestServer(t)
-	text := termText(t, s, map[string]any{"cmd": "pty internal --name dead"})
+	text := termText(t, s, map[string]any{"cmd": "connect internal --name dead"})
 	h := handleFrom(t, text)
 	sid := strings.Split(h, ":")[0]
 
 	// Stop it first.
-	termText(t, s, map[string]any{"cmd": "close " + sid + " --force"})
+	termText(t, s, map[string]any{"cmd": "close " + sid})
 
 	// rm without --force: succeeds because it is already stopped.
 	got := termText(t, s, map[string]any{"cmd": "rm " + sid})

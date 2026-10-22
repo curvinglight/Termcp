@@ -3,6 +3,7 @@ package jrpc
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,7 +53,7 @@ func wsPeer(t *testing.T) (*httptest.Server, *int) {
 func TestSocketCallsSurviveInterleavedEvents(t *testing.T) {
 	srv, _ := wsPeer(t)
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ch, err := Open(t.Context(), url)
+	ch, err := Open(t.Context(), url, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func TestSocketCallsSurviveInterleavedEvents(t *testing.T) {
 // id gets one, and that the matching is done on that id.
 func TestSocketIdsAreAllocatedAndEchoed(t *testing.T) {
 	srv, _ := wsPeer(t)
-	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +120,7 @@ func TestHTTPCallMatchesTheEventStreamAnswer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ch, err := Open(t.Context(), srv.URL)
+	ch, err := Open(t.Context(), srv.URL, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +146,7 @@ func TestHTTPReportsAStreamThatEndsWithoutTheAnswer(t *testing.T) {
 		_, _ = w.Write([]byte("data: {\"method\":\"only-an-event\"}\n\n"))
 	}))
 	defer srv.Close()
-	ch, err := Open(t.Context(), srv.URL)
+	ch, err := Open(t.Context(), srv.URL, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +159,7 @@ func TestHTTPReportsAStreamThatEndsWithoutTheAnswer(t *testing.T) {
 // TestOpenRefusesAnUnknownScheme keeps the scheme honest: a caller that writes a
 // bare host gets a sentence naming what works, not a dial failure.
 func TestOpenRefusesAnUnknownScheme(t *testing.T) {
-	if _, err := Open(t.Context(), "ftp://example.com"); err == nil ||
+	if _, err := Open(t.Context(), "ftp://example.com", localDial); err == nil ||
 		!strings.Contains(err.Error(), "http(s)") {
 		t.Fatalf("an unknown scheme was not explained: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestOpenRefusesAnUnknownScheme(t *testing.T) {
 // TestClosedChannelRefusesCalls pins that close is final rather than a hint.
 func TestClosedChannelRefusesCalls(t *testing.T) {
 	srv, _ := wsPeer(t)
-	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"))
+	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +192,7 @@ func TestCallDeadlineIsNotUnbounded(t *testing.T) {
 		<-r.Context().Done() // never answer
 	}))
 	defer srv.Close()
-	ch, err := Open(t.Context(), srv.URL)
+	ch, err := Open(t.Context(), srv.URL, localDial)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,4 +202,11 @@ func TestCallDeadlineIsNotUnbounded(t *testing.T) {
 	if _, err := ch.Call(ctx, map[string]any{"method": "x"}); err == nil {
 		t.Fatal("a peer that never answers returned success")
 	}
+}
+
+// localDial is the process's own network, which is what these tests exercise: the
+// SSH path is covered where it is built (internal/mcp), and this package is about the
+// channel's framing and locking rather than where the bytes came from.
+func localDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
 }

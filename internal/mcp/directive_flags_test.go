@@ -23,16 +23,75 @@ import (
 // copied by setFlagString/setFlagNumber. Requiring its name to appear anywhere in
 // the package's non-test source is the cheap test that catches all three.
 func TestNoDirectiveFlagIsDead(t *testing.T) {
-	src := readPackageSource(t)
+	src := stripCommentsAndStrings(t, readPackageSource(t))
 	for _, op := range directive.Ops() {
 		for _, f := range op.Flags {
-			if !strings.Contains(src, `"`+f+`"`) {
-				t.Errorf("%s: flag --%s is accepted by the parser but never read anywhere in this package: "+
+			// A FLAG IS ALIVE ONLY IF SOMETHING READS IT, and the check has to be
+			// syntactic: the old version looked for the quoted name anywhere in the
+			// package, so `--directive` passed on the strength of the word appearing in
+			// a COMMENT, and `open --url` passed because `create ext` reads a flag of the
+			// same name. Both were accepted by the parser and read by nobody.
+			//
+			// The forms below are the only ways this package reads a flag; a prose
+			// mention or another verb's use of the same word no longer counts.
+			alive := []string{
+				`stmt.Flag("` + f + `")`,
+				`boolFlag(stmt, "` + f + `")`,
+				`atoiFlag(stmt, "` + f + `"`,
+				`setFlagString(args, stmt, "` + f + `"`,
+				`setFlagNumber(args, stmt, "` + f + `"`,
+				`setFlagList(args, stmt, "` + f + `"`,
+				`setFlagArgvList(args, stmt, "` + f + `"`,
+				`setFlagJSONObject(args, stmt, "` + f + `"`,
+				`setFlagJSONList(args, stmt, "` + f + `"`,
+				`[2]string{"` + f + `"`,
+			}
+			ok := false
+			for _, form := range alive {
+				if strings.Contains(src, form) {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				t.Errorf("%s: flag --%s is accepted by the parser but read by nobody: "+
 					"a caller can set it and the server ignores it. Either consume it or drop it from Flags.",
 					op.Name, f)
 			}
 		}
 	}
+}
+
+// stripCommentsAndStrings removes what cannot READ a flag: comments, and the string
+// literals themselves. It keeps the punctuation of the forms above intact by leaving
+// quoted text in place — the point is to drop the comment channel, not to parse Go.
+func stripCommentsAndStrings(t *testing.T, src string) string {
+	t.Helper()
+	var out strings.Builder
+	inBlock := false
+	for _, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if inBlock {
+			if idx := strings.Index(line, "*/"); idx >= 0 {
+				inBlock = false
+				line = line[idx+2:]
+			} else {
+				continue
+			}
+		}
+		if strings.HasPrefix(trimmed, "/*") {
+			if !strings.Contains(trimmed, "*/") {
+				inBlock = true
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		out.WriteString(line)
+		out.WriteString("\n")
+	}
+	return out.String()
 }
 
 // readPackageSource concatenates this package's non-test .go files.
@@ -57,22 +116,26 @@ func readPackageSource(t *testing.T) string {
 	return b.String()
 }
 
-// TestDocumentedProfileActionsExist pins the action list in help profile to the
+// TestDocumentedProfileActionsExist pins the action list in help create to the
 // list the handler accepts.
 //
 // This exists because the first draft of that page documented `export` and
 // `import` — plausible, since the page also describes the batch import format —
-// and both are refused ("profile needs --action list|create|edit|copy|delete").
+// and both are refused ("edit host needs --action list|create|edit|copy|delete").
 // The flag guard above cannot see it: --source IS read, it is the ACTION that was
 // invented. A caller following the page would have wasted a call on each.
 func TestDocumentedProfileActionsExist(t *testing.T) {
 	src := readPackageSource(t)
 	// The handler states its own vocabulary in the refusal message; reading it
 	// from there means the two cannot drift without this test failing.
-	const marker = "profile needs --action "
+	//
+	// The directive is `host` now (`profile` survives as a synonym). The marker moved
+	// with it because the refusal is what a caller sees: teaching `host` while the
+	// error says `profile` would make the two names look like different things.
+	const marker = "host needs --action "
 	i := strings.Index(src, marker)
 	if i < 0 {
-		t.Fatal("the profile handler no longer states its action list; update this test")
+		t.Fatal("the host handler no longer states its action list; update this test")
 	}
 	rest := src[i+len(marker):]
 	// The list ends at the comma before "got ", not at the closing quote.
@@ -82,21 +145,33 @@ func TestDocumentedProfileActionsExist(t *testing.T) {
 	}
 	accepted := strings.Split(rest[:end], "|")
 
-	op, ok := directive.Lookup("profile")
+	op, ok := directive.Lookup("create")
 	if !ok {
-		t.Fatal("no profile directive")
+		t.Fatal("no create directive")
 	}
-	// Every action the handler accepts must be documented, or a caller cannot
-	// discover it; every action the page names must be accepted, or it is a
-	// capability that does not exist.
+	// Every action the handler accepts must be reachable from SOME verb, or a caller
+	// cannot discover it. The check is against the whole table rather than one page:
+	// `delete` is reached through `rm host`, not through `create`, so demanding it in
+	// help create would force the docs to describe a verb that does not exist.
+	var allDetail strings.Builder
+	for _, o := range directive.Ops() {
+		allDetail.WriteString(o.Detail)
+		allDetail.WriteString(o.Usage)
+	}
 	for _, a := range accepted {
-		if !strings.Contains(op.Detail, a) {
-			t.Errorf("profile accepts --action %s but help profile never mentions it", a)
+		if a == "delete" {
+			if _, ok := directive.Lookup("rm"); !ok {
+				t.Errorf("the host handler accepts delete but no verb reaches it")
+			}
+			continue
+		}
+		if !strings.Contains(allDetail.String(), a) {
+			t.Errorf("the host handler accepts --action %s but no help page mentions it", a)
 		}
 	}
 	for _, word := range []string{"export", "import"} {
 		if strings.Contains(op.Detail, "\n  "+word+" ") {
-			t.Errorf("help profile lists %q as an action, but the handler accepts only %s", word, strings.Join(accepted, "|"))
+			t.Errorf("help create lists %q as an action, but the handler accepts only %s", word, strings.Join(accepted, "|"))
 		}
 	}
 }
