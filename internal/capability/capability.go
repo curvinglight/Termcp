@@ -116,7 +116,6 @@ var table = []Capability{
 	{ID: "shell.detect", Gate: GateOperator, Idempotent: true},
 	{ID: "shell.reader.register", Gate: GateOperator, Idempotent: true},
 	{ID: "shell.reader.unregister", Gate: GateOperator, Idempotent: true},
-	{ID: "shell.notify", Gate: GateOperator, Idempotent: true},
 	{ID: "session.message", Gate: GateOperator, Idempotent: true},
 
 	// --- Human-facing ---
@@ -262,7 +261,6 @@ const (
 	ShellDetect           = "shell.detect"
 	ShellReaderRegister   = "shell.reader.register"
 	ShellReaderUnregister = "shell.reader.unregister"
-	ShellNotify           = "shell.notify"
 
 	UserNotify = "user.notify"
 

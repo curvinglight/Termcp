@@ -41,7 +41,7 @@ func TestEveryHostFlagReachesTheStoredConfig(t *testing.T) {
 		{"description", "prod box", func(t *testing.T, e *sshconfig.Entry) { eq(t, "description", e.Description, "prod box") }},
 		{"default-shell", "/bin/bash", func(t *testing.T, e *sshconfig.Entry) { eq(t, "default_shell", e.DefaultShell, "/bin/bash") }},
 		{"default-mode", "pipe", func(t *testing.T, e *sshconfig.Entry) { eq(t, "default_mode", e.DefaultMode, "pipe") }},
-		{"dial-timeout-seconds", "7", func(t *testing.T, e *sshconfig.Entry) { eq(t, "dial_timeout_seconds", e.DialTimeoutSeconds, 7) }},
+		{"dial-timeout-seconds", "45", func(t *testing.T, e *sshconfig.Entry) { eq(t, "dial_timeout_seconds", e.DialTimeoutSeconds, 45) }},
 		// Each jump case repeats --jump-user because a bastion without a user is refused
 		// by validation, and the point here is the flag reaching the file.
 		{"jump-host", "bastion", func(t *testing.T, e *sshconfig.Entry) {

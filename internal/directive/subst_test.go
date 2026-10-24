@@ -1,6 +1,8 @@
 package directive
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -74,36 +76,119 @@ func TestArgsIsTheSyntaxChannel(t *testing.T) {
 	}
 }
 
-// TestNamedValueIsTheDataChannel pins the other side of the split: a `vars` value is
-// one shell WORD, so a newline or a semicolon in it is data rather than syntax.
+// TestAVariableIsAVariableWhicheverTableNamesIt pins the one rule both spellings
+// follow: what decides the insertion is the POSITION, not whether the value arrived
+// through `args` or `vars`.
 //
-// The two channels have opposite quoting because they carry opposite things. A
-// payload is a command line; a flag value is a value.
-func TestNamedValueIsTheDataChannel(t *testing.T) {
-	f, err := ParseWithSubst(`run h:1 $CMD`, Subst{Named: map[string]string{"CMD": "pwd; whoami"}})
-	if err != nil {
-		t.Fatal(err)
+// They used to differ in exactly one case — a reference that IS the whole payload —
+// where `$1` was spliced verbatim and `$CMD` was quoted into a single word. Identical
+// text produced a different command line depending on which table named the value, and
+// nothing said so. A caller moving a value from one table to the other (a natural edit)
+// silently changed what ran.
+func TestAVariableIsAVariableWhicheverTableNamesIt(t *testing.T) {
+	// One value, two spellings, two legal positions. Every pair must agree: the POSITION
+	// decides the insertion, never which table named the value.
+	//
+	// They used to differ in one case — a reference that IS the whole payload — where
+	// `$1` was spliced and `$CMD` was quoted into a single word. Moving a value from one
+	// table to the other is a natural edit, and it silently changed what ran.
+	const value = "pwd; whoami"
+	positions := []struct {
+		name string
+		cmd  string
+		why  string
+	}{
+		{
+			name: "whole payload",
+			cmd:  "run h:1 %s",
+			why:  "the value IS the command line, so its semicolons are syntax",
+		},
+		{
+			name: "flag value",
+			cmd:  "write h file /tmp/x --data %s",
+			why:  "no shell reads a flag value, so it is the caller's bytes",
+		},
 	}
-	if got, want := f.Statements[0].Payload, "'pwd; whoami'"; got != want {
-		t.Errorf("payload = %q, want %q (one quoted word)", got, want)
+	flagOf := func(st Statement) string { v, _ := st.Flag("data"); return v }
+	for _, p := range positions {
+		posCmd := fmt.Sprintf(p.cmd, "$1")
+		namedCmd := fmt.Sprintf(p.cmd, "$V")
+		fp, err := ParseWithSubst(posCmd, Subst{Pos: []string{value}})
+		if err != nil {
+			t.Fatalf("%s: %v", posCmd, err)
+		}
+		fn, err := ParseWithSubst(namedCmd, Subst{Named: map[string]string{"V": value}})
+		if err != nil {
+			t.Fatalf("%s: %v", namedCmd, err)
+		}
+		sp, sn := fp.Statements[0], fn.Statements[0]
+		if sp.Payload != sn.Payload {
+			t.Errorf("%s: $1 gave payload %q but $V gave %q — the spelling decided the insertion", p.name, sp.Payload, sn.Payload)
+		}
+		if gp, gn := flagOf(sp), flagOf(sn); gp != gn {
+			t.Errorf("%s: $1 gave --data %q but $V gave %q", p.name, gp, gn)
+		}
+		if p.name == "whole payload" && sp.Payload != value {
+			t.Errorf("%s: %s\ngot  %q\nwant %q", p.name, p.why, sp.Payload, value)
+		}
+		if p.name == "flag value" {
+			if got := flagOf(sp); got != value {
+				t.Errorf("%s: %s\ngot  %q\nwant %q", p.name, p.why, got, value)
+			}
+		}
+	}
+}
+
+// TestAShellLineIsNeverWrittenAroundAHole is the rule that keeps the two languages
+// apart: `cmd` is DSL, a variable's value is the shell line, and a reference that sits
+// BESIDE shell text is refused in both spellings.
+//
+// The refusal is the point. As data the value becomes one quoted word and the caller's
+// statement quietly changes; as syntax the caller's DATA becomes commands. There is no
+// insertion that leaves the line meaning what it said, so termcp says so instead of
+// picking one.
+func TestAShellLineIsNeverWrittenAroundAHole(t *testing.T) {
+	for _, c := range []struct {
+		cmd   string
+		named bool
+	}{
+		{`run h:1 echo $1`, false},
+		{`run h:1 echo ${1}`, false},
+		{`run h:1 echo "$1"`, false},
+		{`run h:1 echo x$1`, false},
+		{`run h:1 echo hi > $1`, false},
+		{`run h:1 echo $V`, true},
+		{`run h:1 echo "$V"`, true},
+	} {
+		sub := Subst{Pos: []string{"a; b"}}
+		if c.named {
+			sub = Subst{Named: map[string]string{"V": "a; b"}}
+		}
+		_, err := ParseWithSubst(c.cmd, sub)
+		if err == nil {
+			t.Errorf("%s was accepted; a shell line is a value, not a template", c.cmd)
+			continue
+		}
+		if !strings.Contains(err.Error(), "cannot sit inside a shell line") {
+			t.Errorf("%s: refusal does not say what is wrong: %v", c.cmd, err)
+		}
 	}
 
-	// The same value through the positional channel is syntax, which is the whole
-	// difference between the two arguments.
-	f, err = ParseWithSubst(`run h:1 $1`, Subst{Pos: []string{"pwd; whoami"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := f.Statements[0].Payload, "pwd; whoami"; got != want {
-		t.Errorf("positional payload = %q, want %q (unquoted syntax)", got, want)
+	// The same reference is fine as the WHOLE payload, and a `&&` still ends the payload:
+	// `$1 && notify done` puts the reference alone in its own statement.
+	for _, cmd := range []string{`run h:1 $1`, `run h:1 $1 && notify done`} {
+		if _, err := ParseWithSubst(cmd, Subst{Pos: []string{"make test"}}); err != nil {
+			t.Errorf("%s: %v", cmd, err)
+		}
 	}
 }
 
 // TestPositionalOutsideWholePayloadIsQuoted pins where the raw channel stops.
 //
-// `run h:1 echo $1` and `run h:1 $1 && echo done` both put the reference beside other
-// words, so the caller is naming a WORD in a command line, not the command line. Raw
-// splicing there would let args=["make test"] turn one command into two.
+// `run h:1 $1 && notify done` used to be the interesting case (issues #141, #155): the
+// `&&` is a directive boundary, so `$1` IS the whole payload of its own statement, and
+// quoting it made the terminal run `'make test'` as one program name — the value
+// arrived, the reply said 200, and the command had silently stopped being a command line.
 func TestPositionalOutsideWholePayloadIsQuoted(t *testing.T) {
 	cases := []struct {
 		name string
@@ -111,13 +196,12 @@ func TestPositionalOutsideWholePayloadIsQuoted(t *testing.T) {
 		arg  string
 		want string
 	}{
-		{"as an argument", `run h:1 echo $1`, "a; b", "echo 'a; b'"},
-		{"inside double quotes", `run h:1 echo "$1"`, "a; b", `echo "a; b"`},
-		// `&&` no longer sits inside the payload: it connects two directives, so the
-		// reference before it is still "a word in a line the caller wrote" and is
-		// quoted. The operator itself moves to the NEXT statement's Cond.
-		{"beside an operator", `run h:1 $1 && notify done`, "make test", "'make test'"},
-		{"as a flag value", `write s file /tmp/x --data $1`, "l1\nl2", ""},
+		// A CONDITIONAL IS A DIRECTIVE BOUNDARY, so the reference before it is the
+		// whole payload of its statement — not a word beside an operator. This is the
+		// form a caller writes constantly (`make build && make test` as one arg), and
+		// quoting it is what turned a command line into a program name.
+		{"before a conditional", `run h:1 $1 && notify done`, "make test", "make test"},
+		{"as a flag value", "write s file /tmp/x --data $1", "l1\nl2", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -128,9 +212,9 @@ func TestPositionalOutsideWholePayloadIsQuoted(t *testing.T) {
 			st := f.Statements[0]
 			if tc.want == "" {
 				// A flag directive carries its value in Flags, not in Payload.
-				v, ok := st.Flag("data")
-				if !ok || v != tc.arg {
-					t.Errorf("--data = %q (present %v), want %q", v, ok, tc.arg)
+				got, _ := st.Flag("data")
+				if got != tc.arg {
+					t.Errorf("--data = %q, want %q", got, tc.arg)
 				}
 				return
 			}
@@ -156,22 +240,10 @@ func TestSubstitutionReachesEveryShellContext(t *testing.T) {
 		want string
 	}{
 		{
-			name: "redirect target",
-			cmd:  `run h:1 echo hi > $OUT`,
-			sub:  Subst{Named: map[string]string{"OUT": "/tmp/a b"}},
-			want: `echo hi > '/tmp/a b'`,
-		},
-		{
-			name: "append target",
-			cmd:  `run h:1 echo hi >> $OUT`,
-			sub:  Subst{Named: map[string]string{"OUT": "log"}},
-			want: `echo hi >> 'log'`,
-		},
-		{
-			name: "command substitution body",
-			cmd:  `run h:1 echo $(cat $P)`,
-			sub:  Subst{Named: map[string]string{"P": "/etc/hosts"}},
-			want: `echo $(cat '/etc/hosts')`,
+			name: "heredoc body",
+			cmd:  "run h:1 cat <<EOF\n$BODY\nEOF\n",
+			sub:  Subst{Named: map[string]string{"BODY": "echo C"}},
+			want: "cat <<EOF\necho C\nEOF",
 		},
 	}
 	for _, tc := range cases {
@@ -184,6 +256,24 @@ func TestSubstitutionReachesEveryShellContext(t *testing.T) {
 				t.Errorf("payload = %q, want %q", got, tc.want)
 			}
 		})
+	}
+
+	// THE CONTEXTS THAT ARE NOT HOLES. A redirect target and a command-substitution body
+	// are both inside the shell line the caller wrote, so a reference there mixes the two
+	// languages and is refused. That is not the old silent miss (where `$OUT` was simply
+	// left alone): the caller now hears about it. The redirect belongs in the value:
+	// cmd `run h:1 $1`, args ["echo hi > '/tmp/a b'"].
+	for _, c := range []struct {
+		cmd string
+		sub Subst
+	}{
+		{`run h:1 echo hi > $OUT`, Subst{Named: map[string]string{"OUT": "/tmp/a b"}}},
+		{`run h:1 echo hi >> $OUT`, Subst{Named: map[string]string{"OUT": "log"}}},
+		{`run h:1 echo $(cat $P)`, Subst{Named: map[string]string{"P": "/etc/hosts"}}},
+	} {
+		if _, err := ParseWithSubst(c.cmd, c.sub); err == nil {
+			t.Errorf("%s was accepted; a redirect target is part of the shell line", c.cmd)
+		}
 	}
 }
 
@@ -222,23 +312,43 @@ func TestPositionalIndexErrors(t *testing.T) {
 func TestBraceIndexIsUnambiguous(t *testing.T) {
 	ten := []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "ten"}
 
-	f, err := ParseWithSubst(`run h:1 ${10}`, Subst{Pos: ten})
+	// ONE REFERENCE PER DIRECTIVE, because a reference mixed with shell text is refused —
+	// and every value has to be referenced or the unused-value check fires. Ten statements,
+	// one reference each, is the shape that satisfies both rules and still proves the digit
+	// rule: `${10}` reaches the tenth value, which an unbraced `$10` cannot.
+	var cmd strings.Builder
+	cmd.WriteString("run h:1 $1")
+	for i := 2; i <= 9; i++ {
+		cmd.WriteString("; run h:1 $" + strconv.Itoa(i))
+	}
+	cmd.WriteString("; run h:1 ${10}")
+	f, err := ParseWithSubst(cmd.String(), Subst{Pos: ten})
 	if err != nil {
 		t.Fatalf("${10}: %v", err)
 	}
-	if got := f.Statements[0].Payload; got != "ten" {
-		t.Errorf("${10} payload = %q, want %q", got, "ten")
+	if len(f.Statements) != 10 {
+		t.Fatalf("parsed %d statements, want 10", len(f.Statements))
+	}
+	for i, st := range f.Statements {
+		if got := st.Payload; got != ten[i] {
+			t.Errorf("statement %d payload = %q, want %q", i+1, got, ten[i])
+		}
 	}
 
 	// $10 is $1 followed by a literal 0, and that is correct rather than convenient:
 	// it is what the shell does, so a caller reading their own cmd reads the same
 	// thing the server does.
-	f, err = ParseWithSubst(`run h:1 $10`, Subst{Pos: []string{"ONE"}})
+	// $10 is $1 followed by a literal 0, and that is correct rather than convenient: it
+	// is what the shell does, so a caller reading their own cmd reads the same thing the
+	// server does. The case is shown on a flag value because `run h:1 $10` glues a hole
+	// to a word — the mixed shape, refused on purpose.
+	f, err = ParseWithSubst(`write h file /tmp/x --data $10`, Subst{Pos: []string{"ONE"}})
 	if err != nil {
 		t.Fatalf("$10: %v", err)
 	}
-	if got, want := f.Statements[0].Payload, "'ONE'0"; got != want {
-		t.Errorf("$10 payload = %q, want %q", got, want)
+	got10, _ := f.Statements[0].Flag("data")
+	if want := "ONE0"; got10 != want {
+		t.Errorf("--data from $10 = %q, want %q", got10, want)
 	}
 }
 
@@ -261,7 +371,7 @@ func TestNoArgsLeavesShellPositionalAlone(t *testing.T) {
 // rescanned: a caller whose argument contains the marker text gets its own bytes
 // back, because the fill is single-pass.
 func TestSentinelCollisionIsTheCallersOwnBytes(t *testing.T) {
-	val := "echo __termcp_0__ here"
+	val := "echo __hole_deadbeefcafe__ here"
 	f, err := ParseWithSubst(`run h:1 $1`, Subst{Pos: []string{val}})
 	if err != nil {
 		t.Fatalf("ParseWithSubst: %v", err)
@@ -320,18 +430,24 @@ func TestRestValueFlagTakesPerWordRaw(t *testing.T) {
 }
 
 // TestPerWordRawDoesNotLoosenRun pins that the argv rule did not leak into the
-// payload rule: a positional beside an operator is still one quoted word.
+// payload rule, while keeping the one case where a positional IS the payload.
 //
-// The operator is a directive boundary now, so what this asserts is narrower and
-// more important than it used to be: the value stays a WORD, and the `&&` that
-// follows it starts a new statement rather than being glued onto the payload.
+// `$1` alone before a `&&` is the whole payload of the first directive, so it goes
+// in raw (issues #141, #155). What must NOT happen is the argv rule — where every
+// whole word may be a reference — leaking into a command line: `echo $1` still
+// quotes, because there the caller named a word.
 func TestPerWordRawDoesNotLoosenRun(t *testing.T) {
 	f, err := ParseWithSubst(`run h:1 $1 && notify done`, Subst{Pos: []string{"make test"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := f.Statements[0].Payload, "'make test'"; got != want {
+	if got, want := f.Statements[0].Payload, "make test"; got != want {
 		t.Errorf("payload = %q, want %q", got, want)
+	}
+	// The narrowing that matters: a reference BESIDE other words is not a hole at all,
+	// so the argv rule cannot reach it and nothing is spliced.
+	if _, err := ParseWithSubst(`run h:1 echo $1`, Subst{Pos: []string{"make test"}}); err == nil {
+		t.Error("a reference beside shell text was accepted; DSL and shell are not mixed")
 	}
 	if len(f.Statements) != 2 || f.Statements[1].Cond != "&&" {
 		t.Fatalf("`&&` did not become a directive operator: %+v", f.Statements)

@@ -33,6 +33,8 @@ function _initShellWindowUI(win, connLabel, sessionId) {
     });
   }
 
+  bindWindowTitleRename(win);
+
   bindShellWindowCloseButton(win, closeBtn);
 
   win._inputClosed = false;
@@ -49,28 +51,13 @@ function _initShellWindowUI(win, connLabel, sessionId) {
   setupShellWindowResize(win);
   setupMobileSessionSwitcher(win);
 
-  // --- Header tab switching (term / fw / file / notify panels) ---
-  // Inject the Notifications tab here so both the pending and connected
-  // window templates get it without duplicating the tab-bar markup.
+  // --- Header tab switching (term / fw / file panels) ---
   var tabBarEl = win.querySelector('.shell-tab-bar');
-  if (tabBarEl && !tabBarEl.querySelector('.shell-tab-btn[data-stab="notify"]')) {
-    var ntfTabBtn = document.createElement('button');
-    ntfTabBtn.type = 'button';
-    ntfTabBtn.className = 'shell-tab-btn';
-    ntfTabBtn.setAttribute('data-stab', 'notify');
-    ntfTabBtn.setAttribute('data-i18n-title', 'win.notify.tip');
-    ntfTabBtn.title = t('win.notify.tip');
-    ntfTabBtn.innerHTML = '<svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6a3.5 3.5 0 017 0c0 2.5 1 3.5 1 3.5H2.5s1-1 1-3.5z"/><path d="M5.8 11.5a1.2 1.2 0 002.4 0"/></svg>';
-    tabBarEl.appendChild(ntfTabBtn);
-  }
   /* The lock is declared here — before the pane tabs, so the markup still reads
-     gate-then-faces and no template has to know about the bell. The bell is
-     injected below and the lock is then moved after it, so the row reads
-     term · fw · file · notify · review: the two state controls sit together at
-     the end, away from the navigation. */
+     gate-then-faces and the two state controls sit together at the end, away from
+     the navigation. */
   var reviewBtn = tabBarEl && tabBarEl.querySelector('.shell-review-lock');
-  var notifyBtn = tabBarEl && tabBarEl.querySelector('.shell-tab-btn[data-stab="notify"]');
-  if (reviewBtn && notifyBtn) tabBarEl.appendChild(reviewBtn);
+  if (reviewBtn) tabBarEl.appendChild(reviewBtn);
   var tabBtns = win.querySelectorAll('.shell-tab-btn');
   var terminalWrap = win.querySelector('.shell-terminal-wrap');
   var tabPanels = win.querySelectorAll('.shell-tab-panel');
@@ -143,52 +130,6 @@ function _initShellWindowUI(win, connLabel, sessionId) {
     listEl.scrollTop = listEl.scrollHeight;
   }
   win._refreshFwList = function() { refreshShellFwList(win); };
-
-  // Refresh notifications list for this window (from global cache).
-  function refreshShellNtfList(w) {
-    w = w || win;
-    var listEl = w.querySelector('.shell-ntf-list');
-    if (!listEl) return;
-    var rules = (window._lastNotifications || []).filter(function(n) { return n.session_id === sessionId; });
-    if (!rules.length) {
-      // This tab lists wake-up RULES (the ones the notify tool registers), not the
-      // toasts that appear in the corner. Those are two different things, and an
-      // empty panel beside a toast that just popped reads as a bug — so the empty
-      // state says which thing is empty.
-      listEl.innerHTML = '<div style="padding:16px;color:var(--term-fg-muted);text-align:center;line-height:1.6">'
-        + escapeHtml(t('ntf.empty'))
-        + '<div style="margin-top:6px;font-size:0.72rem;color:var(--term-fg-faint)">'
-        + escapeHtml(t('ntf.emptyHint'))
-        + '</div></div>';
-      return;
-    }
-    listEl.innerHTML = rules.map(function(n){
-      var evColor = n.event === 'exit' ? 'var(--term-danger)' : (n.event === 'silence' ? 'var(--term-warning)' : 'var(--term-success)');
-      var extra = (n.event === 'silence' && n.silence_seconds) ? ' ' + n.silence_seconds + 's' : '';
-      var chLabel = n.channel === 'sampling' ? t('ntf.channel.sampling') : t('ntf.channel.resource');
-      var unregisterTip = t('ntf.unregister');
-      return '<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--term-border-2)" onmouseover="this.style.background=\'var(--term-hover)\'" onmouseout="this.style.background=\'\'">' +
-        '<span style="font-size:0.65rem;font-weight:600;text-transform:uppercase;padding:1px 5px;border-radius:3px;color:' + evColor + ';border:1px solid ' + evColor + ';flex-shrink:0;min-width:56px;text-align:center">' + escapeHtml(n.event) + escapeHtml(extra) + '</span>' +
-        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.78rem"><span style="color:var(--term-fg-muted)">' + escapeHtml(chLabel) + '</span> <span style="color:var(--term-border-4)">·</span> <span style="color:var(--term-fg-mid)">' + escapeHtml(n.shell_id) + '</span></span>' +
-        '<button class="shell-ntf-del-btn" data-ntfid="' + escapeHtml(n.rule_id) + '" title="' + unregisterTip + '" style="padding:2px 6px;font-size:0.68rem;border:1px solid transparent;border-radius:3px;background:transparent;color:var(--term-border-4);cursor:pointer;flex-shrink:0" onmouseover="this.style.borderColor=\'var(--term-danger)\';this.style.color=\'var(--term-danger)\'" onmouseout="this.style.borderColor=\'transparent\';this.style.color=\'var(--term-border-4)\'">✕</button>' +
-        '</div>';
-    }).join('');
-    listEl.querySelectorAll('.shell-ntf-del-btn').forEach(function(btn) {
-      btn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        deleteNotification(this.getAttribute('data-ntfid')).then(function(){ loadNotifications(); }).catch(function(){});
-      });
-    });
-  }
-  win._refreshNtfList = function() { refreshShellNtfList(win); };
-  var ntfRefreshBtn = win.querySelector('.shell-ntf-refresh-btn');
-  if (ntfRefreshBtn) {
-    ntfRefreshBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      spinIconOnce(this);
-      loadNotifications();
-    });
-  }
 
   // File operations for this shell window
   var filePathInput = win.querySelector('.shell-file-path');
@@ -358,15 +299,66 @@ function _initShellWindowUI(win, connLabel, sessionId) {
   });
   if (filePathInput) filePathInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') shellFileBrowse(); });
   if (win.querySelector('.shell-file-upload-btn') && fileUploadInput) {
-    win.querySelector('.shell-file-upload-btn').addEventListener('click', function() { fileUploadInput.click(); });
+    var uploadBtn = win.querySelector('.shell-file-upload-btn');
+    /* THE ORIGINAL ICON IS KEPT, NOT RECONSTRUCTED. While a transfer runs the button
+       shows the percentage instead, and the way back has to be byte-identical to what
+       the template shipped: rebuilding an inline SVG here would drift from
+       terminal-templates.js the first time that markup changed. */
+    var uploadIcon = uploadBtn.innerHTML;
+    var uploadTitle = uploadBtn.getAttribute('title');
+
+    /* A VISIBLE TRANSFER STATE, because the alternative is what #157 reported: a
+       button that looks identical whether the upload is running, finished or dead.
+       The button is also disabled for the duration — a second click used to fire a
+       second POST at the same path, and two writers to one SFTP file is not a
+       progress indicator problem. */
+    function uploadState(pct) {
+      if (pct === null) {
+        uploadBtn.innerHTML = uploadIcon;
+        uploadBtn.disabled = false;
+        uploadBtn.style.cursor = 'pointer';
+        uploadBtn.setAttribute('title', uploadTitle);
+        return;
+      }
+      uploadBtn.disabled = true;
+      uploadBtn.style.cursor = 'progress';
+      uploadBtn.textContent = pct + '%';
+      uploadBtn.setAttribute('title', t('file.upload.progress', { pct: pct }));
+    }
+
+    uploadBtn.addEventListener('click', function() { fileUploadInput.click(); });
     fileUploadInput.addEventListener('change', function() {
       var file = this.files && this.files[0];
       if (!file) return;
+      /* CLEARED BEFORE THE SEND: picking the same file twice in a row fires no
+         change event unless the input is emptied, which reads as "the button
+         stopped working". */
+      this.value = '';
       var path = (filePathInput.value.trim().replace(/\/+$/, '') || '') + '/' + file.name;
-      fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId) + '/files/upload?path=' + encodeURIComponent(path), {method:'POST',body:file})
-        .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-        .then(function() { shellFileBrowse(); })
-        .catch(function(e) { console.error(e); });
+      var url = apiPath('/api/sessions/') + encodeURIComponent(sessionId) + '/files/upload?path=' + encodeURIComponent(path);
+
+      /* XHR, NOT fetch, and only for the progress events: `xhr.upload.onprogress`
+         is the one API that reports how many bytes have actually left the browser.
+         fetch's request-body stream would need duplex half-close, which is not
+         available in every browser this UI runs in. */
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable && e.total > 0) uploadState(Math.round(e.loaded / e.total * 100));
+        else uploadState(0);
+      };
+      xhr.onload = function() {
+        uploadState(null);
+        if (xhr.status >= 200 && xhr.status < 300) { shellFileBrowse(); return; }
+        /* A FAILED UPLOAD IS THE CASE THAT MUST NOT BE SILENT: the file list simply
+           not refreshing is indistinguishable from a slow transfer, and the caller
+           has no way to learn that the bytes never landed. */
+        showCopyToast(t('toast.upload.failed', { msg: uploadErrorText(xhr) }));
+      };
+      xhr.onerror = function() { uploadState(null); showCopyToast(t('toast.upload.failed', { msg: t('file.upload.network') })); };
+      xhr.onabort = function() { uploadState(null); showCopyToast(t('toast.upload.failed', { msg: t('file.upload.aborted') })); };
+      uploadState(0);
+      xhr.send(file);
     });
   }
 

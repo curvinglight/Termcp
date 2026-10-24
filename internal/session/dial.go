@@ -53,16 +53,42 @@ func remoteDialAddr(r *RemoteSSH) string {
 	return net.JoinHostPort(strings.TrimSpace(r.Host), strconv.Itoa(port))
 }
 
-// remoteDialTimeout clamps DialTimeoutSeconds to [30, 120] seconds.
+// The dial timeout's numbers, and they live here because this is where they are used.
+//
+// 30 IS THE DEFAULT, NOT A FLOOR, and the two were confused once — a comment here read
+// "clamps DialTimeoutSeconds to [30, 120]", which described a floor the code did not have
+// (`toSec <= 0 { toSec = 30 }` is a default, and `5` was honoured as 5). Reading that
+// comment as the domain turned a fast-fail setting into a refusal, which is a worse failure
+// than the silent clamp it was meant to fix: a caller that wants a 5 second dial so a script
+// fails fast could no longer say so at all.
+//
+// RecommendedDialTimeoutSeconds is the same kind of number the window arguments publish: a
+// size to stay under, not a wall. A longer dial is honoured — a slow link or a bastion chain
+// is a real reason to want one, and this server cannot see the link the caller is on.
+const (
+	MinDialTimeoutSeconds         = 1
+	RecommendedDialTimeoutSeconds = 120
+	DefaultDialTimeoutSeconds     = 30
+)
+
+// ClampDialTimeoutSeconds resolves a dial timeout: an unset (or negative) value becomes the
+// default, and everything else is the caller's number.
+//
+// It is exported because the config validator asks it instead of restating the rule: a
+// second copy drifts, and the copy that drifts is the one not enforcing anything. There is
+// deliberately NO upper clamp — a value above RecommendedDialTimeoutSeconds is a request
+// this server has no basis to overrule, and capping it silently is the failure mode this
+// whole area was fixed for (a profile that said 600 was stored as 600, echoed as 600 and
+// dialled at 120).
+func ClampDialTimeoutSeconds(seconds int) int {
+	if seconds <= 0 {
+		return DefaultDialTimeoutSeconds
+	}
+	return seconds
+}
+
 func remoteDialTimeout(r *RemoteSSH) time.Duration {
-	toSec := r.DialTimeoutSeconds
-	if toSec <= 0 {
-		toSec = 30
-	}
-	if toSec > 120 {
-		toSec = 120
-	}
-	return time.Duration(toSec) * time.Second
+	return time.Duration(ClampDialTimeoutSeconds(r.DialTimeoutSeconds)) * time.Second
 }
 
 // remoteClientConfig builds the per-hop SSH client config.

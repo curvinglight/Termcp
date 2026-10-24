@@ -58,7 +58,6 @@ var mcpAllow = []string{
 	capability.ShellOutput,
 	capability.ShellReaderRegister,
 	capability.ShellReaderUnregister,
-	capability.ShellNotify,
 	capability.SessionInfo,
 }
 
@@ -149,7 +148,14 @@ func ApplyDefaults(e *Extension) {
 	if e.Paths == nil {
 		e.Paths = p.Paths
 	}
-	if e.Notes == "" {
+	// A PRESET RECIPE IS NOT AN AUTHOR'S TEXT (#159 D1). Checking only for an empty
+	// Notes was enough while the template's shape never changed between presetting
+	// and defaulting — but `create ext x --kind mcp --url …` starts from
+	// Preset(KindMCP), which already filled in the STDIO recipe, so the URL form kept
+	// instructions whose first line tells the reader to run a command it does not
+	// have. isPresetNotes is the test the update path already used; create now asks
+	// the same question, so the two cannot disagree.
+	if isPresetNotes(e.Notes) {
 		e.Notes = PresetNotes(e)
 	}
 	if e.Rows == 0 {

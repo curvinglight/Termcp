@@ -2,8 +2,8 @@ package webui
 
 import (
 	"os"
-	"regexp"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -600,7 +600,6 @@ func TestTheCapacityMeterIsAThemeRestyle(t *testing.T) {
 		t.Error("cyberpunk must rename the column to 义体容量, or the number reads as a plain count")
 	}
 }
-
 
 // The plate's inscription is a WATERMARK, and the panel's height is independent of it.
 //

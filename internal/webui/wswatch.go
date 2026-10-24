@@ -76,7 +76,10 @@ func (c *uiWS) runWatch(ctx context.Context, shell *session.ChildShell, sid stri
 				timeout = 0
 			}
 		}
-		out, _, _, err := shell.ReadTerminalStream(ctx, rid, timeout, false, 0, terminalOutputChunkBytes)
+		// NO TRIM: the browser repaints the terminal from these bytes, and a terminal
+		// emulator is byte-exact — a withheld byte would be a character that never
+		// appeared. Cutting mid-sequence here is correct, and the next chunk finishes it.
+		out, _, _, err := shell.ReadTerminalStream(ctx, rid, timeout, false, 0, terminalOutputChunkBytes, nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

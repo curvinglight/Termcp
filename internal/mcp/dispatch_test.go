@@ -379,3 +379,50 @@ func TestRepliesDoNotNameADeletedDirective(t *testing.T) {
 		}
 	}
 }
+
+// TestCloseWithAForwardIDDoesNotTerminateTheSession pins the destructive half of
+// the same class of bug: `close <session> --forward-id fw-…` used to answer 204 and
+// terminate the WHOLE session, because the dispatcher declared the flag, let the
+// parser accept it, and then closed the container. A caller asking to stop one
+// tunnel silently lost the connection (found by dogfooding #159).
+func TestCloseWithAForwardIDDoesNotTerminateTheSession(t *testing.T) {
+	s := newTestServer(t)
+	s.forwardMgr = forward.NewForwardManager()
+	s.sessMgr.AddOnDeadHook(s.forwardMgr.CloseBySession)
+	h := openPipe(t, s, "sleep 30")
+	sid := strings.SplitN(h, ":", 2)[0]
+	defer termText(t, s, map[string]any{"cmd": "close " + h})
+
+	out := termText(t, s, map[string]any{"cmd": "open " + sid + " forward --local-port 0 --remote-host 127.0.0.1 --remote-port 22"})
+	id := ""
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "forward_id:"); ok {
+			id = strings.TrimSpace(v)
+		}
+	}
+	if id == "" {
+		t.Fatalf("no forward_id in the open reply:\n%s", out)
+	}
+
+	if got := termText(t, s, map[string]any{"cmd": "close " + sid + " --forward-id " + id}); strings.HasPrefix(got, "TERM/1 4") || strings.HasPrefix(got, "TERM/1 5") {
+		t.Fatalf("close --forward-id was refused:\n%s", got)
+	}
+
+	// The tunnel is gone...
+	if list := termText(t, s, map[string]any{"cmd": "ls " + sid + " forward"}); strings.Contains(list, id) {
+		t.Errorf("the forward %s is still listed after close:\n%s", id, list)
+	}
+	// ...and the session it belonged to is NOT.
+	if got := termText(t, s, map[string]any{"cmd": "get " + sid}); strings.Contains(got, "status: exited") {
+		t.Fatalf("closing a forward terminated the session:\n%s", got)
+	}
+	// The shell still answers, which is the only proof that survives a status field.
+	if got := termText(t, s, map[string]any{"cmd": "run " + h + " echo alive"}); !strings.Contains(got, "alive") {
+		t.Errorf("the channel stopped working after closing a forward:\n%s", got)
+	}
+
+	// And the two deadlines together are refused instead of one being dropped.
+	if got := termText(t, s, map[string]any{"cmd": "close " + sid + " --forward-id " + id + " --grace 3"}); !strings.HasPrefix(got, "TERM/1 4") {
+		t.Errorf("--grace beside --forward-id was accepted:\n%s", got)
+	}
+}

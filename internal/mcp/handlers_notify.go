@@ -12,8 +12,8 @@ const maxNotifyMessageLen = 2000
 
 // handleNotifyUser posts a user-facing notification to every open termcp Web UI
 // tab (toast + browser system notification) and optionally highlights the card
-// of the given session. Unlike shell_notify, which wakes the AI Agent, this
-// reaches the human at the browser.
+// of the given session. It reaches the human at the browser; nothing in termcp
+// wakes an agent, which is what the retired reverse-wake-up rules tried to do.
 func (s *Server) handleNotifyUser(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	args := request.GetArguments()
 	message := strings.TrimSpace(getString(args, "message", ""))

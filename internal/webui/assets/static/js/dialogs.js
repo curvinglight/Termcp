@@ -667,23 +667,6 @@ function loadForwards() {
     .catch(function (e) { window._lastForwards = []; });
 }
 
-// Active shell notification rules (registered by the MCP shell_notify tool).
-function loadNotifications() {
-  return fetch(apiPath('/api/notifications'))
-    .then(function (r) { return r.json(); })
-    .then(function (j) {
-      window._lastNotifications = j.notifications || [];
-      document.querySelectorAll('.shell-window').forEach(function(w) { if (w._refreshNtfList) w._refreshNtfList(); });
-    })
-    .catch(function () { window._lastNotifications = []; });
-}
-
-function deleteNotification(ruleId) {
-  return fetch(apiPath('/api/notifications/') + encodeURIComponent(ruleId), { method: 'DELETE' })
-    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
-}
-
-
 
 function loadConnections() {
   return fetch(apiPath('/api/connections'))

@@ -81,13 +81,12 @@ func (g toolGuard) check(ctx context.Context, toolName string, c gate, request m
 		return g.checkEach(ids, g.sessionForSessionID, callerNS, toolName, c, args)
 	}
 
-	// Two tools name what they act on by the RESOURCE's own id rather than by the
-	// session it belongs to: forward(action=close) takes forward_id, and
-	// shell_notify(action=unregister) takes rule_id. Neither argument is one the
-	// branches above read, so the call resolved to no session and reached the
-	// handler unchecked — the same hole the REST forward-close route had, on the
-	// surface an extension handle actually reaches. The owner is resolved from the
-	// same managers the handlers use.
+	// ONE TOOL NAMES WHAT IT ACTS ON BY THE RESOURCE'S OWN ID rather than by the
+	// session it belongs to: forward(action=close) takes forward_id. That argument
+	// is not one the branches above read, so the call resolved to no session and
+	// reached the handler unchecked — the same hole the REST forward-close route
+	// had, on the surface an extension handle actually reaches. The owner is
+	// resolved from the same managers the handlers use.
 	if id := getString(args, "forward_id", ""); id != "" {
 		if sess := g.sessionForForwardID(id); sess != nil {
 			if bad := refuseForeignNamespace(sess, callerNS); bad != nil {

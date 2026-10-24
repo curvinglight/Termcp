@@ -40,9 +40,11 @@ func TestReadRefusesBytesJSONWouldCorrupt(t *testing.T) {
 			"would have replaced it with U+FFFD and shifted every later offset: %s", toolResultText(res))
 	}
 	body := toolResultText(res)
-	// The message must locate the byte and point at a byte-exact route: "not valid
-	// UTF-8" alone leaves the caller with no way to read the stream at all.
-	for _, want := range []string{"not valid UTF-8", "byte ", "mode=hex"} {
+	// The message must locate the byte and point at a route that can read these
+	// bytes on a CHANNEL. It used to name `mode=hex`, which is a file read: a caller
+	// that followed it got "unknown flag" from the very message that told it what to
+	// do. `--encoding` is the flag this verb actually answers (issue #149).
+	for _, want := range []string{"not valid UTF-8", "byte ", "--encoding"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("refusal is missing %q: %s", want, body)
 		}

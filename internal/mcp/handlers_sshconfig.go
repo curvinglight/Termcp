@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -204,14 +206,113 @@ func (s *Server) handleListSSHConfigs(ctx context.Context, request mcpgo.CallToo
 	if err != nil {
 		return toolError(CodeOperationFailed, "%s", err.Error()), nil
 	}
+	// A LISTING THAT CANNOT TELL A USABLE HOST FROM A BROKEN ONE IS A LISTING THAT
+	// LIES. Every entry used to be printed as a bare name whether or not it parsed,
+	// so the only way to learn that a profile was unusable was to try connecting to
+	// it — and an inventory, a demo, or a runbook built from `ls host` claimed hosts
+	// that could never be reached.
+	//
+	// The config is read at startup anyway, so the validation is free: the entry is
+	// loaded here and the reason travels with it. The name is still listed rather
+	// than hidden, because an entry the user wrote and cannot see is worse than one
+	// they can see is broken.
 	arr := make([]any, 0, len(names))
 	for _, n := range names {
 		if s.NoInternal && strings.EqualFold(n, "internal") {
 			continue
 		}
-		arr = append(arr, n)
+		item := map[string]any{"name": n}
+		ent, err := s.sshConfigs.Load(n)
+		if err != nil {
+			item["broken"] = brokenReason(err)
+		} else {
+			// WHERE IT IS AND WHAT IT IS. A name alone cannot answer the first
+			// question a newcomer has — `internal` sits in the same column as a box in
+			// another rack, with nothing saying one is this machine and the other is
+			// ssh. Deciding which is which by trying `uname -a` costs three calls and
+			// is the wrong first impression to charge for a listing that already had
+			// the answer loaded.
+			//
+			// A remote entry reports its TARGET rather than an OS: the OS of a host
+			// that has never been connected to is unknown here, and a column that
+			// guessed would be the kind of listing that lies.
+			if ent.Kind == sshconfig.KindInternal {
+				item["kind"] = "local"
+				item["where"] = localWhere(ent)
+			} else {
+				item["kind"] = "ssh"
+				item["where"] = targetOf(ent.DialSpec)
+			}
+		}
+		arr = append(arr, item)
 	}
 	return jsonResult(map[string]any{"ssh_configs": arr}), nil
+}
+
+// localWhere names the OS and the shell a local session will run.
+//
+// The shell belongs in the first screen because it decides whether the caller's
+// first command works: a caller that assumed bash typed `ls -la` into PowerShell and
+// got `Get-ChildItem: 找不到与参数名称 'la' 匹配的参数`, with a PATH-supplied `uname`
+// answering `MINGW64_NT` and confirming the wrong guess. What the profile names wins;
+// otherwise this reports the shell the server would spawn, which is a fact only the
+// server has (pwsh vs powershell vs cmd depends on PATH).
+//
+// The program name is read with strings.Fields rather than the argv grammar because
+// this is a LABEL, not something to run: a quoted `"C:\Program Files\pwsh.exe" -NoLogo`
+// may label as `"C:\Program` and still name the right shell to a human, while the
+// grammar's error would leave the column empty.
+func localWhere(ent *sshconfig.Entry) string {
+	where := runtime.GOOS
+	prog := ""
+	if line := sshconfig.EffectiveDefaultShell(ent); line != "" {
+		if f := strings.Fields(line); len(f) > 0 {
+			prog = f[0]
+		}
+	} else {
+		prog, _ = shell.NewDetector().Argv()
+	}
+	if prog != "" {
+		where += " " + filepath.Base(prog)
+	}
+	return where
+}
+
+// targetOf renders the `user@host:port` a remote entry dials, for a listing column.
+//
+// An entry may leave any of the three out (the SSH defaults fill them in at dial
+// time), so each part is printed only when it was written down: a fabricated
+// `root@localhost:22` beside an entry that says nothing would be this listing
+// inventing configuration.
+func targetOf(d sshconfig.DialSpec) string {
+	s := d.Host
+	if d.Port > 0 {
+		s += fmt.Sprintf(":%d", d.Port)
+	}
+	if d.User != "" {
+		if s == "" {
+			s = d.User + "@"
+		} else {
+			s = d.User + "@" + s
+		}
+	}
+	return s
+}
+
+// brokenReason renders a load failure as one line fit for a listing column.
+//
+// The sentinel that told the surface which STATUS to answer is stripped: it is the
+// tail of a Go error chain ("...: invalid ssh config"), a detail about how the
+// failure is classified, not part of the sentence the operator has to act on.
+func brokenReason(err error) string {
+	msg := strings.TrimSpace(err.Error())
+	for _, sentinel := range []error{sshconfig.ErrInvalid, sshconfig.ErrNotFound} {
+		// Wrapped errors put the sentinel last ("...: invalid ssh config"), but a
+		// returned one puts it first, so both ends are trimmed.
+		msg = strings.TrimSuffix(msg, ": "+sentinel.Error())
+		msg = strings.TrimPrefix(msg, sentinel.Error()+": ")
+	}
+	return strings.Join(strings.Fields(msg), " ")
 }
 
 // handleGetSSHConfig returns one entry, with the secrets REDACTED.
@@ -356,17 +457,29 @@ func applyEntryEdits(existing *sshconfig.Entry, args map[string]any) {
 	}
 }
 
-// applyJumpEdits overlays a bastion (ProxyJump) onto an existing profile. It is
-// separate from applyEntryEdits because a jump is all-or-nothing on its host:
-// without jump_host there is no bastion to fill in, and the remaining jump_*
-// arguments are ignored rather than silently creating one.
+// applyJumpEdits overlays a bastion (ProxyJump) onto an existing profile.
+//
+// CREATING A BASTION NEEDS ITS HOST; EDITING ONE DOES NOT. That distinction was
+// missing, and it made the rule "a jump is all-or-nothing" swallow real edits:
+// `edit host prod --jump-port 2201` on a profile that already has a bastion answered
+// 200 success and changed nothing, because the merge only ran when `jump_host` was
+// given again. The caller had to restate the host to change a port — and nothing in
+// the reply said so.
+//
+// So the remaining jump_* arguments apply when there is ALREADY a bastion to apply
+// them to. A stray `--jump-user` on a profile with no jump still does not conjure one:
+// that half of the original rule is what keeps a typo from inventing infrastructure.
 func applyJumpEdits(existing *sshconfig.Entry, args map[string]any) {
-	// Jump merge
 	if jh := getString(args, "jump_host", ""); jh != "" {
 		if existing.Jump == nil {
 			existing.Jump = &sshconfig.JumpSpec{}
 		}
 		existing.Jump.Host = strings.TrimSpace(jh)
+	}
+	if existing.Jump == nil {
+		return
+	}
+	{
 		if v := getString(args, "jump_user", ""); v != "" {
 			existing.Jump.User = strings.TrimSpace(v)
 		}

@@ -316,7 +316,7 @@ func TestBuffer_ReadLimitedMaxLinesPreservesUnreadData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := b.ReadLimited(context.Background(), r, 0, 0, 2)
+	data, err := b.ReadLimited(context.Background(), r, 0, 0, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestBuffer_ReadLimitedMaxLinesPreservesUnreadData(t *testing.T) {
 		t.Fatal("expected unread data after max_lines read")
 	}
 
-	data, err = b.ReadLimited(context.Background(), r, 0, 0, 0)
+	data, err = b.ReadLimited(context.Background(), r, 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,23 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
+
+// ErrProcessGone reports that the channel's process has finished, so its stdin is
+// gone. See ErrUnknownKey for why this is a sentinel: "the line you typed is
+// wrong" and "the thing you typed it into is over" are answered by different
+// statuses, and both travel through the same write.
+var ErrProcessGone = errors.New("the process is gone")
+
+// processGoneError carries ErrProcessGone without putting the sentinel's words in
+// the message. The text is a sentence the caller reads ("process has exited,
+// cannot send input"), and appending ": the process is gone" to it would be the
+// same fact twice.
+type processGoneError struct{ status string }
+
+func (e *processGoneError) Error() string {
+	return "process has " + e.status + ", cannot send input"
+}
+func (e *processGoneError) Is(target error) bool { return target == ErrProcessGone }
 
 // Lock ordering: shellStateMu -> stdinMu. Never acquire in reverse order.
 // shellStateMu is only taken by session-level transitions (close/DEAD/terminate,
@@ -187,7 +205,7 @@ func (cs *ChildShell) SendTerminalBytes(data []byte, pressEnter bool) error {
 func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src InputSource) error {
 	status := cs.statusValue()
 	if status != api.SessionRunning {
-		return fmt.Errorf("process has %s, cannot send input", status)
+		return &processGoneError{status: string(status)}
 	}
 	// THE EXIT IS PUBLISHED LATE, SO ASK THE PROCESS TOO.
 	//
@@ -210,13 +228,13 @@ func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src In
 	if cs.execSession != nil {
 		select {
 		case <-cs.execSession.Done():
-			return fmt.Errorf("process has exited, cannot send input")
+			return &processGoneError{status: "exited"}
 		default:
 		}
 	}
 	select {
 	case <-cs.done:
-		return fmt.Errorf("process has exited, cannot send input")
+		return &processGoneError{status: "exited"}
 	default:
 	}
 	var toWrite []byte
@@ -265,7 +283,7 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 	}
 	status := cs.statusValue()
 	if status != api.SessionRunning {
-		return fmt.Errorf("process has %s, cannot send input", status)
+		return &processGoneError{status: string(status)}
 	}
 	payload := bytes.Repeat(seq, repeat)
 	// A named key submits a line too (enter, and the ctrl sequences a line editor

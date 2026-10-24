@@ -3,8 +3,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/directive"
 	"github.com/open-mcp-ai/termcp/internal/envelope"
 	"github.com/open-mcp-ai/termcp/internal/jrpc"
+	"github.com/open-mcp-ai/termcp/internal/ns"
 )
 
 // Three directives, one channel.
@@ -170,7 +173,7 @@ func (s *Server) jrpcOpen(ctx context.Context, stmt directive.Statement, op, ses
 	// REVIEW is deliberately not run here: whether an admitted open is HELD for a
 	// human is the event-hook layer's decision (issue #128), and duplicating that
 	// decision at this layer is how the two would drift apart.
-	if slot, refused := s.refuseDoor(ctx, stmt, op); refused {
+	if slot, refused := s.refuseDoor(ctx, stmt, op, sessionID); refused {
 		return slot
 	}
 	// `mcp open .../sse` used to be refused with a sentence about the legacy
@@ -236,21 +239,38 @@ func (s *Server) jrpcOpen(ctx context.Context, stmt directive.Statement, op, ses
 		// error about "1" — the one instruction this reply gives was wrong, and it was
 		// wrong in the same reply that explains why the next call matters.
 		body += "\nNext: `ls " + handle + "` lists the tabs. Attach one with `open " + handle +
-			" --target <targetId>`, then call through the handle it returns.\n"
+			" --target <targetId>`, then call through the channel it returns.\n"
 		body += "Events are kept: record the number from `get " + handle + "`, act, then `read " + handle + " --since <n>`.\n"
 	}
 	if op == "mcp" {
-		if discover, ok := s.jrpcDiscoverMCP(ctx, h, handle); ok {
-			body += discover
-		} else {
-			// The handshake failed. Say so HERE rather than letting the first real
-			// call discover it: a connection that opens and cannot negotiate is a
-			// fact about the open, and reporting it later moves the blame onto
-			// whatever call happened to be second.
-			body += "\nprotocol: the MCP handshake failed" + discover + ", so tool calls cannot work.\n" +
-				"A refused connection means nothing is listening on that port; a version mismatch means the\n" +
-				"peer does not speak this protocol. The handle still addresses the channel — `close " + handle + "`\n" +
-				"frees it — but there is no tool list to read.\n"
+		discover, ready, err := s.jrpcDiscoverMCP(ctx, h, handle)
+		body += discover
+		if !ready {
+			// A PEER THAT ANSWERED AND REFUSED IS NOT AN OPEN PEER. This used to answer 200,
+			// hand back a handle, and put the failure in the body — so every later call
+			// repeated a fact this call already knew, and reported it as 500
+			// connection_failed (the transport was fine; the URL was not an MCP endpoint).
+			// Found by dogfooding: `open … mcp http://plain-http-server/` answered 200, and
+			// the next `call` answered Internal Server Error.
+			//
+			// A PEER THAT COULD NOT BE REACHED IS STILL AN OPEN PEER, deliberately: an HTTP
+			// channel dials on its first frame, so a server that is not up yet is a handle
+			// worth having — the same lazy-connect contract the jrpc door has always had.
+			// Only "answered, and the answer is not MCP" is final; retrying that URL gives
+			// the same refusal forever.
+			//
+			// THE CHANNEL IS FREED, not left addressable: a handle that cannot carry a tool
+			// call has no use but `close`.
+			if peerAnswered(err) {
+				s.closePeer(stmt, h)
+				return envelope.Slot{Code: 502, Headers: map[string]string{
+					"Path": stmt.Path, "Error-Code": CodeConnectionFailed,
+				}, Body: "the MCP handshake failed" + discover + ", so this URL is not an MCP endpoint.\n" +
+					"A 404 usually means the path is wrong (an MCP server answers POST " + rawURL + ", not GET);\n" +
+					"a version mismatch means the peer does not speak this protocol. Nothing was opened."}
+			}
+			body += "\nprotocol: the MCP handshake failed" + discover + ", so tool calls cannot work until\n" +
+				"something answers there. The address still names the channel — `close " + handle + "` frees it.\n"
 		}
 	}
 	return envelope.Slot{
@@ -260,6 +280,22 @@ func (s *Server) jrpcOpen(ctx context.Context, stmt directive.Statement, op, ses
 	}
 }
 
+// peerAnswered reports whether the failure came from a server that replied, as
+// opposed to one that could not be reached at all.
+//
+// The distinction decides whether an `mcp open` is an open: a URL that answers and
+// refuses the handshake will answer the same way forever, while a port that is not up
+// yet is the ordinary case for a channel that dials lazily. httpCall wraps a non-2xx
+// answer as a "<status>: <body>" error and a transport failure as a *url.Error, which
+// is what this reads.
+func peerAnswered(err error) bool {
+	if err == nil {
+		return false
+	}
+	var urlErr *url.Error
+	return !errors.As(err, &urlErr)
+}
+
 // jrpcDiscoverMCP runs the handshake and lists the peer's tools, so `mcp open`
 // can report what the connection is actually for.
 //
@@ -267,30 +303,30 @@ func (s *Server) jrpcOpen(ctx context.Context, stmt directive.Statement, op, ses
 // channel, and failing the whole open over a discovery query would turn a partial
 // success into a total failure. The boolean says whether the handshake itself
 // worked, which IS a fact about the open.
-func (s *Server) jrpcDiscoverMCP(ctx context.Context, h *jrpcHandle, handle string) (string, bool) {
+func (s *Server) jrpcDiscoverMCP(ctx context.Context, h *jrpcHandle, handle string) (string, bool, error) {
 	if err := s.jrpcReady(ctx, h); err != nil {
 		// THE REASON TRAVELS OUT, not just the fact. The caller below used to print
 		// "the transport is fine and the URL is right" whoever failed, which is true for a
 		// peer that answers with the wrong protocol version and false for a port with
 		// nothing on it — and the second is the common case. Swallowing err here forced
 		// that sentence to be a guess.
-		return " (" + err.Error() + ")", false
+		return " (" + err.Error() + ")", false, err
 	}
 	raw, err := h.ch.Call(ctx, map[string]any{"jsonrpc": "2.0", "method": "tools/list"})
 	if err != nil {
-		return "\ntools: the peer negotiated but refused tools/list (" + err.Error() + ")\n", true
+		return "\ntools: the peer negotiated but refused tools/list (" + err.Error() + ")\n", true, nil
 	}
 	var doc map[string]any
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-		return "\ntools: the peer's tools/list reply was not JSON (" + err.Error() + ")\n", true
+		return "\ntools: the peer's tools/list reply was not JSON (" + err.Error() + ")\n", true, nil
 	}
 	result, _ := doc["result"].(map[string]any)
 	items, _ := result["tools"].([]any)
 	if len(items) == 0 {
-		return "\ntools: none (the peer advertises no tools)\n", true
+		return "\ntools: none (the peer advertises no tools)\n", true, nil
 	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\ntools (%d) — call one with `call %s '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"...\",\"arguments\":{}}}'`:\n", len(items), handle))
+	b.WriteString(fmt.Sprintf("\ntools (%d) — call one with `call %s <tool> {…}` (`get %s tools` lists required keys):\n", len(items), handle, handle))
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
 		if !ok {
@@ -307,51 +343,41 @@ func (s *Server) jrpcDiscoverMCP(ctx context.Context, h *jrpcHandle, handle stri
 		}
 		b.WriteString("\n")
 	}
-	return b.String(), true
+	return b.String(), true, nil
 }
 
 // refuseDoor applies a session's capability whitelist to one of the frame-channel
-// doors.
+// doors (mcp / cdp / jrpc).
 //
-// It answers a NARROWER question than refuseAction, and the difference is not an
-// oversight: refuseAction resolves the session a statement names so it can read
-// that session's restriction. A door names no session — its target is a URL — so
-// the restriction that governs it is the one on the session the CALLER already
-// holds.
-//
-// That is why the loop below is over sessions rather than a lookup of one: the
-// namespaces this caller may see ARE the ones whose grants govern it. A
-// restricted session among them that does not list the door refuses the open; if
-// every visible session is unrestricted (the ordinary case, and every operator
-// surface) the call proceeds, which is what keeps this from changing anything for
-// a caller who was never restricted.
-//
-// ponytail: a linear scan over live sessions, on an operation a caller performs a
-// handful of times per conversation. An index of "the restriction governing a
-// caller" is the right shape once a caller can hold several restrictions at once;
-// today it cannot.
-func (s *Server) refuseDoor(ctx context.Context, stmt directive.Statement, op string) (envelope.Slot, bool) {
-	if s.sessMgr == nil {
+// THE SESSION CHECKED IS THE ONE THE CALL NAMES, and nothing else. It used to walk
+// every session in the caller's namespace and refuse as soon as ANY of them lacked
+// the capability — so one restricted profile anywhere in the instance (any extension
+// template that does not list `mcp.open`) refused the door for every caller, and
+// `--allow mcp.open` on the session actually being used changed nothing. A door is
+// opened THROUGH a session, and that session's template is whose whitelist applies
+// (#159).
+func (s *Server) refuseDoor(ctx context.Context, stmt directive.Statement, op, sessionID string) (envelope.Slot, bool) {
+	if s.sessMgr == nil || sessionID == "" {
 		return envelope.Slot{}, false
 	}
-	callerNS := callerNamespace(ctx)
-	capID := op + ".open"
-	for _, snap := range s.sessMgr.ListAll() {
-		if callerNS != "" && snap.Namespace != callerNS {
-			continue
-		}
-		// ListAll hands back snapshots; the restriction lives on the live
-		// session object, which is what Get returns.
-		sess := s.sessMgr.Get(snap.ID)
-		if sess == nil || sess.Restriction().Allows(capID) {
-			continue
-		}
+	sess, bad := s.resolveTunnelSession(sessionID)
+	if bad != nil || sess == nil {
+		return envelope.Slot{}, false
+	}
+	if callerNS := callerNamespace(ctx); callerNS != "" && sess.Namespace != callerNS {
 		return envelope.Slot{Code: 403, Headers: map[string]string{
 			"Path":       stmt.Path,
 			"Error-Code": CodeForbidden,
-		}, Body: "this session's template does not grant " + capID}, true
+		}, Body: ns.ForbiddenForeign(callerNS)}, true
 	}
-	return envelope.Slot{}, false
+	capID := op + ".open"
+	if sess.Restriction().Allows(capID) {
+		return envelope.Slot{}, false
+	}
+	return envelope.Slot{Code: 403, Headers: map[string]string{
+		"Path":       stmt.Path,
+		"Error-Code": CodeForbidden,
+	}, Body: "this session's template does not grant " + capID}, true
 }
 
 // devtoolsSocket turns a browser's debug endpoint into the socket it advertises.
@@ -402,7 +428,7 @@ func devtoolsSocket(ctx context.Context, rawURL string, dial jrpc.DialFunc) (str
 // stdio form, so an unknown handle there is an error rather than a fallback.
 func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win termArgs, op, sub string, rest []string) envelope.Slot {
 	if len(rest) == 0 {
-		return badRequest(stmt, op+" "+sub+" needs a handle (the one "+op+" open returned)")
+		return badRequest(stmt, op+" "+sub+" needs a channel address (the one "+op+" open returned)")
 	}
 	handle := rest[0]
 	jrpcChannelsMu.Lock()
@@ -418,7 +444,7 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 			return s.mcpStdio(ctx, stmt, sub, handle, rest[1:])
 		}
 		return envelope.Slot{Code: 404, Headers: map[string]string{"Path": stmt.Path, "Error-Code": "not_found"},
-			Body: "no open channel named " + handle + " (copy a handle from " + op + " open, or from ps for a shell)"}
+			Body: "no open channel named " + handle + " (copy a channel address from " + op + " open, or from ps for a shell)"}
 	}
 	if sub == "close" {
 		_ = h.ch.Close()
@@ -455,16 +481,17 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 					"nothing to wait for; a peer that pushes on its own needs a socket (cdp open ws://…)."}
 		}
 		return envelope.Slot{Code: 204, Headers: headers, Body: "no frame within the window"}
-	case "tools":
-		// MCP only: it is the one door whose peer has a tool list. On the others
-		// the subcommand is a lie, and a lie that returns an error frame is worse
-		// than a sentence.
-		if h.kind != "mcp" {
-			return badRequest(stmt, "`"+op+" tools` is MCP's tool list; use `"+op+` call `+handle+` '{"method":"…"}'`+"` instead")
-		}
-		frame := map[string]any{"jsonrpc": "2.0", "method": "tools/list"}
-		return s.jrpcCall(ctx, stmt, h, frame)
 	case "call", "send":
+		// A TOOL NAME IS NOT A FRAME, and the two cannot be confused: a frame is a JSON
+		// object and starts with '{', a tool name never does (#159). The test peels the
+		// caller's grouping quotes first, because `call <peer> '{"…"}'` is how a frame
+		// with spaces in it is spelled — the quote is grouping, not part of the value,
+		// and reading it as "not a frame" would refuse the commonest spelling there is.
+		// Every other frame — notifications, progress, sampling, anything custom —
+		// keeps the escape hatch unchanged.
+		if op == "mcp" && len(rest) > 1 && !strings.HasPrefix(unquoteWord(strings.TrimSpace(rest[1])), "{") {
+			return s.mcpToolCall(ctx, stmt, h, strings.Join(rest[1:], " "))
+		}
 		frame, bad := parseJRPCFrame(stmt, rest[1:])
 		if bad != nil {
 			return *bad
@@ -488,11 +515,15 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 		}
 		return s.frameReply(ctx, stmt, h, reply)
 	}
-	return badRequest(stmt, "unknown "+op+" subcommand: "+sub)
+	// NO FALLBACK: the subcommand is not the caller's word here. The verbs that reach
+	// this function (call, write --send, read --frame, close) each name the one
+	// subcommand they mean, so an unrecognised one is a bug in this file rather than
+	// something a caller typed, and answering it with a sentence would hide that.
+	return envelope.Slot{Code: 500, Headers: map[string]string{
+		"Path": stmt.Path, "Error-Code": CodeOperationFailed,
+	}, Body: "internal: no handler for " + op + " " + sub}
 }
 
-// recvContext bounds the wait for a pushed frame by the call's timeout, so recv
-// obeys the same window parameter as every other directive.
 // recvContext bounds the wait for a pushed frame by the call's timeout, so recv
 // obeys the same window parameter as every other directive, and hands back the
 // cancel for the caller to release once the wait is over.
@@ -504,19 +535,6 @@ func recvContext(ctx context.Context, win termArgs) (context.Context, context.Ca
 		return context.WithDeadline(ctx, time.Now())
 	}
 	return context.WithTimeout(ctx, time.Duration(wait*float64(time.Second)))
-}
-
-// jrpcCall sends one frame and returns its answer, rendered the way every frame is
-// rendered (escapes decoded, oversized payloads turned into receipts).
-func (s *Server) jrpcCall(ctx context.Context, stmt directive.Statement, h *jrpcHandle, frame map[string]any) envelope.Slot {
-	if err := s.jrpcReady(ctx, h); err != nil {
-		return jrpcError(stmt, err)
-	}
-	reply, err := h.ch.Call(ctx, frame)
-	if err != nil {
-		return jrpcError(stmt, err)
-	}
-	return s.frameReply(ctx, stmt, h, reply)
 }
 
 // jrpcReady runs the MCP handshake once, before the first frame that is not the
@@ -567,14 +585,24 @@ func (s *Server) jrpcReady(ctx context.Context, h *jrpcHandle) error {
 func parseJRPCFrame(stmt directive.Statement, rest []string) (map[string]any, *envelope.Slot) {
 	payload := unquoteWord(strings.TrimSpace(strings.Join(rest, " ")))
 	if payload == "" {
-		return nil, ptrSlot(badRequest(stmt, "needs a JSON-RPC frame, e.g. call <handle> '{\"method\":\"…\"}'"))
+		return nil, ptrSlot(badRequest(stmt, "needs a JSON-RPC frame, e.g. call <channel> '{\"method\":\"…\"}'"))
 	}
 	var frame map[string]any
 	if err := json.Unmarshal([]byte(payload), &frame); err != nil {
-		return nil, ptrSlot(badRequest(stmt, "the frame is not JSON: "+err.Error()))
+		return nil, ptrSlot(badRequest(stmt, "the frame is not JSON: "+err.Error()+"\n"+frameSpelling))
 	}
 	return frame, nil
 }
+
+// frameSpelling is the one sentence that turns "invalid character" into a fix.
+//
+// A JSON body is full of double quotes, so the instinct is to wrap it in double
+// quotes and escape the ones inside — which is what a shell would need and this
+// layer does not do: quoting here groups the line into one word and is then
+// removed, one layer, with the bytes inside left alone. The escaped spelling
+// therefore arrives at the parser as backslashes and is refused for it.
+const frameSpelling = "A frame is passed bare or in single quotes — quoting here only groups the line, " +
+	"it does not escape: `call <peer> '{\"method\":\"tools/list\"}'`."
 
 // jrpcError renders a transport failure as a reply, never as a success shape.
 func jrpcError(stmt directive.Statement, err error) envelope.Slot {

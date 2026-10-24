@@ -35,7 +35,6 @@ func TestWindowArgumentTypesAreRefused(t *testing.T) {
 		{"bytes_limit string", map[string]any{"bytes_limit": "many"}, "bytes_limit must be a number"},
 		{"lines_limit array", map[string]any{"lines_limit": []any{1}}, "lines_limit must be a number"},
 		{"learn_mode string", map[string]any{"learn_mode": "yes"}, "learn_mode must be true or false"},
-		{"pipe_to number", map[string]any{"pipe_to": 3}, "pipe_to must be a string"},
 		{"overflow typo", map[string]any{"on_bytes_overflow": "trunc"}, "must be one of truncate, fold"},
 		{"overflow wrong type", map[string]any{"on_time_overflow": 1}, "must be a string"},
 	}
@@ -57,6 +56,15 @@ func TestWindowArgumentTypesAreRefused(t *testing.T) {
 }
 
 // Out-of-range numbers are refused with the bound, not clamped.
+//
+// ONLY TWO KINDS OF BOUND ARE LEFT, and both are about the call working at all rather than
+// about how much it costs: a negative number is a typo (there is no "-1 seconds"), and a
+// window narrower than one character can never return one, so it withholds the same bytes
+// on every call and advances nothing. Every CEILING was removed on purpose — time and space
+// are what the caller pays for, and this server has no basis to overrule the only party that
+// can judge the trade. Those numbers are published as sizes to stay under
+// (TestTheSchemaSaysWhichWindowSizesAreRecommended) and honoured above them
+// (TestALargeWindowIsHonouredNotRefused).
 func TestWindowArgumentBoundsAreRefused(t *testing.T) {
 	s := newTestServer(t)
 	cases := []struct {
@@ -64,10 +72,12 @@ func TestWindowArgumentBoundsAreRefused(t *testing.T) {
 		want string
 	}{
 		{map[string]any{"timeout": -1}, "timeout must be >= 0"},
-		{map[string]any{"timeout": 99999}, "timeout must be <= 3600"},
 		{map[string]any{"bytes_limit": -5}, "bytes_limit must be >= 0"},
 		{map[string]any{"lines_limit": -5}, "lines_limit must be >= 0"},
 		{map[string]any{"total_bytes_limit": 0}, "total_bytes_limit must be >= 1"},
+		// The floor, not a ceiling: a window too small to hold one character withholds the
+		// same bytes on every call and advances nothing.
+		{map[string]any{"bytes_limit": 2}, "smaller than one character"},
 	}
 	for _, tc := range cases {
 		args := map[string]any{"cmd": "ls"}
@@ -78,6 +88,53 @@ func TestWindowArgumentBoundsAreRefused(t *testing.T) {
 		if !strings.Contains(got, "400") || !strings.Contains(got, tc.want) {
 			t.Errorf("%v must be refused with %q:\n%s", tc.args, tc.want, got)
 		}
+	}
+}
+
+// TestALargeWindowIsHonouredNotRefused is the other half of the rule, for time.
+//
+// A wait above the recommendation used to be a 400. The reasoning was sound as far as it
+// went — the transport in front of the caller gives up sooner, so a longer window loses the
+// reply — but it is the CALLER that loses the reply, and it is the only party that knows
+// which client it is talking through. Refusing made its vocabulary depend on a timeout
+// somewhere it cannot see. The number is a recommendation now, and the reply reports how
+// long it actually waited.
+func TestALargeWindowIsHonouredNotRefused(t *testing.T) {
+	s := newTestServer(t)
+	got := s.Term(context.Background(), "ls", map[string]any{"cmd": "ls", "timeout": 99999}).Text()
+	if strings.Contains(got, "400") || strings.Contains(got, "timeout must be") {
+		t.Fatalf("a long wait is the caller's own risk to take:\n%s", got)
+	}
+}
+
+// TestTheSchemaSaysWhichWindowSizesAreRecommended is where the hint lives.
+//
+// A size that is not enforced has to be stated, or it is not a hint — it is a number in a
+// comment. The caller reads the argument description before choosing, so the recommendation
+// belongs there, in the words that say what it is for.
+func TestTheSchemaSaysWhichWindowSizesAreRecommended(t *testing.T) {
+	for name, want := range map[string]string{
+		"bytes_limit":       "stay under",
+		"lines_limit":       "stay under",
+		"total_bytes_limit": "stay under",
+	} {
+		decl, ok := termArgDeclFor(name)
+		if !ok {
+			t.Fatalf("no declaration for %s", name)
+		}
+		if !strings.Contains(decl.DocNote, want) {
+			t.Errorf("%s does not say it is a size to %q: %s", name, want, decl.DocNote)
+		}
+	}
+	// And the text the model actually reads is rendered from the same declaration, so a
+	// recommendation that lived only in this struct would never reach a caller.
+	var rendered strings.Builder
+	for _, d := range termArgDecls {
+		rendered.WriteString(d.Desc)
+		rendered.WriteString(d.DocNote)
+	}
+	if !strings.Contains(rendered.String(), "stay under") {
+		t.Error("the rendered schema text does not carry the recommendation")
 	}
 }
 
@@ -128,11 +185,11 @@ func TestSchemaPublishesTheDeclaredBounds(t *testing.T) {
 				t.Errorf("%s: schema minimum = %v, declaration says %v", name, prop["minimum"], v)
 			}
 		}
-		if v, want := boundValue(d.Max); want {
-			got, _ := prop["maximum"].(float64)
-			if got != v {
-				t.Errorf("%s: schema maximum = %v, declaration says %v", name, prop["maximum"], v)
-			}
+		// NO MAXIMUM, AND THE SCHEMA MUST NOT INVENT ONE. Every upper bound in this table
+		// was removed on purpose: the caller pays for the time and the context, and a
+		// published ceiling would make a client refuse a value this server honours.
+		if raw, present := prop["maximum"]; present {
+			t.Errorf("%s: the schema publishes a maximum (%v) that no longer exists", name, raw)
 		}
 	}
 }

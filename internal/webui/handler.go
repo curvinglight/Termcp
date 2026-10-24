@@ -229,11 +229,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/sessions/{id}/forwards", h.handleListSessionForwards)
 	mux.HandleFunc("POST /api/sessions/{id}/forwards", h.handleCreateForward)
 
-	// Shell notification rules (registered by the MCP shell_notify tool; the UI
-	// lists them and can unregister).
-	mux.HandleFunc("GET /api/notifications", h.handleListNotifications)
-	mux.HandleFunc("DELETE /api/notifications/{id}", h.handleDeleteNotification)
-
 	// File operations
 	mux.HandleFunc("GET /api/sessions/{id}/files", h.handleListFiles)
 	mux.HandleFunc("GET /api/sessions/{id}/files/download", h.handleDownloadFile)

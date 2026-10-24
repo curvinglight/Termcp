@@ -17,6 +17,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/ns"
 	"github.com/open-mcp-ai/termcp/internal/session"
+	"github.com/open-mcp-ai/termcp/internal/task"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -76,11 +77,26 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 	case "reader":
 		return []envelope.Slot{s.directiveReader(ctx, stmt, win)}
 	case "get":
+		if stmt.Kind == "task" {
+			// A RECEIPT IS READ WITHOUT A SESSION behind it: the transfer it describes
+			// outlived the call that started it, and the caller may have no session
+			// handle at all by now. `get task <id>` therefore takes no target.
+			return []envelope.Slot{s.directiveGetTask(ctx, stmt, win)}
+		}
 		if stmt.Kind == "host" {
 			// `get host <name>` reads one entry back. Without it a caller could create,
 			// edit and delete a host but never see what it holds, so a partial edit had
 			// to be done blind.
 			return []envelope.Slot{s.directiveHost(ctx, withFlags(stmt, map[string]string{
+				"action": "get", "name": stmt.Key,
+			}), win)}
+		}
+		if stmt.Kind == "ext" {
+			// `get ext <name>` reads one template back, which is what makes `ls ext
+			// <name>` refusable by name rather than by a shrug. Without it the only way
+			// to see one extension was the full listing, so a caller that mistyped a
+			// name got fourteen rows and believed it had filtered (issue #143).
+			return []envelope.Slot{s.directiveExtension(ctx, withFlags(stmt, map[string]string{
 				"action": "get", "name": stmt.Key,
 			}), win)}
 		}
@@ -109,6 +125,20 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 					domain = stmt.Args[1]
 				}
 				return []envelope.Slot{s.cdpProtocol(ctx, stmt, h, domain)}
+			}
+			// `tools` IS THE MCP SIBLING OF `protocol`: the peer's own table, read live,
+			// in the same two positions (`mcp tools` and `mcp:1 tools`). An argument names
+			// one tool and prints its full input schema.
+			if stmt.Kind == "mcp" && (stmt.Key == "tools" || (len(stmt.Args) > 0 && stmt.Args[0] == "tools")) {
+				tool := ""
+				if stmt.Key == "tools" {
+					if len(stmt.Args) > 0 {
+						tool = stmt.Args[0]
+					}
+				} else if len(stmt.Args) > 1 {
+					tool = stmt.Args[1]
+				}
+				return []envelope.Slot{s.mcpToolList(ctx, stmt, h, win, tool)}
 			}
 			return []envelope.Slot{s.cdpDescribe(stmt, h, index)}
 		}
@@ -214,6 +244,8 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 	// closing the primary channel): a qualifier read as decoration.
 	case "close":
 		switch stmt.Kind {
+		case "task":
+			return []envelope.Slot{s.directiveCloseTask(ctx, stmt)}
 		case "forward":
 			// THE ID IS THE NODE, so it arrives as the key rather than as a flag: the tree
 			// says `close <session> forward <id>`, and asking for `--forward-id` here made
@@ -236,6 +268,28 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 			}
 			return []envelope.Slot{s.closePeer(stmt, h)}
 		case "":
+			// AN EXPLICIT --forward-id NAMES A FORWARD, and it must not be swallowed by
+			// the container close (dogfood finding on #159). The parser accepts the flag
+			// — it is declared on this verb — and the dispatcher then ignored it, so
+			// `close <session> --forward-id fw-…` answered 204 and TERMINATED THE WHOLE
+			// SESSION: the caller asked to stop one tunnel and silently lost the
+			// connection. `--grace` is the mirror image: a session deadline that must not
+			// be ignored either.
+			//
+			// This is not reading intent out of a flag (the mistake `close <channel>
+			// --force` was fixed for): no other object a close can name has a forward
+			// id, so the flag picks the node rather than modifying it.
+			if fid, ok := stmt.Flag("forward-id"); ok && fid != "" {
+				if stmt.FlagState("grace") != directive.FlagAbsent {
+					return []envelope.Slot{badRequest(stmt, "`--grace` is a session deadline; "+fid+
+						" is a forward, and closing a tunnel has nothing to wait for.\n"+
+						"Close the tunnel and the connection separately: `close "+stmt.Target+" --forward-id "+fid+
+						"`, then `close "+stmt.Target+" --grace N` if that is also wanted.")}
+				}
+				return []envelope.Slot{s.directiveForward(ctx, withFlags(stmt, map[string]string{
+					"action": "close", "forward-id": fid,
+				}), win)}
+			}
 			if isPeerHandle(stmt.Target) {
 				return s.peerChannel(ctx, stmt, win, "close", nil)
 			}
@@ -472,6 +526,31 @@ func noContent(stmt directive.Statement) envelope.Slot {
 	return envelope.Slot{Code: 204, Headers: map[string]string{"Path": stmt.Path}}
 }
 
+// closedSlot answers a close with the object it closed, in a header.
+//
+// A CLOSE IS THE LAST THING A CALLER DOES WITH AN OBJECT, AND IT WAS THE ONLY REPLY
+// THAT SAID NOTHING. `close <session>` answered 204 with an empty body, so the caller
+// could not tell "closed the session I named" from "closed something, somewhere" — the
+// reported reaction was to run `ls` and see what was missing, a call spent confirming
+// instead of advancing, on the step where a wrong answer is most expensive.
+//
+// The code stays 204: there is no content to return, and the REST entrance drops a body
+// on 204, so a sentence there would reach MCP only. A header is carried by both.
+//
+// The NAME rides along when the object has one, because that is how the caller thinks
+// of it: they wrote `--name explore` and the reply should say "explore", not only the
+// uuid they copied out of a receipt three calls ago.
+func closedSlot(stmt directive.Statement, address, name string) envelope.Slot {
+	closed := address
+	if strings.TrimSpace(name) != "" {
+		closed += " (" + name + ")"
+	}
+	return envelope.Slot{Code: 204, Headers: map[string]string{
+		"Path":   stmt.Path,
+		"Closed": closed,
+	}}
+}
+
 // badRequest returns a 400 slot for an invalid argument or missing parameter.
 func badRequest(stmt directive.Statement, body string) envelope.Slot {
 	return envelope.Slot{
@@ -647,8 +726,11 @@ func pipeClosedHint(handle string, f *toolFailure, s *Server) *toolFailure {
 	} else if cs.Info().Mode != api.ModePipe {
 		return f
 	}
+	// 409, NOT 500. The channel's process is over; nothing about the server broke and
+	// the caller's own line was fine. A 5xx here invites a retry of a write that can
+	// never land, and hides a finished channel behind "the server failed".
 	return &toolFailure{
-		code: CodeOperationFailed,
+		code: CodeSessionNotRunning,
 		msg: msg + "\nThis is a PIPE channel: its process has finished, so there is no stdin left to write to " +
 			"and `run`/`input` cannot drive it. Its output is still readable — `read " + handle + "` returns it, " +
 			"including the exit code. For an interactive session use `open <session>` instead (a pty).",
@@ -731,7 +813,7 @@ func (s *Server) directiveRead(ctx context.Context, stmt directive.Statement, wi
 
 // directiveReadOne reads one channel.
 func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
-	// bytes_limit 0 means "hand back the handle, consume nothing". readSlotAfter
+	// bytes_limit 0 means "hand back the channel, consume nothing". readSlotAfter
 	// honours it; this path has to as well, or the one directive whose whole point
 	// is reading would be the one place the caller cannot decline to read.
 	// The offset is the stream's current end, so the reply still says where the
@@ -750,8 +832,20 @@ func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement,
 		return s.readGrep(ctx, stmt, win)
 	}
 	args := argsOf("shell_id", stmt.Target)
+	// --offset IS THE SAME BYTE POSITION AS --cursor, and on a channel read it used to
+	// be accepted and IGNORED (dogfood finding on #159): the flag is declared for the
+	// peer `--at` path, so the parser took it and this function never looked. A caller
+	// who wrote `read <channel> --offset 0` therefore got the default cursor read — on
+	// a closed channel, an empty one — and nothing said the flag had not been used.
+	//
+	// Asking twice is refused rather than silently resolved: both name where the read
+	// starts, and a caller who wrote both is not describing a position.
+	if stmt.FlagState("cursor") != directive.FlagAbsent && stmt.FlagState("offset") != directive.FlagAbsent {
+		return badRequest(stmt, "`--cursor` and `--offset` name the same byte position; pass one of them.")
+	}
 	if slot, bad := numericFlags(args, stmt,
 		[2]string{"cursor", "offset"},
+		[2]string{"offset", "offset"},
 		[2]string{"from-line", "from_line"},
 		[2]string{"tail", "tail_lines"},
 	); bad {
@@ -763,7 +857,13 @@ func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement,
 	if boolFlag(stmt, "raw") {
 		args["strip_ansi"] = false
 	}
-	return s.readSlot(ctx, stmt, win, args)
+	// THE SESSION'S ENCODING, when the caller knows it. A terminal is not a UTF-8
+	// device: a zh-CN Windows console writes GBK, so without this the reply was a
+	// refusal the caller could not act on (issue #149).
+	if v, ok := stmt.Flag("encoding"); ok {
+		args["charset"] = v
+	}
+	return s.readSlot(ctx, stmt, win, args, 0)
 }
 
 // readSlotAfter reads the window a command produced, starting where it was
@@ -781,7 +881,7 @@ func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement,
 // `timeout` bounds both and defaults to two seconds.
 func (s *Server) readSlotAfter(ctx context.Context, stmt directive.Statement, win termArgs, start int64) envelope.Slot {
 	args := argsOf("shell_id", stmt.Target, "offset", float64(start))
-	// A byte limit of 0 means "hand back the handle, consume nothing": the
+	// A byte limit of 0 means "hand back the channel, consume nothing": the
 	// directive must not even read, or a JSON-RPC frame destined for `mcp recv`
 	// would be eaten by the envelope.
 	if win.BytesLimit == 0 {
@@ -790,12 +890,89 @@ func (s *Server) readSlotAfter(ctx context.Context, stmt directive.Statement, wi
 			Headers: map[string]string{"Path": stmt.Path, "Content-Range": envelope.UnsatisfiedRange(start)},
 		}
 	}
+	waitStarted := time.Now()
+	// windowExpired is a FACT the wait already computed and then threw away: a pty has
+	// no completion signal, so "the window ran out while bytes were still arriving" is
+	// the closest thing to "this command is still running" the server can honestly say —
+	// and without it the caller cannot tell a finished command from a window that ended
+	// (issue #161, P1-3).
+	windowExpired := false
 	if wait := s.completionWait(stmt.Target); wait {
 		s.awaitExit(ctx, stmt.Target, win)
 	} else if s.ptyRunning(stmt.Target) {
-		s.awaitWindow(ctx, win)
+		windowExpired = s.awaitWindow(ctx, stmt.Target, win, start)
 	}
-	return s.readSlot(ctx, stmt, win, args)
+	slot := s.readSlot(ctx, stmt, win, args, time.Since(waitStarted))
+	if windowExpired && slot.Code < 400 && s.ptyRunning(stmt.Target) && slot.Headers["Still-Running"] == "" {
+		// Same header the pipe path uses, same meaning: the command was accepted and has
+		// not finished. It is set only when the window expired, so it does not become the
+		// permanently-true flag that kept it off the pty path in the first place.
+		if slot.Headers == nil {
+			slot.Headers = map[string]string{}
+		}
+		slot.Headers["Still-Running"] = "true"
+	}
+	// A WINDOW I SHOWED IS A WINDOW I READ. The read above is positional (it names an
+	// offset), and a positional read moves no cursor — so `read <channel>`'s documented
+	// default, "the new bytes since the last read", was false for the flow callers
+	// actually use: after three `run`s the first plain read replayed the channel from
+	// byte zero (issue #162, S2). The caller had seen those bytes; the cursor had not.
+	//
+	// Only when bytes were actually handed over: `fold` and `bytes_limit: 0` reply
+	// without showing anything, and advancing past bytes the caller never saw would
+	// turn a withheld window into a skipped one.
+	if slot.Code < 400 && slot.Body != "" {
+		if end, ok := envelope.RangeEnd(slot.Headers["Content-Range"]); ok {
+			if cs, bad := s.requireShell(stmt.Target); bad == nil {
+				cs.AdvanceDefaultReader(end)
+			}
+		}
+	}
+	return slot
+}
+
+// humanTyped reports whether bytes entered this channel through the non-MCP entrance
+// since start.
+//
+// THIS IS THE ONE FACT ABOUT "WHO IS ON THE OTHER END" THAT TERMCP ACTUALLY HAS.
+// The tempting question — "is something in the foreground waiting for input?" — cannot
+// be answered from here (the process group lives on the far side of the SSH connection,
+// and a Windows terminal has no such notion), and guessing it from the byte stream is
+// impossible: a program blocked at a prompt and a finished command are byte-identical.
+//
+// But the transcript already records who typed. Every input span carries a status —
+// `i` the HTTP/WebSocket surface, `a` an agent through MCP — because the log has to be
+// replayable and auditable. So "someone else is writing here" is a recorded fact, not an
+// inference, and a caller about to type into a shared channel deserves to know first.
+//
+// The value reported is therefore the entrance (`api`), not a guess about who is behind
+// it: a browser and a script driving /api/term are the same status in the log, and
+// claiming "human" for both would be wrong for one of them.
+//
+// The question asked is "at or after the start of this window", and the answer comes from
+// the store's sparse seek table (MarksWindow) rather than the whole index: a reader that
+// needs one screen of a long log should not pay for the log.
+func (s *Server) humanTyped(handle string, start, end int64) bool {
+	cs, bad := s.requireShell(handle)
+	if bad != nil {
+		return false
+	}
+	if end < start {
+		end = start
+	}
+	marks, _, err := s.sessMgr.MarksWindow(cs.ParentSessionID(), cs.ID, start, end)
+	if err != nil {
+		return false
+	}
+	for _, m := range marks {
+		if m.Offset < start {
+			continue
+		}
+		if m.Status == api.LogAPIInput {
+			return true
+		}
+	}
+	return false
 }
 
 // ptyRunning reports whether the handle is a live pty channel. The handle may
@@ -810,19 +987,94 @@ func (s *Server) ptyRunning(handle string) bool {
 	return info.Mode == api.ModePTY && info.Status == api.SessionRunning
 }
 
-// awaitWindow waits out the caller's time window. A pty has no completion
-// signal, so the window is sampled rather than ended early; timeout=0 means a
-// snapshot, not a wait.
-func (s *Server) awaitWindow(ctx context.Context, win termArgs) {
+// ptyQuiet is how long a pty's stream must stand still before a wait calls the
+// command done.
+//
+// MEASURED, NOT GUESSED. One `echo` on a PowerShell with an oh-my-posh profile
+// arrives as five chunks spread over 1.1s: the echo of the typed line at 120ms,
+// a first repaint at 510ms, the command's own output at 940ms. The gaps between
+// chunks reach 430ms, so a shorter grace ends the wait on the echo alone and the
+// reply looks like a command that printed nothing. 500ms covers the widest gap
+// this shell showed and still ends a fast command in about a quarter of the 2s
+// window a caller typically passes.
+const ptyQuiet = 500 * time.Millisecond
+
+// ptyPoll is how often the wait asks the stream how long it is. The wait is a
+// poll rather than a subscribe because the length is already tracked per channel
+// and asking for it is cheaper than registering a second reader that would then
+// swallow bytes meant for `read`.
+const ptyPoll = 20 * time.Millisecond
+
+// awaitWindow waits out a pty command, bounded by the caller's time window.
+//
+// A PTY HAS NO COMPLETION SIGNAL, so the wait used to be a blind sleep of the
+// whole window: `run` on a 20s window took 20s on a command that finished in one,
+// and the reply said nothing about how long the command itself took. The window
+// is the caller's budget, not the command's duration, so the wait now watches the
+// stream: it ends when the stream has stood still for ptyQuiet, and only falls
+// back to the window when there is nothing to watch (a command that has printed
+// nothing yet has no other signal). timeout=0 stays a snapshot, not a wait.
+//
+// The cost of the trade: a command that thinks silently for longer than ptyQuiet
+// after printing comes back with what it printed so far, and the caller reads on.
+// That is the same contract a terminal has — you cannot tell "done" from "quiet"
+// either — and it is the one direction the old blind sleep got wrong.
+//
+// IT RETURNS WHICH OF THE TWO HAPPENED, because the caller can act on the difference:
+// the window running out means the command has not finished, which is a fact worth a
+// header. Ending on quiet means the command stopped talking, which is as close to "done"
+// as a terminal ever gets.
+func (s *Server) awaitWindow(ctx context.Context, handle string, win termArgs, start int64) (windowExpired bool) {
 	limit := time.Duration(win.TimeoutSeconds * float64(time.Second))
 	if limit <= 0 {
-		return
+		return false
 	}
-	timer := time.NewTimer(limit)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
+	deadline := time.Now().Add(limit)
+	last := start
+	var still time.Time
+	ticker := time.NewTicker(ptyPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+		now, ok := s.outputSizeFor(handle)
+		if !ok {
+			// The channel went away under the wait; the read that follows reports it
+			// in the caller's own vocabulary instead of "nothing arrived".
+			return false
+		}
+		switch {
+		case now != last:
+			last, still = now, time.Time{}
+			// THE REPLY CANNOT GROW, SO WAITING BUYS NOTHING.
+			//
+			// The space window is a limit on how much enters the caller's context, so once
+			// the byte window is full every further byte is discarded: the wait would sit
+			// there for the rest of the window to collect output the reply cannot carry.
+			// A noisy command (a scan, a brute force) never goes quiet, so this was the
+			// only thing that could end the wait early — the reporting caller's 320s
+			// window over a command that filled the reply in its first second is exactly
+			// this case (issue #161, P1-3).
+			if win.BytesLimit > 0 && now-start >= int64(win.BytesLimit) {
+				return true
+			}
+		case now <= start:
+			// Nothing has been said yet. Silence before the first byte is not
+			// completion, it is a command that has not started talking; only the
+			// window can end this wait.
+		default:
+			if still.IsZero() {
+				still = time.Now()
+			} else if time.Since(still) >= ptyQuiet {
+				return false
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return true
+		}
 	}
 }
 
@@ -877,14 +1129,24 @@ func (s *Server) awaitExit(ctx context.Context, handle string, win termArgs) {
 
 // readSlot performs one read and renders it. This is where the three axes are
 // applied for every directive that returns bytes.
-func (s *Server) readSlot(ctx context.Context, stmt directive.Statement, win termArgs, args map[string]any) envelope.Slot {
+//
+// `waited` IS HOW MUCH OF THE CALLER'S WINDOW IS ALREADY SPENT. The wait before this
+// read (awaitWindow / awaitExit) burns the caller's budget, and the read that follows
+// then passed the FULL timeout again — so a `run` with timeout=60 could block for 120
+// seconds, and the second half of that was invisible in the reply. The window is one
+// budget, not two: the read gets what is left.
+//
+// That is also what makes `timeout` mean one thing. `readTimeout` capped a plain read at
+// 60 and left `run` uncapped, so the same parameter bounded two directives differently
+// and nothing in the reply said which had happened (issue #161, P1-3).
+func (s *Server) readSlot(ctx context.Context, stmt directive.Statement, win termArgs, args map[string]any, waited time.Duration) envelope.Slot {
 	started := time.Now()
 	args["max_bytes"] = float64(win.BytesLimit)
 	args["max_lines"] = float64(win.LinesLimit)
 	// A pipe channel that has not exited yet must not block for the whole timeout
 	// on a read that has nothing new; a pty read waits for the quiet window
 	// instead. Both are upper bounds, so the smaller of the two wins.
-	args["timeout"] = readTimeout(win)
+	args["timeout"] = readTimeout(remaining(win, waited))
 
 	res, fail := s.callTool(ctx, "shell_output", args)
 	if fail != nil {
@@ -894,7 +1156,28 @@ func (s *Server) readSlot(ctx context.Context, stmt directive.Statement, win ter
 	if !ok {
 		return s.slotFromFailure(ctx, stmt, &toolFailure{code: CodeOperationFailed, msg: toolResultText(res)})
 	}
-	return s.windowSlot(stmt, win, doc, time.Since(started))
+	// WAITED IS THE WHOLE CALL, not just this read.
+	//
+	// The header exists to tell "I waited and heard nothing" from "I did not wait" —
+	// the distinction that keeps an empty reply from looking like a broken channel. It
+	// was measured from the READ, so the wait before it (where the window is actually
+	// spent) was missing: a call that sat on a 1s window answered `Waited: 0ms`, and the
+	// reporting caller read that as "the window never happened" (issue #161, P1-3).
+	return s.windowSlot(stmt, win, doc, waited+time.Since(started))
+}
+
+// remaining is the part of the caller's window that the wait did not spend.
+//
+// A negative or zero remainder is zero: the wait already used the budget, so the read
+// that follows must not block at all. That is the difference between "the window ended"
+// and "the window ended, and then we waited again".
+func remaining(win termArgs, waited time.Duration) termArgs {
+	left := win.TimeoutSeconds - waited.Seconds()
+	if left < 0 {
+		left = 0
+	}
+	win.TimeoutSeconds = left
+	return win
 }
 
 // windowSlot renders a shell_output document as an envelope slot.
@@ -908,6 +1191,82 @@ func (s *Server) windowSlot(stmt directive.Statement, win termArgs, doc map[stri
 	total := int64(getFloatAny(doc, "total_bytes", 0))
 	body := getString(doc, "output", "")
 	headers := map[string]string{"Path": stmt.Path}
+
+	// A WINDOW THAT ROLLED BACK SAYS SO.
+	//
+	// The rule is that a window never ends inside a character, so the bytes that would
+	// have been cut are withheld and the next read delivers them whole. That is lossless
+	// and the Content-Range already says where the window stopped — but "I got fewer
+	// bytes than bytes_limit" and "a character straddled the end" are the same bytes on
+	// the wire, and a caller paging by its own arithmetic (offset += bytes_limit) would
+	// skip the withheld bytes and then land INSIDE a character on the next read, where
+	// the reply is a 400 naming a charset the session does not write. One header turns
+	// that into a fact the caller can act on.
+	if n := int64(getFloatAny(doc, "trimmed_bytes", 0)); n > 0 {
+		// TWO CASES, because the remedy differs and only one of them has one.
+		//
+		// Mid-stream, the withheld bytes are simply early: the next read starts at them
+		// and gets them whole. At the END of the stream there is no next read that can
+		// complete them — they are a fragment of a character that the writer never
+		// finished — so promising "read --cursor A continues there" would send the caller
+		// into a loop that returns nothing forever. Say which one it is.
+		//
+		// Both are said in terms of the CHARSET, because that is what decided the cut:
+		// the boundary came from the encoding, not from the size limit the caller passed.
+		if end+n >= total {
+			headers["Trimmed"] = fmt.Sprintf("bytes %d-%d withheld: they are the end of the stream and do not form a character in this encoding, so no read returns them as text",
+				end, end+n-1)
+		} else {
+			headers["Trimmed"] = fmt.Sprintf("bytes %d-%d withheld: the window end fell inside a character in this encoding; read --cursor %d continues there",
+				end, end+n-1, end)
+		}
+	}
+
+	// A FILTERED READ SAYS WHAT IT PASSED OVER.
+	//
+	// `--stream o` answers "stdout only" by selecting a subset of the span the window
+	// covers, and the span still runs to End — the cursor has to move by the range, or a
+	// poll loop would re-read the same bytes forever. So the bytes of the other stream
+	// leave the caller's cursor without ever being shown, and nothing used to say so.
+	// The worst case was not a partial body: `--stream e` on a stdout-only channel
+	// answered 200 with an EMPTY body and `Content-Range: bytes 0-7/8` — "eight bytes
+	// here" and zero delivered — and the plain read that followed returned 204, so eight
+	// bytes of output were consumed by a reply that displayed nothing at all.
+	//
+	// The count and the flag that shows them turn that into a fact the caller can act on.
+	// It is deliberately NOT a refusal and NOT a rewind: the caller asked for a view, and
+	// the bytes are still in the channel for whoever asks for the other view.
+	if n := int64(getFloatAny(doc, "stream_omitted_bytes", 0)); n > 0 {
+		// The stream is a flag on the statement, not a window parameter: the filter runs
+		// inside the read, and only the statement knows which side was asked for.
+		want, _ := stmt.Flag("stream")
+		other := "e"
+		if want == "e" {
+			other = "o"
+		}
+		headers["Omitted"] = fmt.Sprintf("%d bytes in this range are not in stream %s and went past unseen; read --stream %s (or --stream all) shows them, and --offset reaches back",
+			n, want, other)
+	}
+
+	// WHO ELSE IS TYPING. The reply can say that a person wrote into this channel,
+	// because the transcript records the source of every input span (`i` human through
+	// the HTTP/WebSocket surface, `a` an agent through MCP) — the log has to be
+	// replayable, so the attribution is a recorded fact rather than an inference. It is
+	// the one part of "this channel's state is not mine alone" that termcp can prove: a
+	// program blocked at a prompt and a finished command are byte-identical, so the
+	// foreground question is unanswerable here, but "a human typed" is in the index.
+	//
+	// Only when it is at or after this window's start: a person who typed before the
+	// bytes being shown is history the caller has already accounted for.
+	if s.humanTyped(stmt.Target, start, total) {
+		// "api", NOT "human". The transcript records which ENTRANCE the bytes came
+		// through (`i` the HTTP/WebSocket surface, `a` MCP), and the HTTP surface is used
+		// by a person in a browser AND by any script that drives /api/term directly. An
+		// agent calling the REST entrance was being told "a human typed" about its own
+		// command — the header has to name the fact termcp holds, not the one it is
+		// guessing at.
+		headers["Typed-By"] = "api"
+	}
 
 	// THE HANDLER ALREADY APPLIED THE LIMITS, so this pass must decide from
 	// has_more, not from the body's size.
@@ -969,6 +1328,21 @@ func (s *Server) windowSlot(stmt directive.Statement, win termArgs, doc map[stri
 	// the output speaks for itself, and on pipe the exit state is observable.
 	if waited > 0 {
 		headers["Waited"] = fmt.Sprintf("%dms", waited.Milliseconds())
+	}
+	// A 204 WITH NO WAIT IS THE ONE REPLY THAT LOOKS LIKE A BUG.
+	//
+	// An empty read of a live shell is legitimate — the command may simply not have
+	// printed yet — but `Waited: 0ms` says that in a technical voice, in the header
+	// block a caller skims last. The reported reaction was to suspect the input had
+	// been dropped and spend a call proving it had not. Naming the flag is what turns
+	// that into an obvious next move.
+	//
+	// A HEADER, not a body sentence: this reply is a 204, and 204 must not carry a
+	// body — the REST entrance would drop it and only MCP would show the hint, which
+	// is the silent divergence between the two entrances this repo keeps paying for.
+	// It appears only on the empty-and-unwaited case, so a read with output never pays.
+	if code == 204 && waited == 0 && s.ptyRunning(stmt.Target) {
+		headers["Hint"] = "nothing yet — a pty is still running. Pass timeout=<ms> to wait for output"
 	}
 	if code == 204 && s.ptyRunning(stmt.Target) {
 		headers["Sampled"] = "true"
@@ -1127,14 +1501,18 @@ func foldOrTruncateLines(body string, limit int, policy string) string {
 	return b.String()
 }
 
-// readTimeout is the blocking wait a read gets: the caller's timeout, capped so a
-// non-blocking read (timeout 0) really is non-blocking.
+// readTimeout is the blocking wait a read gets.
+//
+// IT USED TO CAP AT 60 SILENTLY, which made one parameter mean two things: `run` waited
+// the caller's full window and `read` waited at most a minute, with nothing in the reply
+// saying which bound had applied (issue #161, P1-3). The cap is gone: the budget passed
+// here is already what is LEFT of the caller's window (see readSlot), so the number is
+// the caller's own and no second, hidden one is needed.
+//
+// Zero stays zero: a non-blocking read really is non-blocking.
 func readTimeout(win termArgs) float64 {
 	if win.TimeoutSeconds <= 0 {
 		return 0
-	}
-	if win.TimeoutSeconds > 60 {
-		return 60
 	}
 	return win.TimeoutSeconds
 }
@@ -1505,6 +1883,17 @@ func (s *Server) peerChannel(ctx context.Context, stmt directive.Statement, win 
 		h = found
 	}
 
+	// THE WINDOW IS THIS SIDE'S OWN DEADLINE (#158). Without it the only bound on a
+	// peer call is the caller's context, which belongs to a host watchdog this daemon
+	// cannot see — so a peer that never answers hangs until the host kills the turn,
+	// and what the caller reads is a watchdog abort rather than "the peer is not
+	// answering". A waiter gets the caller's window, or 15s when none was asked for.
+	callCtx, stopCall := ctx, context.CancelFunc(func() {})
+	if sub == "call" || sub == "recv" {
+		callCtx, stopCall = context.WithTimeout(ctx, peerCallWindow(win))
+		defer stopCall()
+	}
+
 	// A BROWSER SESSION IS NOT A CHANNEL: the frame is written by the caller, and the
 	// one thing this layer adds is the sessionId. Everything else (the method table,
 	// the parameters) stays the caller's, which is why there is no CDP command enum
@@ -1515,14 +1904,14 @@ func (s *Server) peerChannel(ctx context.Context, stmt directive.Statement, win 
 			return []envelope.Slot{*bad}
 		}
 		if sub == "send" || boolFlag(stmt, "send") {
-			return []envelope.Slot{s.cdpSend(ctx, stmt, h, index, f)}
+			return []envelope.Slot{s.cdpSend(callCtx, stmt, h, index, f)}
 		}
-		return []envelope.Slot{s.cdpCall(ctx, stmt, h, index, f)}
+		return []envelope.Slot{namePeerTimeout(callCtx, s.cdpCall(callCtx, stmt, h, index, f))}
 	}
 	addr := peerKey(h.sessionID, h.kind, h.index)
 	out := stmt
 	out.Op = h.kind
-	return []envelope.Slot{s.jrpcChannel(ctx, out, win, h.kind, sub, []string{addr, frame})}
+	return []envelope.Slot{namePeerTimeout(callCtx, s.jrpcChannel(callCtx, out, win, h.kind, sub, []string{addr, frame}))}
 }
 
 // openPeer opens a peer through a session and returns the handle.
@@ -1539,6 +1928,15 @@ func (s *Server) openPeer(ctx context.Context, stmt directive.Statement, win ter
 // it goes, and this translates it into the action the collection's handler expects.
 func (s *Server) directiveLS(ctx context.Context, stmt directive.Statement, win termArgs) []envelope.Slot {
 	switch stmt.Kind {
+	case "task":
+		// TASKS ARE NOT A SESSION'S COLLECTION. A transfer belongs to the process, not
+		// to a session handle, so `ls task` takes no target — the same shape as
+		// `ls host`.
+		if stmt.Key != "" {
+			return []envelope.Slot{badRequest(stmt, "`ls task` lists every transfer; for one of them use `get task "+
+				stmt.Key+"` (pass a `timeout` on the call and it waits).")}
+		}
+		return []envelope.Slot{s.directiveLsTask(stmt)}
 	case "host":
 		// A NAME HERE WOULD BE SILENTLY DROPPED: the handler lists every entry, so
 		// `ls host prod` answered the whole table and the caller believed it had been
@@ -1549,6 +1947,13 @@ func (s *Server) directiveLS(ctx context.Context, stmt directive.Statement, win 
 		}
 		return []envelope.Slot{s.directiveHost(ctx, withFlags(stmt, map[string]string{"action": "list"}), win)}
 	case "ext":
+		// A NAME HERE WOULD BE SILENTLY DROPPED, exactly as it was on `ls host` and
+		// `ls <session> forward`. `ls ext evrything` answered the whole list, so a
+		// caller checking that an extension exists read fourteen rows as confirmation.
+		if stmt.Key != "" {
+			return []envelope.Slot{badRequest(stmt, "`ls` lists every extension; for one of them use `get ext "+
+				stmt.Key+"`.")}
+		}
 		return []envelope.Slot{s.directiveExtension(ctx, withFlags(stmt, map[string]string{"action": "list"}), win)}
 	case "alias":
 		return []envelope.Slot{s.directiveAlias(ctx, stmt, win)}
@@ -1603,6 +2008,18 @@ func (s *Server) directiveLS(ctx context.Context, stmt directive.Statement, win 
 	// `ls <session>`: that link's channels. directivePS lists everything, so the
 	// statement is narrowed by pointing the handler at one session through --all and
 	// filtering in psOne; see directivePS for the filter.
+	//
+	// A CHANNEL ADDRESS IS NOT A COLLECTION, AND IT USED TO BE ANSWERED AS ONE
+	// (issue #148). The parser folds `ls s1 5` into the address `s1:5`, so the index
+	// arrives on the target rather than in Key. Dropped here, `ls s1 5` answered the
+	// whole listing — or, on a session with no live channels, the global "(nothing is
+	// running)", which is a sentence about a different collection. A caller using a
+	// stale index to ask "is my channel up" read that as "the session is dead".
+	if idx := locator.SplitHandle(stmt.Target).Index; idx > 0 {
+		sid := locator.SplitHandle(stmt.Target).SessionID
+		return []envelope.Slot{badRequest(stmt, "`ls "+sid+"` lists every channel; for one of them "+
+			"use `get "+sid+":"+strconv.Itoa(idx)+"`.")}
+	}
 	return []envelope.Slot{s.directivePS(ctx, withFlags(stmt, map[string]string{
 		"shells": "true", "only-session": stmt.Target, "all": "true",
 	}), win)}
@@ -1719,4 +2136,137 @@ func (s *Server) listPeers(stmt directive.Statement) envelope.Slot {
 		b.WriteString("\n")
 	}
 	return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: b.String()}
+}
+
+// --- task: the receipt side of an asynchronous transfer (#158) ---
+
+// directiveGetTask answers `get task <id>`, waiting out the caller's window.
+//
+// THE WINDOW IS THE WAIT, exactly as it is for a pty read: the reply comes back the
+// instant the transfer finishes, and one that does not finish inside the window
+// answers with its progress rather than an error. That is the whole point of a
+// receipt — the caller decides how long to wait, not a watchdog it cannot see.
+func (s *Server) directiveGetTask(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+	id := strings.TrimSpace(stmt.Key)
+	if id == "" {
+		id = strings.TrimSpace(stmt.Target)
+	}
+	if id == "" {
+		return badRequest(stmt, "get task needs the id from the receipt: get task task_abc123")
+	}
+	timeout := time.Duration(win.TimeoutSeconds * float64(time.Second))
+	v, err := s.tasks.Await(ctx, id, timeout)
+	if err != nil {
+		return notFoundSlot(stmt, CodeInvalidArgument, err.Error()+
+			"\nA receipt is answerable for ten minutes after the transfer ends; `ls task` lists the live ones.")
+	}
+	code := 200
+	if v.Status == task.Failed {
+		code = 500
+	}
+	return envelope.Slot{Code: code, Headers: map[string]string{
+		"Path": stmt.Path, "Task": v.ID, "Status": string(v.Status),
+	}, Body: renderTask(v)}
+}
+
+// directiveLsTask answers `ls task`: every transfer this process knows about.
+func (s *Server) directiveLsTask(stmt directive.Statement) envelope.Slot {
+	list := s.tasks.List()
+	if len(list) == 0 {
+		return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path},
+			Body: "no transfers. A `write <session> file <path> --local-path <file>` starts one and answers with a task id."}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d task(s):\n", len(list))
+	for _, v := range list {
+		fmt.Fprintf(&b, "  %-16s %-9s %-9s %s\n", v.ID, v.Kind, v.Status, taskProgress(v))
+	}
+	b.WriteString("\n`get task <id>` waits for one; `close task <id>` cancels it.")
+	return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: b.String()}
+}
+
+// directiveCloseTask answers `close task <id>`: cancel the transfer, do not delete
+// the receipt.
+func (s *Server) directiveCloseTask(ctx context.Context, stmt directive.Statement) envelope.Slot {
+	id := strings.TrimSpace(stmt.Key)
+	if id == "" {
+		id = strings.TrimSpace(stmt.Target)
+	}
+	if id == "" {
+		return badRequest(stmt, "close task needs the id: close task task_abc123")
+	}
+	stopped, err := s.tasks.Cancel(id)
+	if err != nil {
+		return notFoundSlot(stmt, CodeInvalidArgument, err.Error()+"\n`ls task` lists the live ones.")
+	}
+	v, gerr := s.tasks.Get(id)
+	if gerr != nil {
+		return notFoundSlot(stmt, CodeInvalidArgument, gerr.Error())
+	}
+	if !stopped {
+		// Already finished: the caller asked to stop something that is not running, and
+		// the honest answer names the state it is in instead of pretending to cancel.
+		return envelope.Slot{Code: 409, Headers: map[string]string{"Path": stmt.Path, "Task": id},
+			Body: "nothing to cancel: " + id + " is already " + string(v.Status) + "\n" + renderTask(v)}
+	}
+	return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path, "Task": id, "Status": "cancelled"},
+		Body: "cancelled " + id + "; the partial file was removed at both ends\n" + renderTask(v)}
+}
+
+// renderTask is the one shape every task reply uses.
+func renderTask(v task.View) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Task:     %s\n", v.ID)
+	fmt.Fprintf(&b, "Kind:     %s\n", v.Kind)
+	fmt.Fprintf(&b, "Status:   %s\n", v.Status)
+	fmt.Fprintf(&b, "Progress: %s\n", taskProgress(v))
+	if rate := v.Rate(); rate > 0 {
+		fmt.Fprintf(&b, "Rate:     %s/s\n", humanBytes(rate))
+	}
+	fmt.Fprintf(&b, "Path:     %s -> %s\n", v.LocalPath, v.Path)
+	if v.Error != "" {
+		fmt.Fprintf(&b, "Error:    %s\n", v.Error)
+	}
+	return b.String()
+}
+
+// taskProgress renders "done/total (pct)" without inventing a total.
+func taskProgress(v task.View) string {
+	if v.BytesTotal <= 0 {
+		return humanBytes(v.BytesDone) + " (total unknown)"
+	}
+	return fmt.Sprintf("%s/%s (%d%%)", humanBytes(v.BytesDone), humanBytes(v.BytesTotal), v.Percent())
+}
+
+// peerCallWindow chooses the deadline for a peer call.
+//
+// Defaults to 15s: short enough that a 30s host watchdog never kills the call
+// from outside, long enough for any ordinary peer operation (a CDP evaluate, an
+// MCP tool list).
+//
+// IT HAS TO ASK WHETHER THE CALLER SPOKE, not what the value came out as. `timeout` has a
+// default of its own (2s, the read window), so `win.TimeoutSeconds` is never zero and the
+// 15s branch below was unreachable from the term door: every peer call was bounded by 2
+// seconds, which a cold tunnel through the internal SSH server can exceed — CI caught it
+// as a 504 on an ordinary LSP frame. An explicit `timeout` still wins, including one
+// shorter than the default; an explicit 0 means "do not wait", which is not a deadline a
+// request/response call can use, so it falls back to the peer default.
+const defaultPeerWindow = 15 * time.Second
+
+func peerCallWindow(win termArgs) time.Duration {
+	if win.TimeoutSet && win.TimeoutSeconds > 0 {
+		return time.Duration(win.TimeoutSeconds * float64(time.Second))
+	}
+	return defaultPeerWindow
+}
+
+// namePeerTimeout turns a deadline expiry into a 504 that names the peer.
+func namePeerTimeout(ctx context.Context, slot envelope.Slot) envelope.Slot {
+	if ctx.Err() == context.DeadlineExceeded && (slot.Code == 500 || slot.Code == 0) {
+		slot.Code = 504
+		slot.Headers["Error-Code"] = "peer_timeout"
+		slot.Body = "the peer did not answer within the window. `call` waited its full budget; " +
+			"give the call a larger `timeout` if this method needs longer, or use `--send` for fire-and-forget."
+	}
+	return slot
 }

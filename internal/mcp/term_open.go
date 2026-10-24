@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/directive"
 	"github.com/open-mcp-ai/termcp/internal/envelope"
+	"github.com/open-mcp-ai/termcp/internal/transcript"
 )
 
 // pipe and pty — the two primitives, as directives.
@@ -107,8 +109,67 @@ func (s *Server) directiveOpen(ctx context.Context, stmt directive.Statement, wi
 	headers := map[string]string{"Path": stmt.Path}
 	// The handle is NEWS here — the whole reason this call exists — so it is the
 	// one reply that always carries it.
-	headers["Handle"] = shortHandle(doc)
+	handle := shortHandle(doc)
+	headers["Handle"] = handle
+	// A PTY SHELL EXISTS BEFORE IT IS READY, AND TYPING INTO IT BEFORE THEN IS LOST
+	// (issue #156). The handle is created as soon as the process is; the line editor
+	// inside it — PSReadLine, readline, zle — is still starting up, and input that
+	// arrives before it takes over the terminal is DISCARDED rather than buffered.
+	// Nothing reports that: `run` answers 200 and the command simply never happens, on
+	// every channel of that session, forever.
+	//
+	// So a pty open waits for the shell to speak before answering, and the wait is a bound
+	// rather than a claim: a shell that never prints anything (an empty PS1) is handed
+	// over when the budget runs out, because a silent shell is not a broken one.
+	//
+	// WAITING FOR THE SHELL TO GO QUIET WAS TRIED AND REJECTED. It reads like the better
+	// signal — a shell that has stopped talking has finished its startup files — and it
+	// is not: measured on a themed PowerShell, startup pauses for longer than any quiet
+	// threshold short enough to afford (a second wait after the open returned still found
+	// the shell talking, 505ms later), while every open paid 1.8s instead of 0.1s. It made
+	// the terminal slower for everyone and left the same gap, so the honest state is that
+	// this is a heuristic with a ceiling — see issue #162, S1, which is the part a human
+	// has to decide: the only reliable readiness probe is a round trip, and a round trip
+	// writes a line into the caller's transcript.
+	//
+	// PIPE opens do not wait: their bytes go into the process's own stdin, which the OS
+	// buffers, and `--argv sleep 30` prints nothing for thirty seconds by design.
+	if mode == "pty" {
+		s.awaitShellReady(ctx, handle, shellReadyBudget)
+	}
 	return []envelope.Slot{{Code: 200, Headers: headers, Body: createdBody(doc, mode)}}
+}
+
+// shellReadyBudget bounds how long an open waits for the shell to say something.
+//
+// Generous enough for a profile that draws a prompt (a themed PowerShell on a cold
+// machine is the slow case observed), short enough that a caller notices nothing when the
+// shell is silent.
+const shellReadyBudget = 3 * time.Second
+
+// awaitShellReady waits until the channel has produced its first byte, or the budget runs
+// out. It returns whether the shell spoke, which the caller currently ignores: the handle
+// is worth handing over either way, and a shell too slow to answer inside the budget is
+// still the caller's shell.
+func (s *Server) awaitShellReady(ctx context.Context, handle string, budget time.Duration) bool {
+	src, err := transcript.Resolve(s.sessMgr, s.msgMgr, handle)
+	if err != nil || src.Live == nil {
+		return false
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		if src.Live.BufferLen() > 0 {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+		// TEN MILLISECONDS is a compromise on purpose: `ReadTerminalStream` would block
+		// until the bytes arrive, but it reads through a registered reader cursor, and
+		// creating one here would be state that exists for a wait. Polling a counter has
+		// no such cost, and the counter is the same number `Content-Range` reports.
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // createdBody renders the two facts a caller needs about a new channel: its
@@ -117,10 +178,19 @@ func (s *Server) directiveOpen(ctx context.Context, stmt directive.Statement, wi
 // reading a stream that never separates them.
 func createdBody(doc map[string]any, mode string) string {
 	handle := shortHandle(doc)
-	if mode == "pty" {
-		return fmt.Sprintf("%s pty\n", handle)
+	// THE HANDLE IS TWO ADDRESSES IN ONE WORD, and the first reply is where that has
+	// to be said: `a1f3:1` looks like one opaque id, so a caller carries it into
+	// every command — until a verb wants the session (`rm` deletes a session, not a
+	// channel) and answers "that is a channel". Spelling the parts once, here, is
+	// what makes the difference visible at the moment the word is new.
+	split := ""
+	if i := strings.LastIndex(handle, ":"); i > 0 {
+		split = fmt.Sprintf(" (session %s, channel %s)", handle[:i], handle[i+1:])
 	}
-	return fmt.Sprintf("%s pipe (stderr separable: --stream e)\n", handle)
+	if mode == "pty" {
+		return fmt.Sprintf("%s pty%s\n", handle, split)
+	}
+	return fmt.Sprintf("%s pipe (stderr separable: --stream e)%s\n", handle, split)
 }
 
 // shortHandle renders `<session>:N` from a handler reply.

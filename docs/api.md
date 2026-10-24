@@ -3,7 +3,7 @@
 Base URL: `http://localhost:18765`
 
 **Read this only if you are building on the transport.** If you are an agent
-driving Termcp, you need one endpoint — `POST /api/term` (§16) — or the MCP
+driving Termcp, you need one endpoint — `POST /api/term` (§15) — or the MCP
 `term` tool, and the command language announces itself: `{"cmd":""}` returns the
 guide, `{"cmd":"help"}` every directive, `{"cmd":"help <directive>"}` one
 directive's shape and traps. Those replies are generated from the same table the
@@ -415,7 +415,7 @@ session belongs to, so a renamed session keeps its lamp.
 A record may also carry `namespace` (absent on ordinary sessions). It marks a
 session a subsystem owns rather than one a caller asked for: the extension layer
 keeps one connection per host and serves its extensions through channels in it,
-so those sessions are reported in the extension column (section 15) instead of as
+so those sessions are reported in the extension column (section 14) instead of as
 session or archive cards. They are still addressable everywhere an id is
 accepted — an extension hands out `{session_id, shell_id}` — but they are not
 listed by the MCP `session_list`, and the Web UI hides their cards.
@@ -607,7 +607,7 @@ Bidirectional real-time channel.
 |------|--------|---------|
 | `watch_add` | `id` | Subscribe to terminal output |
 | `watch_remove` | `id` | Unsubscribe |
-| `input` | `id`, `d`(string), `nl` | Send keystrokes (dropped for a session in review mode — see §12) |
+| `input` | `id`, `d`(string), `nl` | Send keystrokes (dropped for a session in review mode — see §11) |
 | `resize` | `id`, `rows`, `cols` | Change PTY size |
 
 **Server → Client:**
@@ -618,7 +618,7 @@ Bidirectional real-time channel.
 | `terminal` | `id`, `d`(string) | Terminal output chunk |
 | `shell_activity` | `shell_id`, `src`(`api`\|`ai`), `submit` | A shell received input, and from where |
 | `ui_notify` | `title`, `message`, `level`, `session_id`, `duration_seconds` | User-facing notification (MCP `notify_user`) |
-| `approval` | session, request | Approval queue changed (see §12) |
+| `approval` | session, request | Approval queue changed (see §11) |
 
 The row↔byte mapping the timeline rail draws from is not carried on this frame:
 a mapping recorded as bytes arrive cannot survive a reload (one write delivers
@@ -900,7 +900,7 @@ Response 202:
 A command line is text plus the enter that ends it. `press_enter: true` ends it
 here, so the held text becomes one reviewable request immediately; with
 `press_enter: false` the text waits for a `/key` call. Nothing reaches the shell
-until a human accepts it (see §12).
+until a human accepts it (see §11).
 
 Errors: `404` unknown shell, `409` shell is not running, `400` malformed body.
 
@@ -1092,39 +1092,7 @@ Response 200: { "ok": true }
 
 ---
 
-## 11. Notification rules (shell_notify)
-
-Reverse-wake-up rules registered by the MCP `shell_notify` tool are listed and
-deleted here. The Web UI's Notifications tab reads the same source.
-
-### `GET /api/notifications`
-
-Lists all active notification rules.
-
-| Parameter | Type | Meaning |
-|-----------|------|---------|
-| `shell_id` | query | Optional filter by shell |
-| `session_id` | query | Optional filter by session |
-
-```
-Response 200:
-{ "notifications": [{ "rule_id": "notif_...", "session_id": "...", "shell_id": "...",
-                     "channel": "resource"|"sampling", "event": "output"|"exit"|"silence",
-                     "created_at": 1758499200123 }] }
-```
-
-### `DELETE /api/notifications/{id}`
-
-Unregisters one rule (`id` = `rule_id`).
-
-```
-Response 200: { "ok": true, "rule_id": "notif_..." }
-Response 404: { "error": "notification rule not found" }
-```
-
----
-
-## 12. Review mode
+## 11. Review mode
 
 A session can require **review** of everything the AI sends to its terminal.
 The switch is per-session and covers every shell channel in it.
@@ -1384,8 +1352,7 @@ A queued write answers `202 Accepted` with no id:
 
 The agent cannot decide the request, so an id would only invite a retry loop. It
 is told the write is waiting and continues; the shell's output afterwards shows
-whether the command ran. (An agent that wants to be woken when a decision lands
-can register `shell_notify`.)
+whether the command ran.
 
 ### `GET /api/sessions/{id}/approval`
 
@@ -1479,7 +1446,7 @@ Semantics:
 - `404` unknown id; `409` already decided or execution failed.
 
 > **What is approved.** The request records the *input string*, not a parsed
-> command. `type <handle> "rm -rf / ; ls"` is one request covering two commands.
+> command. `type <channel> "rm -rf / ; ls"` is one request covering two commands.
 > Splitting it would require shell parsing, which is not attempted.
 
 > **A dead session cancels what is pending.** A request whose session has gone
@@ -1501,15 +1468,9 @@ A rejected, expired, or cancelled request leaves the log at `q` — no bytes eve
 followed it, which is exactly what a replay should show. Input that passed a gate
 is distinguishable from input that never met one.
 
-### Waking a waiting agent
-
-An agent does not have to poll. Registering `shell_notify` on the shell makes the
-queue wake it when a decision lands, because an approval transition is delivered
-through the same `output` event path.
-
 ---
 
-## 13. Instance info
+## 12. Instance info
 
 ### `GET /api/version`
 
@@ -1656,7 +1617,7 @@ Only daemon instances accept the stop; a manually started instance is refused
 with `409` rather than being hunted down as a process. `termcp daemon stop`
 does exactly this over HTTP.
 
-## 14. Backward-compatible routes
+## 13. Backward-compatible routes
 
 Old routes still work and delegate to the new ones. New code should use the canonical
 paths above.
@@ -1678,7 +1639,7 @@ paths above.
 > `DELETE /api/sessions/{id}`. All three routes accept a comma-separated id
 > list (batch) and then answer 200 with per-id results — see section 6.
 
-## 15. Extensions
+## 14. Extensions
 
 An extension is a stored template for a session whose capabilities are trimmed to
 what the template's author decided (an MCP server over a pipe shell, a read-only
@@ -1702,7 +1663,7 @@ Response 200:
 }
 ```
 
-A row carries `session_id`/`shell_id` when the extension is available (the handles
+A row carries `session_id`/`shell_id` when the extension is available (the channels
 to drive it through), `forwards` with the address each declared tunnel bound, and
 `failure` + `next_retry_ms` when it is not. `status` is one of `available`,
 `probing`, `unavailable`, `disabled`.
@@ -1773,7 +1734,7 @@ already in use are renamed rather than overwritten — up to the first free
 Response 201: { "imported": 2, "renamed": [ { "from": "docs", "to": "docs-2" } ] }
 ```
 
-## 16. The term entrance
+## 15. The term entrance
 
 ### `POST /api/term`
 
@@ -1787,28 +1748,26 @@ send. The alternative was eight endpoints whose output cursor, stream filter and
 window semantics are all one directive's job here.
 
 ```
-Request:  { "cmd": "ps", "bytes_limit": 0 }
+Request:  { "cmd": "ls", "bytes_limit": 0 }
 
 Response 200:
 { "protocol": "TERM/1", "code": 200, "reason": "OK",
-  "Path": "ps", "body": "(nothing is running)\n" }
+  "Path": "ls", "body": "(nothing is running)\n" }
 ```
 
 <!-- BEGIN termdoc: args -->
 | `cmd` | Empty or omitted returns the guide (where am I, what can I do, what is here) — never an error. A `cmd` that is present but not a string is a 400: a command that was sent and did not survive the transport is not the same request as one never sent |
-| `timeout` | Seconds to wait (default 2; a pipe returns as soon as its process exits) |
-| `bytes_limit` | Max bytes per slot (default 8192; `0` = the handle only, no bytes) |
-| `lines_limit` | Max lines per slot (default 200; `0` = no line limit) |
-| `total_bytes_limit` | Absolute cap for the whole reply (default 32768) |
+| `timeout` | Seconds to look (default 2; a pipe returns as soon as its process exits). 60 is the wait to stay under, not a wall: a longer window is allowed, and the reply says how long it waited. An upper bound on waiting, not a completion wait |
+| `bytes_limit` | Bytes per slot (default 8192; `0` = the channel only, no bytes, otherwise at least 4 — a window narrower than one character cannot return one). 32768 is the size to stay under, not a wall: you are paying for the context, so a larger window is allowed and said so in the reply |
+| `lines_limit` | Lines per slot (default 200; `0` = no line limit). 2000 is the size to stay under, not a wall: a longer tail is allowed, and said so in the reply |
+| `total_bytes_limit` | Cap for the whole reply (default 32768). 32768 is the size to stay under, not a wall — this is YOUR budget for one reply, so set it as high as you are willing to read |
 | `on_time_overflow` | `truncate` (default) or `fold` (return no bytes this time) |
 | `on_bytes_overflow` | `truncate` (default) or `fold` (return no bytes this time) |
 | `on_lines_overflow` | `truncate` (default) or `fold` (return no bytes this time) |
-| `pipe_to` | A handle whose stdin receives this reply's bytes; they leave the body |
 | `learn_mode` | Attach each directive's usage line once per reply |
 | `structured_content` | Also send the JSON projection as `structuredContent`. **Off by default**: the two projections carry the same bytes, so the JSON copy is a duplicate a human sees on every call. Pass `true` for a client that reads structured content |
-| `allow_escapes` | Permit raw control bytes in cmd. Default: false. Pass `vars` for data (newlines/quotes) or `args` for command lines |
-| `args` | Positional values for `$1`, `$2`, … (1-based; `$0` is refused). A reference that is the WHOLE payload of `run`/`type` is sent to the terminal verbatim — that is how `pwd; whoami` gets to run as two commands — while a reference beside other words is substituted as one quoted word. `${10}` is the unambiguous form for ten or more |
-| `vars` | Dictionary substituted into `cmd` at parse time ($NAME replaced by one safely quoted word). Use `args` for values that must reach the terminal as shell syntax |
+| `args` | Positional values for `$1`, `$2`, … (1-based; `$0` is refused; `${10}` is the unambiguous form for ten or more). The reference must BE the payload: the value is the shell line, and cmd is DSL, so a reference beside other shell text is refused rather than guessed at. Nothing quotes or escapes the value — if you want one word, write the quotes inside the value. EVERY value must be referenced by cmd: a value nothing names is refused before anything runs, because a dropped argument is invisible in the reply |
+| `vars` | Named values for `$NAME` in `cmd`. The same mechanism as `args` under another spelling — the position decides the insertion, never which table named the value — so a `$NAME` that is the whole payload and a `$1` that is the whole payload behave identically. Every name must be referenced by cmd: an unused entry is refused before anything runs, and so is a `$NAME` this table does not define |
 <!-- END termdoc: args -->
 
 The window parameters are identical to the tool's, with the same names and the
@@ -1819,9 +1778,9 @@ back, this declines a duplicate of the body that did come back. It exists becaus
 the two projections (rendered text and JSON) carry the same bytes, which is a
 rounding error on a listing and most of the reply on a large read — exactly where
 the windows were meant to protect the caller from paying for output it did not ask
-for. A caller moving a big payload turns it on; one reading `ps` need not.
+for. A caller moving a big payload turns it on; one reading `ls` need not.
 
-**Statements.** `;` separates statements and each gets its own slot: `help; ps`
+**Statements.** `;` separates statements and each gets its own slot: `help; ls`
 answers twice. `&&` and `|` stay inside one statement (that is one command).
 
 **Status codes and slots.** The status code answers for the REQUEST. A command
@@ -1869,10 +1828,10 @@ X-Termcp-Namespace: alice
 
 | Behaviour | Not declared | Declared `alice` |
 |-----------|--------------|------------------|
-| `ps` | every non-infrastructure session | only sessions `alice` opened |
+| `ls` | every non-infrastructure session | only sessions `alice` opened |
 | `pipe` / `pty` (new session) | an ordinary session | the session is tagged `ns:alice`, persisted in its manifest |
-| Operating by handle | any session (including an extension's, when the handle is in hand) | only `ns:alice`, otherwise `forbidden` |
-| Extension / infrastructure sessions | reachable with a handle | refused |
+| Operating by channel | any session (including an extension's, when the channel is in hand) | only `ns:alice`, otherwise `forbidden` |
+| Extension / infrastructure sessions | reachable with a channel | refused |
 
 A caller that declares nothing is the **owner** — the browser, the stdio bridge,
 an agent that set no header — not a tenant: it keeps the ordinary behaviour. The

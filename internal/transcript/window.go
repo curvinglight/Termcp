@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/open-mcp-ai/termcp/internal/ansi"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 )
 
 // Params is a transcript read request: which bytes to return, how to render
@@ -54,11 +55,53 @@ type Params struct {
 	// there; refusing its window would take the terminal down over output it can
 	// display perfectly well.
 	RequireUTF8 bool
+	// Charset is the encoding the session's bytes are in, for output that is not
+	// UTF-8 at all. Empty means UTF-8.
+	//
+	// A TERMINAL IS NOT A UTF-8 DEVICE: on a Chinese Windows the console code page is
+	// 936, so a shell writes GBK, and refusing that window left the caller with no
+	// way to read its own session (issue #149). Decoding is the answer to that, not
+	// an escape hatch: the bytes are the encoding the caller said they are, so
+	// `--grep` matches characters rather than byte sequences and a JSON-RPC frame
+	// from a GBK extension can be read at all.
+	//
+	// It is per READ rather than per SESSION because the two can disagree — a
+	// profile's shell writes GBK while a tool it launches writes UTF-8 — and because
+	// a caller who knows the encoding should not have to change a profile to say so.
+	Charset string
+}
+
+// trimIncomplete drops the trailing bytes of a byte window that cannot complete a
+// character, so a window never ends inside one.
+//
+// THE RULE BELONGS TO THE CHARSET, and it was applied to only ONE of the two ways a
+// window gets cut. A cursor read goes through the buffer, which takes the rule as a
+// callback; a POSITIONAL read — offset, from_line — sliced the log directly and applied
+// nothing. That is the path `run` always uses (it reads at the offset the command was
+// submitted), so a `bytes_limit` landing inside a three-byte glyph still produced the
+// original bug: the reply was refused as "not valid UTF-8" and named a charset the
+// session does not write. Same rule, same owner, applied wherever bytes are cut.
+func trimIncomplete(charset string, raw []byte) ([]byte, int64) {
+	cut := encoding.IncompleteTail(charset, raw)
+	if cut <= 0 || cut > len(raw) {
+		return raw, 0
+	}
+	return raw[:len(raw)-cut], int64(cut)
 }
 
 // render turns this read's bytes into its output string, enforcing the
 // byte-fidelity contract only where the caller asked for it (see RequireUTF8).
 func (p Params) render(raw []byte) (string, error) {
+	if p.Charset != "" {
+		// DECODE FIRST, THEN RENDER, so everything downstream — the UTF-8 refusal,
+		// ANSI stripping, the caller's `--grep` — sees characters. The escape rule is
+		// the same either way; only the meaning of a byte changes.
+		decoded, err := encoding.Decode(p.Charset, raw)
+		if err != nil {
+			return "", errf(ErrInvalid, "%s", err.Error())
+		}
+		raw = decoded
+	}
 	if p.RequireUTF8 {
 		return Render(raw, p.StripAnsi)
 	}
@@ -116,16 +159,33 @@ type Window struct {
 	// by offset need this rather than len(Output): rendering (ANSI stripping,
 	// escapes, and the U+FFFD JSON would otherwise substitute) changes the length,
 	// so an offset derived from the rendered string points at the wrong byte.
-	Raw         []byte
-	Start       int64
-	End         int64
-	Total       int64
+	Raw   []byte
+	Start int64
+	End   int64
+	Total int64
+	// Trimmed is how many bytes at the end of this window were withheld to keep it
+	// from ending inside a character. They are NOT lost: the window stops before them,
+	// so the next read delivers them whole. It is reported because "the reply is
+	// shorter than the limit I set" and "the window rolled back one character" are the
+	// same bytes on the wire and only this number tells them apart.
+	Trimmed     int64
 	HasMore     bool
 	PartialTail int64
 	FromLine    int64
 	ToLine      int64
 	TotalLines  int64
 	LineBytes   []int64
+	// StreamOmitted counts the bytes INSIDE [Start, End) that the stream filter passed
+	// over because they belonged to the other stream.
+	//
+	// A filtered read answers "give me stdout" by selecting a subset of the span it
+	// covers, and the span still runs to End — cursors advance by the range, not by the
+	// body, or a poll loop would re-read the same bytes forever. The consequence is that
+	// those bytes leave the caller's cursor without ever being shown, and nothing said
+	// so: `--stream e` on a stdout-only channel answered 200 with an empty body and
+	// `Content-Range: bytes 0-7/8`, then consumed all eight. The count is what lets the
+	// reply say "eight bytes went past, here is the flag that shows them".
+	StreamOmitted int64
 }
 
 // Read produces the window a read asked for. The four forms share a result
@@ -177,6 +237,7 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		if err != nil {
 			return Window{}, errf(ErrOperation, "%s", err.Error())
 		}
+		raw, trimmed := trimIncomplete(p.Charset, raw)
 		raw = truncateAtLines(raw, p.MaxLines)
 		end := start + int64(len(raw))
 		// The window starts at a line start, so counting its newlines numbers
@@ -191,7 +252,7 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 				prev = start + int64(i)
 			}
 		}
-		filtered, err := filterStream(raw, start, src, p.Stream)
+		filtered, omitted, err := filterStream(raw, start, src, p.Stream)
 		if err != nil {
 			return Window{}, err
 		}
@@ -200,24 +261,33 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 			return Window{}, err
 		}
 		w = Window{
-			Output:      rendered,
-			Raw:         filtered,
-			Start:       start,
-			End:         end,
-			Total:       total,
-			HasMore:     end < total,
-			PartialTail: rawPartialTail(raw),
-			FromLine:    p.FromLine,
-			ToLine:      p.FromLine - 1 + newlines,
-			TotalLines:  totalLines,
-			LineBytes:   lineBytes,
+			Output:        rendered,
+			Raw:           filtered,
+			StreamOmitted: omitted,
+			Start:         start,
+			End:           end,
+			Total:         total,
+			HasMore:       end < total,
+			PartialTail:   rawPartialTail(raw),
+			FromLine:      p.FromLine,
+			ToLine:        p.FromLine - 1 + newlines,
+			TotalLines:    totalLines,
+			LineBytes:     lineBytes,
+			Trimmed:       trimmed,
 		}
-	case p.TailLines != nil || p.TailBytes || (src.Live == nil && p.Offset == nil):
+	// AN EXPLICIT TAIL IS A TAIL. The extra disjunct that used to be here — a
+	// closed source read with no selector at all — answered the same call the same
+	// way forever: it is a TAIL, not a cursor, so a caller polling an extension's
+	// output re-read the same bytes on every call and the offsets never advanced
+	// (#159 C1). The caller layer now supplies a cursor for that case (it is the
+	// layer that can hold one: this package is deliberately stateless), so what
+	// arrives here is either an explicit tail or an explicit offset.
+	case p.TailLines != nil || p.TailBytes:
 		raw, st, tot, err := src.scanTailWindow(p.TailLines, p.MaxBytes)
 		if err != nil {
 			return Window{}, errf(ErrOperation, "%s", err.Error())
 		}
-		filtered, err := filterStream(raw, st, src, p.Stream)
+		filtered, omitted, err := filterStream(raw, st, src, p.Stream)
 		if err != nil {
 			return Window{}, err
 		}
@@ -225,7 +295,7 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		if err != nil {
 			return Window{}, err
 		}
-		w = Window{Output: rendered, Raw: filtered, Start: st, End: tot, Total: tot, PartialTail: rawPartialTail(raw)}
+		w = Window{Output: rendered, Raw: filtered, StreamOmitted: omitted, Start: st, End: tot, Total: tot, PartialTail: rawPartialTail(raw)}
 	case p.Offset != nil:
 		offset := *p.Offset
 		total, err := src.Len()
@@ -243,9 +313,10 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		if err != nil {
 			return Window{}, errf(ErrOperation, "%s", err.Error())
 		}
+		raw, trimmed := trimIncomplete(p.Charset, raw)
 		raw = truncateAtLines(raw, p.MaxLines)
 		end := offset + int64(len(raw))
-		filtered, err := filterStream(raw, offset, src, p.Stream)
+		filtered, omitted, err := filterStream(raw, offset, src, p.Stream)
 		if err != nil {
 			return Window{}, err
 		}
@@ -253,14 +324,37 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		if err != nil {
 			return Window{}, err
 		}
-		w = Window{Output: rendered, Raw: filtered, Start: offset, End: end, Total: total, HasMore: end < total, PartialTail: rawPartialTail(raw)}
+		w = Window{Output: rendered, Raw: filtered, StreamOmitted: omitted, Start: offset, End: end, Total: total, HasMore: end < total, PartialTail: rawPartialTail(raw), Trimmed: trimmed}
 	default:
+		if src.Live == nil {
+			// NO SELECTOR ON A CLOSED SOURCE. This cannot silently pick one: “the
+			// whole history” is what the caller did not ask for (and is the O(N²)
+			// replay #159 C1 was opened about), “the tail” answers a different
+			// question, and a live reader cursor does not exist here. The caller
+			// layer knows which one it meant — the MCP read supplies a stored cursor
+			// automatically — so reaching this means a surface skipped that step.
+			return Window{}, errf(ErrInvalid, "%s",
+				"this channel is closed, so a read needs to say where to start: offset, from_line or tail_lines")
+		}
 		// Live streaming cursor path (unchanged semantics).
 		pre := src.Live.ReaderCursor(p.ReaderID)
 		if pre < 0 {
 			return Window{}, errf(ErrReader, "reader_id %d is not registered on this shell", p.ReaderID)
 		}
-		out, raw, partial, err := src.Live.ReadTerminalStream(ctx, p.ReaderID, time.Duration(p.Timeout*float64(time.Second)), p.StripAnsi, p.MaxLines, p.MaxBytes)
+		// THE RULE THE BUFFER CANNOT KNOW. A byte window is cut wherever the caller's
+		// budget falls, and a cut inside a character is not the caller's data being
+		// wrong — but the byte-fidelity check below cannot tell the difference, so it
+		// answers with a charset the session is not writing. This layer is the only one
+		// that knows the charset, so it hands the buffer the rule instead of a name.
+		var trimmed int64
+		trim := func(window []byte) int {
+			cut := encoding.IncompleteTail(p.Charset, window)
+			if cut > 0 && cut <= len(window) {
+				trimmed = int64(cut)
+			}
+			return cut
+		}
+		out, raw, partial, err := src.Live.ReadTerminalStream(ctx, p.ReaderID, time.Duration(p.Timeout*float64(time.Second)), p.StripAnsi, p.MaxLines, p.MaxBytes, trim)
 		if err != nil {
 			return Window{}, errf(ErrOperation, "%s", err.Error())
 		}
@@ -270,20 +364,33 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		// rendered form and `raw` is what it was rendered from. Checking the RAW
 		// bytes is what makes the refusal honest: a stripped string could pass
 		// utf8.Valid while the stream it came from was binary.
+		if p.Charset != "" {
+			decoded, derr := encoding.Decode(p.Charset, raw)
+			if derr != nil {
+				return Window{}, errf(ErrInvalid, "%s", derr.Error())
+			}
+			raw = decoded
+			out = clean(raw, p.StripAnsi)
+		}
 		if p.RequireUTF8 {
 			if err := RenderCheck(raw); err != nil {
 				return Window{}, err
 			}
 		}
 		output := out
+		var omitted int64
 		if p.Stream != "" && p.Stream != "all" {
-			filtered, ferr := filterStream(raw, pre, src, p.Stream)
+			filtered, omitted, ferr := filterStream(raw, pre, src, p.Stream)
 			if ferr != nil {
 				return Window{}, ferr
 			}
+			w.StreamOmitted = omitted
 			output = clean(filtered, p.StripAnsi)
 		}
-		w = Window{Output: output, Raw: raw, Start: pre, End: end, Total: total, HasMore: end < total, PartialTail: partial}
+		// StreamOmitted goes in the literal, not on the line above: this assignment replaces
+		// the whole struct, so a field set before it is silently thrown away — which is
+		// exactly the shape of the bug the field exists to report.
+		w = Window{Output: output, Raw: raw, StreamOmitted: omitted, Start: pre, End: end, Total: total, HasMore: end < total, PartialTail: partial, Trimmed: trimmed}
 	}
 	return w, nil
 }
@@ -312,10 +419,20 @@ func clean(raw []byte, stripAnsi bool) string {
 // window boundaries stay byte-exact.
 func renderInvalidUTF8(raw []byte) error {
 	i := invalidUTF8Index(raw)
+	// NAME THE CHARSET WHEN THE BYTES CONFIRM IT. On a Chinese Windows the console
+	// code page is 936, so this refusal was the normal case rather than an edge one —
+	// and it named two remedies that do not exist on a channel (`mode=hex`,
+	// `mode=file` are file reads), leaving a caller with output it could not read at
+	// all. The round trip in Sniff is what makes "these bytes are GBK" a fact rather
+	// than a guess, and the flag that follows it is one this build answers.
+	hint := "pass --encoding <charset> if the session writes something other than UTF-8, or read a narrower window"
+	if name := encoding.Sniff(raw); name != "" {
+		hint = "these bytes decode as " + name + " and round-trip byte-for-byte; if this session writes " +
+			name + ", pass --encoding " + name
+	}
 	return errf(ErrInvalid, "the window contains bytes that are not valid UTF-8 "+
 		"(first at byte %d of %d); a JSON reply would replace them with U+FFFD and silently "+
-		"shift every offset after them. Read this range byte-wise instead "+
-		"(mode=hex or mode=file) or ask for a narrower window", i, len(raw))
+		"shift every offset after them. %s", i, len(raw), hint)
 }
 
 // Render applies clean and enforces the byte-fidelity contract above.
@@ -344,18 +461,21 @@ func invalidUTF8Index(b []byte) int {
 // ranges, "e" the bytes inside them, "" and "all" return raw unchanged. The
 // filter never moves an offset - the window's Start/End describe the raw
 // window whatever it returns; only the returned content changes.
-func filterStream(raw []byte, start int64, src *Source, stream string) ([]byte, error) {
+func filterStream(raw []byte, start int64, src *Source, stream string) (filtered []byte, omitted int64, err error) {
 	if stream == "" || stream == "all" {
-		return raw, nil
+		return raw, 0, nil
 	}
 	if src.MsgMgr == nil {
-		return nil, errf(ErrInvalid, "stream filtering requires a persistent transcript log")
+		return nil, 0, errf(ErrInvalid, "stream filtering requires a persistent transcript log")
 	}
 	ranges, err := src.MsgMgr.StderrRanges(src.SessID, src.ShellID)
 	if err != nil {
-		return nil, errf(ErrOperation, "%s", err.Error())
+		return nil, 0, errf(ErrOperation, "%s", err.Error())
 	}
-	return selectBytes(raw, start, ranges, stream == "e"), nil
+	out := selectBytes(raw, start, ranges, stream == "e")
+	// What the selection left behind, INSIDE this span. Non-zero means the caller's
+	// cursor is about to move past bytes it was not shown.
+	return out, int64(len(raw) - len(out)), nil
 }
 
 // selectBytes is the byte-level half of the filter, over prepared ranges.

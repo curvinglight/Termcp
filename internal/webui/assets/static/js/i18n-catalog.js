@@ -128,6 +128,12 @@ var I18N_CATALOG = {
     'common.download': 'Download',
     'common.upload': 'Upload',
     'common.loading': 'Loading...',
+    /* Upload progress lives on the button itself (#157): a transfer that shows
+       nothing is indistinguishable from a dead one. */
+    'file.upload.progress': 'Uploading {pct}%',
+    'file.upload.network': 'the connection failed',
+    'file.upload.aborted': 'the transfer was cancelled',
+    'toast.upload.failed': 'Upload failed: {msg}',
     'common.copyUrl': 'Copy URL',
 
     /* --- leaving the page --- */
@@ -169,31 +175,21 @@ var I18N_CATALOG = {
 
     /* --- session tiles --- */
     'session.delete.title': 'Delete session',
-    'session.delete.message': 'Delete "{name}"?',
     'session.close.title': 'Close session',
     'session.close.hintArchives': 'The session stops and keeps its output readable in the archive column.',
     'session.close.messageArchives': 'Stop “{name}” and move it to the archive?',
     'session.close.ok': 'Stop',
-    'session.cancelDial.title': 'Cancel this connection',
-    'session.openHistory': 'Open history',
-    'session.openTerminal': 'Open terminal',
     'session.open.tip': 'Open session {sid}',
-    'session.openHistory.tip': 'Open history (read-only)',
-    'session.aria.select': 'Select session',
     'session.aria.rename': 'Rename session',
     'session.aria.copyUrl': 'Copy session URL',
     'session.prompt.rename': 'Rename session',
+    'session.rename.hint': 'Click to rename',
     'session.status.running': 'Running',
-    'session.client.tip': 'Started by agent “{name}” (its namespace: it lists and drives only its own sessions)',
-    'session.status.dead': 'Ended: {reason}',
-    'session.status.connecting': 'Connecting',
     'session.ended': 'Session ended',
     'session.dead.badge': 'ended',
     'session.dead.badgeTitle': 'Session ended (read-only)',
     'session.toast.unchanged': 'Name unchanged',
     'session.toast.renamed': 'Renamed',
-    'fwd.count.one': '{count} forward',
-    'fwd.count.other': '{count} forwards',
     'reason.explicit': 'ended manually',
     'reason.crash': 'unexpected disconnect',
     'reason.exited': 'process exited',
@@ -232,8 +228,6 @@ var I18N_CATALOG = {
     'win.resize': 'Drag to resize',
     'win.aria.select': 'Select this window for a batch close',
     'win.aria.connections': 'Connections',
-    'plate.sessions.empty': 'No running sessions',
-    'plate.archive.empty': 'No archived sessions',
 
     /* --- extension panel (the connections panel's other side) --- */
     'nav.extensions': 'Extensions',
@@ -295,14 +289,11 @@ var I18N_CATALOG = {
     'win.term.tab': 'Terminal',
     'win.fw.tab': 'Forwardings',
     'win.files.tab': 'Files',
-    'win.notify.tab': 'Notifications',
 
     /* --- review mode (approval gate) --- */
     'tab.reviewWaiting': 'Commands waiting for review',
     'conn.approval.mark': 'New sessions require command review by default',
     'conn.approval.markAria': 'Review mode enabled by default',
-    'win.notify.tip': 'Wake-up rules for this shell (notify tool)',
-    'ntf.emptyHint': 'This tab lists rules that notify an agent (notify tool), not the toasts shown in the corner.',
     'modal.conn.loopbackOnly': 'Built-in loopback connection: it dials this machine over the built-in SSH server, so host, credentials and jumps do not apply. Only the settings below are used.',
     'modal.conn.field.approval': 'Review every AI write by default',
     'modal.conn.field.approvalHint': 'Sessions started from this profile begin with review mode on: each command waits for you to Accept or Reject it before any byte reaches the shell.',
@@ -346,10 +337,6 @@ var I18N_CATALOG = {
     'fw.empty': 'No active forwards',
 
     /* --- notifications panel --- */
-    'ntf.empty': 'No wake-up rules for this shell',
-    'ntf.unregister': 'Unregister',
-    'ntf.channel.sampling': 'sampling',
-    'ntf.channel.resource': 'resource',
 
     /* --- forwarding modal --- */
     'modal.forward.title': 'New Forwarding',
@@ -591,6 +578,10 @@ var I18N_CATALOG = {
     'common.download': '下载',
     'common.upload': '上传',
     'common.loading': '加载中…',
+    'file.upload.progress': '上传中 {pct}%',
+    'file.upload.network': '连接失败',
+    'file.upload.aborted': '传输已取消',
+    'toast.upload.failed': '上传失败：{msg}',
     'common.copyUrl': '复制 URL',
 
     /* --- leaving the page --- */
@@ -632,31 +623,21 @@ var I18N_CATALOG = {
 
     /* --- session tiles --- */
     'session.delete.title': '删除会话',
-    'session.delete.message': '删除“{name}”？',
     'session.close.title': '关闭会话',
     'session.close.hintArchives': '会话会停止，输出保留在归档栏里可继续查看。',
     'session.close.messageArchives': '停止“{name}”并移入归档？',
     'session.close.ok': '停止',
-    'session.cancelDial.title': '取消这个连接',
-    'session.openHistory': '打开历史',
-    'session.openTerminal': '打开终端',
     'session.open.tip': '打开会话 {sid}',
-    'session.openHistory.tip': '打开历史（只读）',
-    'session.aria.select': '选择会话',
     'session.aria.rename': '重命名会话',
     'session.aria.copyUrl': '复制会话 URL',
     'session.prompt.rename': '重命名会话',
+    'session.rename.hint': '点击重命名',
     'session.status.running': '运行中',
-    'session.client.tip': '由 agent“{name}”发起（它的 namespace：只能列出与操作自己的会话）',
-    'session.status.dead': '已结束：{reason}',
-    'session.status.connecting': '连接中',
     'session.ended': '会话已结束',
     'session.dead.badge': '已结束',
     'session.dead.badgeTitle': '会话已结束（只读）',
     'session.toast.unchanged': '名称未变更',
     'session.toast.renamed': '已重命名',
-    'fwd.count.one': '{count} 个转发',
-    'fwd.count.other': '{count} 个转发',
     'reason.explicit': '手动结束',
     'reason.crash': '异常断开',
     'reason.exited': '进程已退出',
@@ -695,8 +676,6 @@ var I18N_CATALOG = {
     'win.resize': '拖动调整大小',
     'win.aria.select': '选中此窗口以便批量关闭',
     'win.aria.connections': '连接',
-    'plate.sessions.empty': '暂无运行中的会话',
-    'plate.archive.empty': '暂无已归档的会话',
 
     /* --- 扩展面板（连接面板的另一侧） --- */
     'nav.extensions': '扩展',
@@ -758,14 +737,11 @@ var I18N_CATALOG = {
     'win.term.tab': '终端',
     'win.fw.tab': '端口转发',
     'win.files.tab': '文件',
-    'win.notify.tab': '通知',
 
     /* --- review mode (approval gate) --- */
     'tab.reviewWaiting': '等待审核的命令',
     'conn.approval.mark': '新会话默认需要审核命令',
     'conn.approval.markAria': '默认启用审核模式',
-    'win.notify.tip': '该 shell 的唤醒规则（notify 工具）',
-    'ntf.emptyHint': '此标签页列出的是通知代理的规则（notify 工具），不是角落弹出的提示。',
     'modal.conn.loopbackOnly': '内置回环连接：它通过内置 SSH 服务连接本机，因此主机、凭据和跳板都不适用，只用下方的设置。',
     'modal.conn.field.approval': '默认审核 AI 的每次写入',
     'modal.conn.field.approvalHint': '从该配置启动的会话默认开启审核模式：每条命令都会等你接受或拒绝后才发送到 shell。',
@@ -809,10 +785,6 @@ var I18N_CATALOG = {
     'fw.empty': '暂无端口转发',
 
     /* --- notifications panel --- */
-    'ntf.empty': '暂无通知规则',
-    'ntf.unregister': '取消注册',
-    'ntf.channel.sampling': '采样',
-    'ntf.channel.resource': '资源',
 
     /* --- forwarding modal --- */
     'modal.forward.title': '新建端口转发',
@@ -1054,6 +1026,10 @@ var I18N_CATALOG = {
     'common.download': '下載',
     'common.upload': '上傳',
     'common.loading': '載入中…',
+    'file.upload.progress': '上傳中 {pct}%',
+    'file.upload.network': '連線失敗',
+    'file.upload.aborted': '傳輸已取消',
+    'toast.upload.failed': '上傳失敗：{msg}',
     'common.copyUrl': '複製 URL',
 
     /* --- leaving the page --- */
@@ -1095,31 +1071,21 @@ var I18N_CATALOG = {
 
     /* --- session tiles --- */
     'session.delete.title': '刪除工作階段',
-    'session.delete.message': '刪除「{name}」？',
     'session.close.title': '關閉工作階段',
     'session.close.hintArchives': '工作階段會停止，輸出保留在歸檔欄裡可繼續檢視。',
     'session.close.messageArchives': '停止「{name}」並移入歸檔？',
     'session.close.ok': '停止',
-    'session.cancelDial.title': '取消這個連線',
-    'session.openHistory': '開啟歷史',
-    'session.openTerminal': '開啟終端',
     'session.open.tip': '開啟工作階段 {sid}',
-    'session.openHistory.tip': '開啟歷史（唯讀）',
-    'session.aria.select': '選取工作階段',
     'session.aria.rename': '重新命名工作階段',
     'session.aria.copyUrl': '複製工作階段 URL',
     'session.prompt.rename': '重新命名工作階段',
+    'session.rename.hint': '點擊重新命名',
     'session.status.running': '執行中',
-    'session.client.tip': '由 agent「{name}」發起（它的 namespace：只能列出與操作自己的工作階段）',
-    'session.status.dead': '已結束：{reason}',
-    'session.status.connecting': '連線中',
     'session.ended': '工作階段已結束',
     'session.dead.badge': '已結束',
     'session.dead.badgeTitle': '工作階段已結束（唯讀）',
     'session.toast.unchanged': '名稱未變更',
     'session.toast.renamed': '已重新命名',
-    'fwd.count.one': '{count} 個轉送',
-    'fwd.count.other': '{count} 個轉送',
     'reason.explicit': '手動結束',
     'reason.crash': '異常斷線',
     'reason.exited': '行程已結束',
@@ -1158,8 +1124,6 @@ var I18N_CATALOG = {
     'win.resize': '拖曳調整大小',
     'win.aria.select': '選取此視窗以便批次關閉',
     'win.aria.connections': '連線',
-    'plate.sessions.empty': '尚無執行中的工作階段',
-    'plate.archive.empty': '尚無已封存的工作階段',
 
     /* --- 擴充功能面板（連線面板的另一側） --- */
     'nav.extensions': '擴充功能',
@@ -1221,14 +1185,11 @@ var I18N_CATALOG = {
     'win.term.tab': '終端',
     'win.fw.tab': '通訊埠轉送',
     'win.files.tab': '檔案',
-    'win.notify.tab': '通知',
 
     /* --- review mode (approval gate) --- */
     'tab.reviewWaiting': '等待審核的指令',
     'conn.approval.mark': '新工作階段預設需要審核命令',
     'conn.approval.markAria': '預設啟用審核模式',
-    'win.notify.tip': '此 shell 的喚醒規則（notify 工具）',
-    'ntf.emptyHint': '此分頁列出的是通知代理的規則（notify 工具），不是角落彈出的提示。',
     'modal.conn.loopbackOnly': '內建回環連線：它透過內建 SSH 服務連線本機，因此主機、認證與跳板都不適用，只使用下方的設定。',
     'modal.conn.field.approval': '預設審核 AI 的每次寫入',
     'modal.conn.field.approvalHint': '從此設定啟動的工作階段預設開啟審核模式：每道指令都會等你接受或拒絕後才送到 shell。',
@@ -1272,10 +1233,6 @@ var I18N_CATALOG = {
     'fw.empty': '尚無通訊埠轉送',
 
     /* --- notifications panel --- */
-    'ntf.empty': '尚無通知規則',
-    'ntf.unregister': '取消註冊',
-    'ntf.channel.sampling': '取樣',
-    'ntf.channel.resource': '資源',
 
     /* --- forwarding modal --- */
     'modal.forward.title': '新增通訊埠轉送',

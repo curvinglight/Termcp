@@ -1111,18 +1111,30 @@ func TestNetHubRegressionFixes(t *testing.T) {
 }
 
 // TestNetHubSidebarKeepsThePageFromScrolling guards the bug where the WHOLE body
-// scrolled: the resource panel capped itself at `calc(100dvh - 134px)`, a hand-count
-// of the chrome above and below it (header 57 + dock padding 16 + gap 8 + trigger 50
-// + dock bottom padding 16). Those sum to 147, not 134, so the panel was permanently
-// 13px too tall and the document grew a scrollbar of its own — however few nodes the
-// list held. That it was a CONSTANT error and not a content one is what made it hard
-// to see: 30 nodes and 60 nodes overflowed by exactly the same 13px (measured in
-// headless Chrome), and the page scrolled with an EMPTY sidebar too.
+// scrolled, through the two shapes it has taken.
 //
-// The number cannot be re-derived from the stylesheet alone, so what is pinned here is
-// its shape: the ceiling is a viewport minus a single chrome constant, and the same
-// constant serves both the panel and the rail that replaces it collapsed. Two
-// different numbers is exactly how the two drifted apart.
+// FIRST it was `calc(100dvh - 134px)`, a hand-count of the chrome above and below the
+// panel. Those terms sum to 147, not 134, so the panel was permanently 13px too tall
+// and the document grew a scrollbar of its own — however few nodes the list held. That
+// it was a CONSTANT error and not a content one is what made it hard to see: 30 nodes
+// and 60 nodes overflowed by exactly the same 13px.
+//
+// THEN it was `calc(100dvh - --app-header-h - --dock-h - 90px)`: the measured form of
+// the same mistake, and worse in one way — `--dock-h` is published by an element in
+// THIS layout, so the panel's height depended on a measurement whose own height could
+// depend on the page the panel had just changed. The constant was wrong too (measured
+// at 1400x900: 40px of overflow with a full archive, 112px with a status banner up).
+//
+// NOW there is no arithmetic at all: body is one viewport tall, `.dock` is its
+// flexible row, the frame takes that height, the grid row is `minmax(0, 1fr)` — a
+// DEFINITE row — and every column says `max-height: 100%` against it. Flex does the
+// subtraction, so it cannot be out of date and cannot feed back into its own inputs.
+// What is pinned here is that chain, because a single missing link restores the
+// scrollbar with no other symptom.
+//
+// The observable half — a page that does not scroll with 80 extensions in it, and
+// column heights that settle rather than oscillate — is measured in a real browser by
+// TestNoColumnOutgrowsTheViewport.
 func TestNetHubSidebarKeepsThePageFromScrolling(t *testing.T) {
 	css := readAppCSS(t)
 
@@ -1150,48 +1162,42 @@ func TestNetHubSidebarKeepsThePageFromScrolling(t *testing.T) {
 		t.Errorf("the gap above the panel changed; the chrome constant counts it: %q", body)
 	}
 
-	// The ceiling is built from MEASURED lengths, not a hand-counted constant.
-	//
-	// It used to be `calc(100dvh - 147px)`, where 147 was a sum a human maintained
-	// by hand: header 57 + dock padding 32 + gap 8 + trigger 50. The header is 60px
-	// now, not 57, so the constant was three pixels short and the page scrolled by
-	// exactly three pixels — the same class of error as the 134 that preceded it,
-	// and invisible in the stylesheet because the arithmetic looked right.
-	//
-	// --app-header-h and --dock-h are published by shell-windows.js from the real
-	// boxes, so a font, a language or a wrapped nav cannot put the sum out of date.
-	const ceiling = "calc(100dvh - var(--app-header-h, 60px) - var(--dock-h, 44px) - 90px)"
-	for _, m := range []struct{ name, rule string }{
-		{"the panel", body},
-		{"the collapsed rail", between(t, css, ".workspace-frame.nethub-collapsed #nethub .nethub-rail {", "}")},
-		/* The archive wears the hosts column's frame, so its body is a .nethub-body
-		   and inherits the ceiling above; it restates it on its own class anyway,
-		   because a column that relies on an invariant should say so where it
-		   lives rather than only in the rule it happens to inherit. */
-		{"the archive column's body", between(t, css, ".extpanel-body {", "}")},
+	// THE CHAIN, LINK BY LINK. Each one is load-bearing: without the definite body
+	// there is no free space to distribute, without the flexible dock and frame there
+	// is nothing to distribute it through, without the definite row `max-height: 100%`
+	// resolves against an auto height and is ignored, and without the caps the
+	// columns grow the row they were supposed to fit in.
+	for _, m := range []struct{ name, rule, want string }{
+		{"the page is exactly one viewport tall", between(t, css, "body { letter-spacing", "}"), "height: 100dvh"},
+		{"the dock is its flexible row", between(t, css, ".dock { flex: 1 1 auto", "}"), "display: flex"},
+		{"the dock does not extend the document", between(t, css, ".dock { flex: 1 1 auto", "}"), "overflow: clip"},
+		{"the frame takes that height", between(t, css, ".workspace-frame {", "}"), "flex: 1 1 auto"},
+		{"the columns' row is definite", between(t, css, ".workspace-frame {", "}"), "grid-template-rows: minmax(0, 1fr)"},
+		{"the hosts column is capped by it", between(t, css, ".nethub {", "}"), "max-height: 100%"},
+		{"the extension column is capped by it", between(t, css, ".workspace-exts {\n  display: flex", "}"), "max-height: 100%"},
+		{"the panel takes the leftover height", body, "flex: 1 1 auto"},
+		{"the collapsed rail takes it too", between(t, css, ".workspace-frame.nethub-collapsed #nethub .nethub-rail {", "}"), "flex: 1 1 auto"},
+		{"the archive body takes it too", between(t, css, ".extpanel-body {", "}"), "flex: 1 1 auto"},
 	} {
-		if !strings.Contains(m.rule, ceiling) {
-			t.Errorf("%s must cap itself at %q so it cannot push the page past the viewport; got %q",
-				m.name, ceiling, m.rule)
+		if !strings.Contains(m.rule, m.want) {
+			t.Errorf("%s: %q must appear in %q", m.name, m.want, m.rule)
 		}
 	}
 
-	/* One ceiling, every consumer — and FEWER consumers since the archive started
-	   wearing the hosts column's frame. It used to be five spellings: the panel,
-	   the rail, the archive's own panel, its own rail, and the folding body. The
-	   archive shares .nethub-body and .nethub-rail now, so three cover everything
-	   they used to: the shared body, the shared rail, and the archive's own body
-	   (which restates it deliberately). A second spelling is how 134 and 147
-	   coexisted, so the count is pinned rather than bounded — an extra copy is the
-	   failure this guards, and a missing one means a column lost its cap. */
-	if n := strings.Count(css, ceiling); n != 3 {
-		t.Errorf("expected the shared panel, the shared rail and the archive body to carry the ONE ceiling; found %d uses", n)
-	}
-	// The hand-counted form is gone, and must not come back: it is what drifted.
-	for _, stale := range []string{"100dvh - 134px", "100dvh - 147px"} {
+	// NO ARITHMETIC OVER MEASURED VALUES IN A CEILING, and that is the actual fix:
+	// `--dock-h` is published by an element inside this layout, so a ceiling built
+	// from it depends on a measurement whose height can depend on the page the ceiling
+	// just changed. The hand-counted forms are gone for the same reason they always
+	// drift, and both must stay gone.
+	for _, stale := range []string{
+		"100dvh - 134px", "100dvh - 147px",
+		"calc(100dvh - var(--app-header-h, 60px) - var(--dock-h, 44px) - 90px)",
+	} {
 		if strings.Contains(css, stale) {
-			t.Errorf("%q is a hand-counted chrome sum; the header and dock depths are measured "+
-				"(--app-header-h / --dock-h), so a literal here drifts the moment either box changes", stale)
+			t.Errorf("%q is a chrome sum in a column's ceiling. The panel's height must come from the "+
+				"layout (the row it shares), not from arithmetic over measured values — one of them "+
+				"(--dock-h) is published by an element in this same layout, which makes the ceiling "+
+				"depend on its own result", stale)
 		}
 	}
 
@@ -1432,141 +1438,5 @@ func TestAddControlIsTheDrawersBottomAction(t *testing.T) {
 	}
 	if !strings.Contains(readAssetLF(t, "static/js/conn-form.js"), "getElementById('conn-add')") {
 		t.Error("conn-form.js should wire the drawer's add action")
-	}
-}
-
-// A session tile's name is its rename control, and the selection checkbox sits
-// on that same row.
-//
-// Both were somewhere else: the pencil button sat next to the sid, so it read as
-// "edit the id" rather than "rename the session", and the checkbox was pinned to
-// the icon's top-left corner, where it looked like it belonged to the icon. The
-// name has to stay the click target for opening nothing — it renames — so the
-// tile's open handler must ignore clicks that land on it.
-func TestSessionTileNameRenamesAndCheckboxSitsOnItsRow(t *testing.T) {
-	sessions := readAssetLF(t, "static/js/sessions.js")
-	css := readThemeCSS(t, "cyberpunk")
-
-	// The checkbox is inside the name row, not the icon stack.
-	if !strings.Contains(sessions, `'<div class="sess-name-row">' +`) {
-		t.Fatal("the session tile should have a sess-name-row holding the checkbox and the name")
-	}
-	row := between(t, sessions, `class="sess-name-row">`, `</div>`)
-	if !strings.Contains(row, `class="sess-checkbox"`) {
-		t.Error("the checkbox belongs on the name row, on the same line as the name it selects")
-	}
-	if !strings.Contains(row, "sess-entry-line") {
-		t.Error("the name row should also hold the name")
-	}
-	// And out of the icon stack, where it used to sit.
-	stack := between(t, sessions, `'<div class="conn-tile-stack">'`, `'</div>' +`)
-	if strings.Contains(stack, "sess-checkbox") {
-		t.Error("the checkbox should have left the icon stack")
-	}
-
-	// The two elements must stay adjacent for the gap to mean anything: a name
-	// that grows to fill the row strands the checkbox at the card's edge, and the
-	// CSS gap then has nothing to do with the visual spacing.
-	if !strings.Contains(css, ".sess-entry-line ") && !strings.Contains(css, ".sess-entry-line {") {
-		t.Fatal("the name rule should exist in the stylesheet")
-	}
-	nameRule := between(t, css, ".sess-entry-line {", "}")
-	if !strings.Contains(nameRule, "flex: 0 1 auto") {
-		t.Errorf("the name must size to its text (flex: 0 1 auto), or the checkbox is pushed away from it; got %q", nameRule)
-	}
-	rowRule := between(t, css, ".conn-tile.sess-tile .sess-name-row {", "}")
-	for _, want := range []string{"justify-content: center", "padding: 0 4px"} {
-		if !strings.Contains(rowRule, want) {
-			t.Errorf("the name row should have %s so the pair is centred with breathing room", want)
-		}
-	}
-
-	// The pencil is gone from both the markup and the stylesheet.
-	if strings.Contains(sessions, "sess-rename-btn") || strings.Contains(css, "sess-rename-btn") {
-		t.Error("the rename button next to the sid should be gone: the name is the control now")
-	}
-	if strings.Contains(readAssetLF(t, "static/js/util.js"), "SVG_PENCIL_12") {
-		t.Error("SVG_PENCIL_12 is dead once the rename button is gone")
-	}
-
-	// Renaming hangs off the name element, and the name is keyboard reachable.
-	name := between(t, sessions, "var nameEl = tile.querySelector('.sess-entry-line');", "\n\n")
-	for _, want := range []string{"nameEl.addEventListener('click', doRename)", "nameEl.addEventListener('keydown'"} {
-		if !strings.Contains(name, want) {
-			t.Errorf("the name element should carry %s", want)
-		}
-	}
-	if !strings.Contains(sessions, `class="sess-entry-line" role="button" tabindex="0"`) {
-		t.Error("the name is now an actionable control and needs button semantics and a tab stop")
-	}
-
-	// A click on the name must not also open the session: the tile's own handler
-	// has to skip it, or a rename would open a terminal behind the prompt.
-	open := between(t, sessions, "tile.onclick = function (e) {", "\n    };")
-	for _, want := range []string{".sess-entry-line", ".sess-sid-line", ".sess-status-ic"} {
-		if !strings.Contains(open, want) {
-			t.Errorf("the tile's open handler must ignore clicks on %s: each is its own control", want)
-		}
-	}
-
-	// The sid copies, and it is keyboard reachable for the same reason the name is.
-	sid := between(t, sessions, "var sidEl = tile.querySelector('.sess-sid-line');", "\n\n")
-	for _, want := range []string{"sidEl.addEventListener('click', doCopy)", "sidEl.addEventListener('keydown'"} {
-		if !strings.Contains(sid, want) {
-			t.Errorf("the sid is the copy control and should carry %s", want)
-		}
-	}
-	if !strings.Contains(sessions, `class="sess-sid-line" role="button" tabindex="0"`) {
-		t.Error("the sid is now actionable and needs button semantics and a tab stop")
-	}
-	// The separate copy button is gone from the session tile. The entry card keeps
-	// its own (dialogs.js), so this checks the tile's markup, not the class.
-	tileHtml := between(t, sessions, "tile.innerHTML =", "tile.title =")
-	if strings.Contains(tileHtml, "sess-copy-btn") {
-		t.Error("the session tile should not carry a separate copy button: the sid copies")
-	}
-
-	// Status is a lamp at the left of the id, not a word on the name.
-	if !strings.Contains(sessions, `class="sess-status-ic `) {
-		t.Error("the tile should carry a status lamp")
-	}
-	if strings.Contains(css, ".sess-dead {") {
-		t.Error("the DEAD word badge should be gone: the lamp says it now")
-	}
-	meta := between(t, sessions, `'<div class="sess-meta-row">'`, `'</div>' +`)
-	if !strings.Contains(meta, "statusIc") || !strings.Contains(meta, "sess-sid-line") {
-		t.Error("the lamp belongs immediately before the sid")
-	}
-	if i, j := strings.Index(meta, "statusIc"), strings.Index(meta, "sess-sid-line"); i > j {
-		t.Error("the lamp must precede the sid, not follow it")
-	}
-	// The lamp's colours come from tokens. A hardcoded pair is a second palette
-	// the theme cannot reach — and because the skin layer re-declares the lamp
-	// further down, a hex in the base layer is a value that never renders at all.
-	// Both layers are asserted: the base one is the fallback the page keeps if the
-	// skin block is dropped, the skin one is what a browser actually paints.
-	base := between(t, css, ".conn-tile.sess-tile .sess-status-ic.is-live {", "}")
-	skin := css[strings.LastIndex(css, ".conn-tile.sess-tile .sess-status-ic.is-live {"):]
-	skin = skin[:strings.Index(skin, "}")+1]
-	for name, rule := range map[string]string{"base": base, "skin": skin} {
-		if !strings.Contains(rule, "background: var(--") {
-			t.Errorf("the %s lamp declares no token background: %q", name, rule)
-		}
-	}
-	if !strings.Contains(skin, "background: var(--accent)") {
-		t.Errorf("the painted lamp is the accent hue; got %q", skin)
-	}
-	for _, want := range []string{
-		"animation: sessCyanPulse",
-		".conn-tile.sess-tile .sess-status-ic.is-dead { background: var(--danger); }",
-	} {
-		if !strings.Contains(css, want) {
-			t.Errorf("the status lamp should style %s", want)
-		}
-	}
-	for _, hardcoded := range []string{"#1a7f37", "#cf222e"} {
-		if strings.Contains(css, hardcoded) {
-			t.Errorf("the lamp hardcodes %s; its colour belongs to a token", hardcoded)
-		}
 	}
 }

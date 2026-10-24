@@ -44,7 +44,15 @@ func TestProfileDeleteOnAnExistingNameSucceeds(t *testing.T) {
 	}); !strings.Contains(text, "success") {
 		t.Fatalf("deleting an existing profile failed:\n%s", text)
 	}
-	list := termText(t, s, map[string]any{"cmd": "edit host --action list"})
+	// THE LISTING MADE THE ASSERTION MEANINGLESS. This read `edit host --action list`,
+	// a form the command surface no longer has: the reply was a 400 about an unknown
+	// flag, which of course does not contain the profile name, so "it is gone" passed
+	// whatever the store held. Reading the real listing, and checking that it listed
+	// anything at all, is what makes the absence below evidence.
+	list := termText(t, s, map[string]any{"cmd": "ls host"})
+	if !strings.HasPrefix(list, "TERM/1 2") {
+		t.Fatalf("listing hosts was refused, so the assertion below proves nothing:\n%s", list)
+	}
 	if strings.Contains(list, "victim") {
 		t.Fatalf("the profile is still listed after delete:\n%s", list)
 	}

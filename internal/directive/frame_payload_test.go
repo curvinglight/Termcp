@@ -69,21 +69,24 @@ func TestFramePayloadDoesNotQuoteNamedValues(t *testing.T) {
 // TestShellQuotingIsUnchangedOutsideFrames pins that the fix did not leak: a shell
 // command line keeps the shell's reading, because that is what its caller wrote.
 func TestShellQuotingIsUnchangedOutsideFrames(t *testing.T) {
-	// Inside single quotes a shell expands nothing, so the reference is the shell's.
-	f, err := ParseWithSubst(`run h:1 '$1'`, Subst{Pos: []string{"x"}})
-	if err != nil {
-		t.Fatal(err)
+	// Inside single quotes a shell expands nothing, so the reference is the shell's — and
+	// the value the caller passed is therefore never referenced, which is now its own
+	// refusal ("cmd never references $1") rather than a silently dropped argument.
+	_, err := ParseWithSubst(`run h:1 '$1'`, Subst{Pos: []string{"x"}})
+	if err == nil {
+		t.Fatal("a value nothing references must be refused, quoted payload or not")
 	}
-	if got, want := f.Statements[0].Payload, "'$1'"; got != want {
-		t.Errorf("single-quoted payload = %q, want %q", got, want)
+	if !strings.Contains(err.Error(), "never references $1") {
+		t.Errorf("the refusal should name the unused value: %v", err)
 	}
 
-	// And a named value outside a frame is still one quoted shell word.
-	f, err = ParseWithSubst(`run h:1 echo $V`, Subst{Named: map[string]string{"V": "a b"}})
+	// And a named value in a shell line obeys the same rule as a positional one: it is
+	// the whole line or it is refused. Nothing about frames changed that.
+	f, err := ParseWithSubst(`run h:1 $V`, Subst{Named: map[string]string{"V": "a b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := f.Statements[0].Payload, "echo 'a b'"; got != want {
+	if got, want := f.Statements[0].Payload, "a b"; got != want {
 		t.Errorf("vars payload = %q, want %q", got, want)
 	}
 }

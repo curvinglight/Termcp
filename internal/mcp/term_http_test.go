@@ -577,6 +577,9 @@ func TestEscapeHeaderKeepsCarriageReturns(t *testing.T) {
 // reply, two projections, one answer.
 func TestHeaderAndBodyAgreeOnAPathWithCR(t *testing.T) {
 	s := newTestServer(t)
+	// No switch needed: the raw-byte gate reads parsed statements and only the
+	// regions a terminal receives, so a CR headed for a Path is data and arrives as
+	// written.
 	rec := postTerm(t, s, `{"cmd": "get \"a\rb\""}`)
 	slots := termSlots(t, rec)
 	bodyPath, _ := slots[0]["Path"].(string)

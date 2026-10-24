@@ -42,6 +42,7 @@ func TestNoFoldHeaderWhenNothingWasFolded(t *testing.T) {
 	s := newTestServer(t)
 	h := openPty(t, s)
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
+	awaitPtyReady(t, s, h)
 
 	termText(t, s, map[string]any{"cmd": "run " + h + " echo SHORT", "timeout": 2})
 	got := termText(t, s, map[string]any{"cmd": "read " + h + " --from-line 1", "timeout": float64(1)})

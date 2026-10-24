@@ -153,7 +153,6 @@ function reapplyWindowLanguage(win) {
      rotate had to repaint its role and title. It is a tick everywhere now, and a
      tick does not depend on the viewport. */
   if (win._refreshFwList) win._refreshFwList();
-  if (win._refreshNtfList) win._refreshNtfList();
   if (win._shellFileBrowse) win._shellFileBrowse();
   /* The lock's title and its switch text encode the mode, so they are written
      from t() at paint time and are not data-i18n nodes. Repainting the labels

@@ -63,6 +63,20 @@ func headerValue(t *testing.T, text, key string) (string, bool) {
 	return "", false
 }
 
+// headerValueOr is headerValue without a test handle, for helpers that need a
+// header inside an expression.
+func headerValueOr(text, key, def string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if line == "" {
+			break
+		}
+		if v, ok := strings.CutPrefix(line, key+": "); ok {
+			return v
+		}
+	}
+	return def
+}
+
 // handleFrom reads the Handle header, which is how a caller learns a new channel.
 func handleFrom(t *testing.T, text string) string {
 	t.Helper()
@@ -120,7 +134,7 @@ func TestTermHelp(t *testing.T) {
 	if _, rest, ok := strings.Cut(single, "\n\n"); ok {
 		body = rest // skip the envelope: status line and headers
 	}
-	if first, _, _ := strings.Cut(body, "\n"); !strings.HasPrefix(first, "run <session> <index> <line>") {
+	if first, _, _ := strings.Cut(body, "\n"); !strings.HasPrefix(first, "run <channel> <line>") {
 		t.Errorf("the body does not open with the usage template:\n%s", single)
 	}
 }
@@ -288,6 +302,7 @@ func TestTermRunOnPtyReadsTheWindow(t *testing.T) {
 func TestTermPtyRunWaitsTheWindow(t *testing.T) {
 	s := newTestServer(t)
 	h := openPty(t, s)
+	awaitPtyReady(t, s, h)
 	text := termText(t, s, map[string]any{
 		"cmd":     "run " + h + " $1",
 		"args":    []any{"sleep 1 && echo LATE"},
@@ -303,30 +318,33 @@ func TestTermPtyRunWaitsTheWindow(t *testing.T) {
 func TestTermRunStartsAtItsOwnOffset(t *testing.T) {
 	s := newTestServer(t)
 	h := openPty(t, s)
-	termText(t, s, map[string]any{"cmd": "run " + h + " seq 1 500", "timeout": float64(2), "bytes_limit": float64(64)})
-
-	// LET seq FINISH PRODUCING before the next command.
+	awaitPtyReady(t, s, h)
+	// THE MARKER IS HOW "seq FINISHED" IS KNOWN, and a quiet heuristic is not.
 	//
 	// The 64-byte window deliberately leaves most of seq's output unread — that is the
-	// point of the test — but the WRITER is still going when this call returns. Sending
-	// the next command immediately made the two interleave differently on a CI runner
-	// than on a workstation, and the assertion below then saw "1\n2\n3" in the second
-	// body because seq was still writing it, not because run replayed anything.
+	// point of the test — but the WRITER is still going when this call returns. The wait
+	// used to be "the buffer has not grown for 50ms", which a chunked writer satisfies in
+	// the middle of its own output: the second body then carried seq's remaining lines,
+	// and this test reported them as a replay. A marker printed AFTER seq is an end, not a
+	// pause.
+	// TWO THINGS HAVE TO TRAVEL AS THE VALUE, and both are about the marker meaning what
+	// it says.
 	//
-	// Waiting for the shell to go quiet (not for it to exit — it is a pty and stays
-	// up) is what separates "unread tail exists" from "output is still arriving".
-	shellID := shellIDFromHandle(t, s, h)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		before := s.sessMgr.GetChildShell(shellID).BufferLen()
-		time.Sleep(50 * time.Millisecond)
-		if s.sessMgr.GetChildShell(shellID).BufferLen() == before {
-			break // the producer stopped adding bytes
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("seq never stopped writing")
-		}
-	}
+	// The `;` is the DSL's statement separator, so the same text written into cmd is two
+	// statements and the second is not a directive.
+	//
+	// And the marker is BUILT by the command (`seq-finished-$(echo marker)`) rather than
+	// written in it: a wait that greps the transcript for a literal string matches the
+	// ECHO of the line that contains it, which returns before the command has run — the
+	// wait would then be measuring nothing, which is how this test spent a while passing
+	// for the wrong reason.
+	termText(t, s, map[string]any{
+		"cmd":         "run " + h + " $1",
+		"args":        []any{"seq 1 60; echo seq-finished-$(echo marker)"},
+		"timeout":     float64(2),
+		"bytes_limit": float64(64),
+	})
+	waitForContent(t, s, h, "seq-finished-marker")
 
 	second := termText(t, s, map[string]any{"cmd": "run " + h + " echo SECOND", "timeout": float64(2)})
 	if !strings.Contains(second, "SECOND") {
@@ -434,25 +452,49 @@ func TestTermPSLinesAreCopyable(t *testing.T) {
 		if len(fields) == 0 {
 			continue
 		}
+		// THE STATUS LINE, NOT THE WORD "404". A channel id is a uuid, and one that
+		// begins with those three digits made this fail about once in four thousand
+		// runs — a flake whose cause was a substring match, not a race. The reply's
+		// first line is the status, which is the thing being asked about.
 		probe := termText(t, s, map[string]any{"cmd": "get " + fields[0]})
-		if strings.Contains(probe, "404") {
-			t.Errorf("the handle %q from ps does not resolve:\n%s", fields[0], probe)
+		if !strings.HasPrefix(probe, "TERM/1 2") {
+			t.Errorf("the channel %q from ls does not resolve:\n%s", fields[0], probe)
 		}
 	}
 }
 
 // info is `key: value`, one fact per line.
+//
+// The two ADDRESSES are two different nodes and answer about different things: a bare
+// session id is the connection container, and `<id>:<index>` is one channel on it
+// (issue #142 — the channel address used to return the session record byte for byte,
+// so a mistyped index was indistinguishable from a hit).
 func TestTermInfoIsKeyValueLines(t *testing.T) {
 	s := newTestServer(t)
 	h := openPipe(t, s, "sleep 5")
-	text := termText(t, s, map[string]any{"cmd": "get " + h})
+	sid := strings.SplitN(h, ":", 2)[0]
+
+	// The session: what the link is, and which channels hang off it.
+	sess := termText(t, s, map[string]any{"cmd": "get " + sid})
 	for _, key := range []string{"id: ", "status: ", "ssh_config: ", "shell: "} {
-		if !strings.Contains(text, key) {
-			t.Errorf("get misses %q:\n%s", key, text)
+		if !strings.Contains(sess, key) {
+			t.Errorf("get <session> misses %q:\n%s", key, sess)
 		}
 	}
-	if strings.Contains(text, "{") {
-		t.Errorf("get must be key: value lines, not JSON:\n%s", text)
+	if strings.Contains(sess, "{") {
+		t.Errorf("get must be key: value lines, not JSON:\n%s", sess)
+	}
+
+	// The channel: the facts about THIS channel, which the session record never had.
+	chanInfo := termText(t, s, map[string]any{"cmd": "get " + h})
+	for _, key := range []string{"channel: " + h, "index: ", "mode: pipe", "status: ", "bytes: "} {
+		if !strings.Contains(chanInfo, key) {
+			t.Errorf("get <channel> misses %q:\n%s", key, chanInfo)
+		}
+	}
+	// A pipe has no terminal, so it must not be given a size.
+	if strings.Contains(chanInfo, "size: ") {
+		t.Errorf("a pipe channel was given a terminal size:\n%s", chanInfo)
 	}
 }
 
@@ -1001,7 +1043,7 @@ func TestTermMCPStreamableHandshakeAndClose(t *testing.T) {
 		t.Fatalf("close failed:\n%s", toolResultText(res))
 	}
 	after := termText(t, s, map[string]any{"cmd": "read " + h})
-	if !strings.Contains(after, "404") || !strings.Contains(after, "names nothing") {
+	if !strings.HasPrefix(after, "TERM/1 404") || !strings.Contains(after, "names nothing") {
 		t.Fatalf("closed peer still resolves:\n%s", after)
 	}
 }
@@ -1118,6 +1160,59 @@ func openPipe(t *testing.T, s *Server, argv string) string {
 		t.Fatalf("connect --argv %s failed:\n%s", argv, text)
 	}
 	return handleFrom(t, text)
+}
+
+// awaitPtyReady types a marker into a fresh pty and waits for it to come back.
+//
+// THE ROUND TRIP IS THE ONLY RELIABLE READINESS SIGNAL, which is why this is a test
+// helper and not something the open does: it writes a line into the transcript, and a
+// caller's transcript is not the server's to write into. `open` waits for the shell's
+// first byte, which is a heuristic with a ceiling — a themed PowerShell draws its banner
+// over more than a second, and its line editor installs at the end of that, so input
+// arriving in between is discarded (issue #156, and the open-half of #162 S1).
+//
+// A test that types immediately and then asserts on the output is testing the cursor, or
+// the fold, or the still-running header — not the shell's startup — so it establishes the
+// precondition first. Waiting for the stream to go quiet does NOT establish it: startup
+// pauses for longer than any affordable quiet threshold, measured.
+func awaitPtyReady(t *testing.T, s *Server, handle string) {
+	t.Helper()
+	marker := "pty-ready-probe"
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		// THE MARKER IS BUILT BY THE SHELL, not written in the line: a probe that greps
+		// the transcript for a literal matches the ECHO of the line containing it, so it
+		// reports "ready" for a shell that discarded the input entirely — which is the
+		// exact failure this probe exists to rule out.
+		termText(t, s, map[string]any{
+			"cmd":     "run " + handle + " $1",
+			"args":    []any{"echo pty-ready-$(echo probe)"},
+			"timeout": 3,
+		})
+		if strings.Contains(termText(t, s, map[string]any{"cmd": "read " + handle + " --from-line 1", "timeout": 0}), marker) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the pty never accepted a line: %s is not reading", handle)
+		}
+	}
+}
+
+// noisyCommand is a command that keeps printing for several seconds, in the syntax of
+// whichever shell a pty open actually gives us.
+//
+// IT HAS TO BE THE RIGHT SYNTAX, and two tests typed bash's. On Windows the pty runs
+// PowerShell, which answers `for i in 1 2 3; do …` with a ParserError — and both tests
+// still passed, because they looked for their marker with strings.Contains over the whole
+// reply, and the ECHO of the typed line contains the marker too. So the loop never ran and
+// nothing said so: an assertion that was matching the command instead of its output. The
+// number is printed with each line (`tick 3`), which the command text cannot contain, so a
+// caller's assertion can only be satisfied by output.
+func noisyCommand(marker string) string {
+	if runtime.GOOS == "windows" {
+		return "1..40 | ForEach-Object { '" + marker + " ' + $_; Start-Sleep -Milliseconds 200 }"
+	}
+	return "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do echo " + marker + " $i; sleep 0.2; done"
 }
 
 // openPty starts a pty channel (a login shell) and returns its handle.
@@ -1238,7 +1333,8 @@ func TestTermRefusalIsNeverSuccessShaped(t *testing.T) {
 // "ssh_configs", and listFromDoc treats a missing key as an empty list — so the
 // one call that says what you can connect to always answered "(none)" on an
 // instance holding four profiles. The fix is the key AND the shape: this listing
-// is a plain array of names, not objects with a description field.
+// is an array of entries, each carrying the name and — since issue #154 — the
+// reason it is unusable when it is.
 func TestProfileListRendersTheHandlerKey(t *testing.T) {
 	s := newTestServer(t)
 	dir := t.TempDir()
@@ -1316,35 +1412,6 @@ func TestReadBytesLimitZeroConsumesNothing(t *testing.T) {
 	}
 }
 
-// TestPipeToForwardsAndConsumes pins the one schema parameter that had no
-// implementation: pipe_to was parsed into termArgs and then read by nobody, so
-// asking for a pipe silently returned the bytes inline.
-func TestPipeToForwardsAndConsumes(t *testing.T) {
-	s := newTestServer(t)
-	src := openPipe(t, s, "echo forwarded-payload")
-	sink := openPipe(t, s, "cat")
-	defer closeShell(t, s, sink)
-
-	out := termText(t, s, map[string]any{"cmd": "read " + src, "pipe_to": sink, "timeout": float64(1)})
-	if strings.Contains(out, "forwarded-payload") {
-		t.Errorf("pipe_to left the forwarded bytes in the reply body:\n%s", out)
-	}
-	got := termText(t, s, map[string]any{"cmd": "read " + sink, "timeout": float64(1)})
-	if !strings.Contains(got, "forwarded-payload") {
-		t.Errorf("pipe_to wrote nothing into the target handle:\n%s", got)
-	}
-}
-
-// TestPipeToBadTargetIsAnError pins that a pipe which goes nowhere is reported.
-func TestPipeToBadTargetIsAnError(t *testing.T) {
-	s := newTestServer(t)
-	src := openPipe(t, s, "echo payload")
-	out := termText(t, s, map[string]any{"cmd": "read " + src, "pipe_to": "no-such-handle", "timeout": float64(1)})
-	if !strings.Contains(out, "not found") {
-		t.Fatalf("pipe_to to a missing handle reported nothing:\n%s", out)
-	}
-}
-
 // TestMCPCallTakesTheFrameFirst pins the argument position of the frame.
 //
 // mcpHTTP joined rest[1:], but mcpChannel had already sliced the handle off, so
@@ -1401,6 +1468,43 @@ func TestMCPCallAcceptsEveryQuotingOfTheFrame(t *testing.T) {
 		// what tells a parsed frame from a rejected one.
 		if !strings.Contains(out, `"result"`) {
 			t.Errorf("%s-quoted frame was refused:\n%s", name, out)
+		}
+	}
+
+	// THE ESCAPED SPELLING IS REFUSED, and the refusal has to say why. It is the
+	// one a shell-minded caller reaches for (a shell would read the backslash as an
+	// escape); here quoting only groups the line and the bytes inside are left
+	// alone, so the frame arrives at the parser full of backslashes. Refusing it
+	// with a bare "invalid character" sends the caller to look at their JSON, which
+	// is correct — the spelling is what is wrong.
+	escaped := `"` + strings.ReplaceAll(frame, `"`, `\"`) + `"`
+	out := termText(t, s, map[string]any{"cmd": "call " + h + " " + escaped})
+	if !strings.Contains(out, "not JSON") {
+		t.Fatalf("an escaped frame must be refused, not sent:\n%s", out)
+	}
+	if !strings.Contains(out, "single quotes") {
+		t.Errorf("the refusal does not teach the spelling that works:\n%s", out)
+	}
+}
+
+// TestUnquoteWordRemovesOneLayerAndNothingElse pins the restraint.
+//
+// The temptation is to unescape while the quotes are being peeled — inside double
+// quotes a shell would read a backslash-quote as a quote — but unescaping is
+// expansion, and this layer does not evaluate. A `$` in a JSON body would be the
+// first casualty, and the second would be every caller who meant a literal
+// backslash.
+func TestUnquoteWordRemovesOneLayerAndNothingElse(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{`{"a":1}`, `{"a":1}`},
+		{`'{"a":1}'`, `{"a":1}`},
+		{`"{\"a\":1}"`, `{\"a\":1}`},
+		{`"C:\Program Files"`, `C:\Program Files`},
+		{`""`, ``},
+		{`"`, `"`},
+	} {
+		if got := unquoteWord(tc.in); got != tc.want {
+			t.Errorf("unquoteWord(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -1597,23 +1701,25 @@ func TestABatchIsNotPartlyExecuted(t *testing.T) {
 
 // TestRunDetailStatesWhatAPtyCannotKnow pins the thing the reply cannot say.
 //
-// On a pty, `run` samples a window and returns; there is no completion signal to
-// report, so an empty reply is indistinguishable from a silent command. That is
-// invisible in the wire format, which makes `help run` the only place a caller
-// can find it — and a caller that guesses wrong reaches for `read`, which is a
-// consuming cursor and therefore the one thing that cannot help.
+// On a pty, `run` waits for the stream to go still and returns; there is no
+// completion signal to report, so a reply that stops mid-output is indistinguishable
+// from a finished command. That is invisible in the wire format, which makes
+// `help run` the only place a caller can find it — along with the two things that
+// do help: raising `timeout` for a command that has not spoken yet, and `read` for
+// the bytes that arrive after the wait ended.
 func TestRunDetailStatesWhatAPtyCannotKnow(t *testing.T) {
 	s := newTestServer(t)
 	body := termText(t, s, map[string]any{"cmd": "help run"})
 
-	for _, want := range []string{"pty", "SAMPLES", "timeout", "pipe"} {
+	for _, want := range []string{"pty", "STILL", "timeout", "pipe"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("`help run` does not mention %q:\n%s", want, body)
 		}
 	}
-	// The advice that actually rescues the caller: read cannot recover the bytes.
-	if !strings.Contains(body, "consuming cursor") {
-		t.Errorf("`help run` does not warn that read is a consuming cursor:\n%s", body)
+	// The advice that actually rescues the caller: the bytes are still there, and
+	// read repeats the sample rather than continuing after it.
+	if !strings.Contains(body, "its own cursor") {
+		t.Errorf("`help run` does not say where the rest of the output is:\n%s", body)
 	}
 }
 

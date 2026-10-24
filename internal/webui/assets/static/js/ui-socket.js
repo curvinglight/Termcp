@@ -144,7 +144,6 @@ function connectUIWebSocket() {
         } else if (typeof window.renderNodeStates === 'function') window.renderNodeStates();
         // Notification rules share this wake signal (notify.Manager onChange →
         // sessionHub.broadcast), so keep the rule panels in sync too.
-        loadNotifications();
         /* The extension panel rides the same frame: the reconciler broadcasts
            through the same hub, so an extension reaching available appears on
            the page the moment it happens rather than on the next poll. The

@@ -13,11 +13,36 @@
      .sessdock). `min-height: 100dvh` keeps the dock at the bottom on a short
      page — a column that only reaches its content height would float the dock
      up under the workspace. */
-  body { letter-spacing: .005em; display: flex; flex-direction: column; min-height: 100dvh; }
+  /* A DEFINITE HEIGHT, not just a floor. `min-height` sizes the box by its content
+     and then refuses to go below the viewport, which means a column taller than the
+     window simply grows the page — and the whole desktop layout is built on the
+     promise that the page never scrolls (every column carries its own scroller
+     instead). With `height`, the flex algorithm has negative free space to
+     distribute, so `.dock` shrinks and the columns are capped by the row they share.
+     The narrow block below restores `height: auto`: there the columns stack into one
+     wrapped row and the page genuinely has to scroll. */
+  body { letter-spacing: .005em; display: flex; flex-direction: column; height: 100dvh; min-height: 100dvh; }
   /* The workspace row takes every pixel the header and dock leave. `min-height: 0`
-     is what lets it shrink instead of pushing the dock off-screen, and it is the
-     reason the panels inside can cap themselves at 100dvh and still fit. */
-  .dock { flex: 1 1 auto; min-height: 0; }
+     is what lets it shrink instead of pushing the dock off-screen.
+
+     IT IS ALSO A DEFINITE HEIGHT, which is what makes the columns' ceilings
+     expressible at all. `flex: 1 1 auto` on a flex item whose container has a
+     definite height resolves the item's height, so every descendant can say
+     `max-height: 100%` and mean "the viewport minus the chrome" — no arithmetic
+     over measured values, and nothing that can disagree with the thing it measures.
+     It is a COLUMN container so the frame inside it can take that height. */
+  .dock { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+    /* `clip`, NOT `hidden`: hidden would make this a scroll container and turn it
+       into the scrollport that `position: sticky` inside the columns resolves
+       against. Clip just refuses to extend the document's scrollable area, which is
+       exactly the rule — every column scrolls itself, so nothing here is lost.
+       A `position: fixed` descendant (the narrow-screen drawers) is not clipped by
+       it, because clipping an ancestor only captures fixed boxes whose containing
+       block it is. */
+    overflow: clip; }
+  /* The frame inside .dock carries that height down to the columns; its rule lives
+     with the rest of the frame's geometry in workspace.css, so the frame is
+     described in ONE place rather than in two files that can disagree. */
   /* Blackwall: one fixed layer under the whole page. z-index: -1 is load-bearing
      rather than decoration: a positioned element at auto/0 paints with the
      in-flow, z-index:0 layer — above every static background and card — so the

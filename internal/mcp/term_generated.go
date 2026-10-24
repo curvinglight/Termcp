@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/directive"
 	"github.com/open-mcp-ai/termcp/internal/envelope"
 	"github.com/open-mcp-ai/termcp/internal/locator"
+	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -86,7 +88,12 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 		body += peers
 	}
 	if strings.TrimSpace(body) == "" {
-		body = "(nothing is running)\n"
+		// AN EMPTY LISTING HAS TO SAY WHAT TO DO NEXT, or it reads as "there is
+		// nothing here" when the truth is "nothing is RUNNING yet". The reporting
+		// caller's first move was `ls`, it said only "nothing is running", and
+		// `ls host` -- the one command that answers "what could I connect to" -- was a
+		// guess it had to make from the guide (issue #161, P2-5).
+		body = "(nothing is running)\n`ls host` shows the saved targets; `connect <host>` opens one.\n"
 	}
 	// PS IS THE STATE, SO ITS learn_mode TEACHES THE STATE VERBS.
 	//
@@ -110,7 +117,8 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 	// A generated reply is capped by the same window as a byte stream: a listing is
 	// exactly as capable of flooding a context as a log is, and the directives with
 	// no stream to continue are the ones with no other protection.
-	body, code := capGenerated(body, win)
+	body, code, cut := capGeneratedCounted(body, win)
+	noteTruncated(headers, cut, win)
 	return envelope.Slot{Code: code, Headers: headers, Body: body}
 }
 
@@ -119,6 +127,23 @@ func (s *Server) directiveInfo(ctx context.Context, stmt directive.Statement, wi
 	sess, bad := s.requireSession(stmt.Target)
 	if bad != nil {
 		return s.slotFromFailure(ctx, stmt, failureFromResult(bad))
+	}
+	// A CHANNEL ADDRESS IS A DIFFERENT NODE, AND IT USED TO BE ANSWERED WITH ITS
+	// PARENT (issue #142/#148).
+	//
+	// `get a1f3:2` returned the session record — byte-for-byte the same reply as
+	// `get a1f3`, with only `Path` differing. Nothing in it described channel 2, and
+	// `get a1f3:99` returned the same 200, so a mistyped index was indistinguishable
+	// from a hit. That is the worst shape for an answer: it looks like confirmation.
+	if idx := locator.SplitHandle(stmt.Target).Index; idx > 0 {
+		cs, ok := sess.ShellByIndex(idx)
+		if !ok {
+			return s.slotFromFailure(ctx, stmt, &toolFailure{
+				code: CodeShellNotFound,
+				msg:  fmt.Sprintf("no channel %d on %s; it has %s", idx, sess.ID, channelSummary(sess)),
+			})
+		}
+		return s.channelSlot(stmt, win, cs)
 	}
 	info := sess.Info()
 	var b strings.Builder
@@ -136,8 +161,60 @@ func (s *Server) directiveInfo(ctx context.Context, stmt directive.Statement, wi
 		writeKV(&b, "shell", fmt.Sprintf("%s %s %s %s",
 			handleOf(info.ID, sh.Index), sh.Status, dash(string(sh.Mode)), dash(sh.Name)))
 	}
-	body, code := capGenerated(b.String(), win)
-	return envelope.Slot{Code: code, Headers: map[string]string{"Path": stmt.Path}, Body: body}
+	body, code, cut := capGeneratedCounted(b.String(), win)
+	headers := map[string]string{"Path": stmt.Path}
+	noteTruncated(headers, cut, win)
+	return envelope.Slot{Code: code, Headers: headers, Body: body}
+}
+
+// channelSlot renders one channel's own state.
+//
+// The fields are the ones a caller can act on and cannot get anywhere else: the
+// index (which channel this is), the mode (a pty has no exit code, a pipe has no
+// size), the status, the exit code when there is one, and where the transcript
+// currently ends. `ls` shows the first three for every channel at once; this is the
+// one address that answers about a single one, which is what a caller has after
+// copying a handle out of a reply.
+//
+// The byte count is the transcript length, not a reader's cursor: a cursor belongs
+// to a reader, and there is no reader here. It is the number that answers "is there
+// anything new since I last looked", which is the question this address is for.
+func (s *Server) channelSlot(stmt directive.Statement, win termArgs, cs *session.ChildShell) envelope.Slot {
+	info := cs.Info()
+	var b strings.Builder
+	writeKV(&b, "channel", handleOf(cs.ParentSessionID(), info.Index))
+	writeKV(&b, "index", fmt.Sprint(info.Index))
+	writeKV(&b, "name", dash(info.Name))
+	writeKV(&b, "mode", dash(string(info.Mode)))
+	writeKV(&b, "status", string(info.Status))
+	// A pty has a size; a pipe does not, and printing 24x80 for one would invent a
+	// fact about a channel that has no terminal.
+	if info.Mode == api.ModePTY {
+		writeKV(&b, "size", fmt.Sprintf("%dx%d", info.Rows, info.Cols))
+	}
+	if info.ExitCode != nil {
+		writeKV(&b, "exit_code", fmt.Sprint(*info.ExitCode))
+	}
+	writeKV(&b, "bytes", fmt.Sprint(cs.BufferLen()))
+	writeKV(&b, "created", ageOf(info.CreatedAt))
+	body, code, cut := capGeneratedCounted(b.String(), win)
+	headers := map[string]string{"Path": stmt.Path}
+	noteTruncated(headers, cut, win)
+	return envelope.Slot{Code: code, Headers: headers, Body: body}
+}
+
+// channelSummary names the channels a session does have, for a 404 that has to say
+// what was available instead. A bare "no channel 5" sends the caller back to `ls`.
+func channelSummary(sess *session.Session) string {
+	shells := sess.ListChildShells()
+	if len(shells) == 0 {
+		return "no channels"
+	}
+	parts := make([]string, 0, len(shells))
+	for _, sh := range shells {
+		parts = append(parts, fmt.Sprintf(":%d", sh.Index))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // directiveResize changes a pty's size.
@@ -234,6 +311,15 @@ func (s *Server) directiveClose(ctx context.Context, stmt directive.Statement, w
 		if _, bad := s.requireShell(stmt.Target); bad != nil {
 			return s.slotFromFailure(ctx, stmt, failureFromResult(bad))
 		}
+		// The channel's own name, when the caller gave it one with --name: a bare `:1`
+		// says which slot closed and nothing about what was in it. Read BEFORE the
+		// archive, because a shell that has just been archived is exactly the thing
+		// this handle may no longer resolve — and a close must not turn its own
+		// confirmation into a 404.
+		name := ""
+		if sh, bad := s.requireShell(stmt.Target); bad == nil && sh != nil {
+			name = sh.Info().Name
+		}
 		// ARCHIVE, NOT ERASE. shell_close deletes the shell's metadata, which leaves
 		// the transcript on disk with nothing that addresses it: the caller reads 404
 		// afterwards and cannot tell a closed channel from one that never existed.
@@ -246,7 +332,7 @@ func (s *Server) directiveClose(ctx context.Context, stmt directive.Statement, w
 		// the channel: handles are minted monotonically, so nothing ever reclaims the
 		// entry and a long-lived instance grows one per channel it ever opened.
 		s.dropRecvCursor(stmt.Target)
-		return noContent(stmt)
+		return closedSlot(stmt, stmt.Target, name)
 	}
 
 	// A bare session id, or a locator naming one: terminate the container.
@@ -282,8 +368,9 @@ func (s *Server) directiveClose(ctx context.Context, stmt directive.Statement, w
 	// transition, and this function already releases what it releases by name.
 	if sess != nil {
 		closePeersBySession(sess.Info().ID)
+		return closedSlot(stmt, sess.Info().ID, sess.Info().Name)
 	}
-	return noContent(stmt)
+	return closedSlot(stmt, stmt.Target, "")
 }
 
 // directiveRemove deletes a session and its logs.
@@ -393,7 +480,9 @@ func (s *Server) directiveSpan(ctx context.Context, stmt directive.Statement, wi
 			int64(getFloatAny(span, "from_line", 0)), int64(getFloatAny(span, "to_line", 0)),
 			lineStartCell))
 	}
-	return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: b.String()}
+	// One line per span, and a busy channel has thousands of them: this is the reply
+	// most able to flood a context, so it obeys the same window as everything else.
+	return generatedSlot(stmt, win, b.String())
 }
 
 // directiveReader registers or drops an output reader.
@@ -412,7 +501,7 @@ func (s *Server) directiveReader(ctx context.Context, stmt directive.Statement, 
 	case directive.FlagAbsent:
 		// fall through to register below
 	case directive.FlagNoValue:
-		return badRequest(stmt, "reader --drop needs a reader id: `reader <handle> --drop <id>`")
+		return badRequest(stmt, "reader --drop needs a reader id: `reader <channel> --drop <id>`")
 	default:
 		v, _ := stmt.Flag("drop")
 		readerID, err := flagNumber(v)
@@ -628,6 +717,25 @@ func (s *Server) directiveFile(ctx context.Context, stmt directive.Statement, wi
 		text := toolResultText(res)
 		return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: text}
 	}
+	if taskID := getString(doc, "task_id", ""); taskID != "" {
+		// A TRANSFER IS A RECEIPT (202 Accepted). The transfer has started in the
+		// background; the reply names the task id and tells the caller how to wait
+		// for it. A watchdog of 30s can now move a 30 MB binary without being killed.
+		v, err := s.tasks.Get(taskID)
+		body := ""
+		if err == nil {
+			body = renderTask(v) + "\n`get task " + taskID + "` waits for it (the wait is the call's `timeout`)."
+		} else {
+			body = "started " + taskID + "\n`get task " + taskID + "` waits for it."
+		}
+		return envelope.Slot{
+			Code: 202,
+			Headers: map[string]string{
+				"Path": stmt.Path, "Task": taskID, "Status": "running",
+			},
+			Body: body,
+		}
+	}
 	return generatedSlot(stmt, win, compactDocument(doc))
 }
 
@@ -786,7 +894,12 @@ func (s *Server) directiveHost(ctx context.Context, stmt directive.Statement, wi
 	if action == "list" {
 		// The profile listing is a set of names, one per line: copy-pasteable into
 		// the next `pty`/`pipe`.
-		return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: listFromDoc(res, "ssh_configs", "name")}
+		//
+		// THROUGH THE WINDOW, like every other generated reply. It used to build its own
+		// slot, so `bytes_limit: 60` on a six-entry table answered 200 with the whole
+		// thing: a parameter accepted and then not applied, which is the same failure as
+		// a flag with no effect.
+		return generatedSlot(stmt, win, listFromDoc(res, "ssh_configs", "name"))
 	}
 	doc, _ := toolResultMap(res)
 	return generatedSlot(stmt, win, compactDocument(doc))
@@ -879,8 +992,9 @@ func (s *Server) directiveExtension(ctx context.Context, stmt directive.Statemen
 	}
 	if action == "list" {
 		// The boot manifest: one extension per line, with its state and handle, so
-		// a caller that lost its context gets its toolset back in one call.
-		return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: extensionListing(res)}
+		// a caller that lost its context gets its toolset back in one call. Capped like
+		// the rest: a host with twenty installed extensions is a reply, not a receipt.
+		return generatedSlot(stmt, win, s.extensionListing(res))
 	}
 	doc, _ := toolResultMap(res)
 	return generatedSlot(stmt, win, compactDocument(doc))
@@ -928,77 +1042,23 @@ func (s *Server) refuseAction(ctx context.Context, stmt directive.Statement, cap
 	}, true
 }
 
-// directiveJRPC handles the three frame-channel entries.
-//
-// One function, because the doors differ only in what they do to the channel
-// after opening it (see term_jrpc.go): the subcommand split, the handle
-// registry and the reply shapes are identical, and three copies of them would be
-// three places for `recv` to disagree with itself.
-//
-// The split is done by hand rather than with strings.Fields because the FRAME is
-// the rest of the line, quotes included: Fields would split a JSON body on its
-// own spaces (`"name": "x"` becomes two words), and the payload keeps the
-// caller's quoting, so a quoted frame reached json.Unmarshal with its quotes
-// still on and was refused as "not JSON".
-// looksLikeURL reports whether a word carries a scheme, which is how a bare URL is
-// told apart from a session name in `open`. Session ids are hex and host names are
-// identifiers; neither can contain "://".
-func looksLikeURL(word string) bool { return strings.Contains(word, "://") }
-
-func (s *Server) directiveJRPC(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
-	payload := strings.TrimSpace(stmt.Payload)
-	if payload == "" {
-		return badRequest(stmt, stmt.Op+" needs a subcommand: open|tools|send|recv|call|close")
-	}
-	sub, rest := splitWord(payload)
-	switch sub {
-	case "open":
-		// open <session> <url>. The session is FIRST because it is the larger
-		// decision: it decides which network the URL is resolved on, and a caller
-		// that has not chosen one has not yet said what the URL means.
-		//
-		// ONE WORD IS NOT A SESSION AND AN EMPTY URL. A caller that typed a bare URL
-		// has already named the thing it wants to reach and merely omitted the network;
-		// reporting "needs a URL" would answer a sentence it did not say. Recognising a
-		// scheme is how the two mistakes stay distinguishable.
-		first, tail := splitWord(rest)
-		if tail = strings.TrimSpace(tail); tail == "" {
-			if looksLikeURL(first) {
-				return s.jrpcOpen(ctx, stmt, stmt.Op, "", unquoteWord(first))
-			}
-			return s.jrpcOpen(ctx, stmt, stmt.Op, unquoteWord(first), "")
-		}
-		rawURL, _ := splitWord(tail)
-		return s.jrpcOpen(ctx, stmt, stmt.Op, unquoteWord(first), unquoteWord(rawURL))
-	case "tools", "send", "recv", "call", "close":
-		handle, tail := splitWord(rest)
-		args := []string{}
-		if handle != "" {
-			args = append(args, unquoteWord(handle))
-		}
-		if tail = strings.TrimSpace(tail); tail != "" {
-			args = append(args, tail)
-		}
-		return s.jrpcChannel(ctx, stmt, win, stmt.Op, sub, args)
-	}
-	return badRequest(stmt, "unknown "+stmt.Op+" subcommand: "+sub)
-}
-
-// splitWord cuts the first whitespace-delimited word off s, returning it and the
-// rest. It is the one piece of word splitting `mcp` needs: the subcommand and the
-// handle are single words, and everything after them is a frame that must keep its
-// spaces.
-func splitWord(s string) (string, string) {
-	s = strings.TrimSpace(s)
-	if i := strings.IndexAny(s, " \t"); i >= 0 {
-		return s[:i], strings.TrimSpace(s[i+1:])
-	}
-	return s, ""
-}
-
 // unquoteWord strips one layer of matching shell quotes, so `'{"a":1}'` and
 // `"{\"a\":1}"` both hand the same text to the JSON parser. An unquoted word is
 // returned unchanged.
+// unquoteWord removes one layer of the caller's own quoting.
+//
+// That is ALL it does, and the restraint is the point. It is tempting to unescape
+// while it is here — inside double quotes a shell would read `\"` as `"` — but
+// unescaping is EXPANSION, and this layer is forbidden from evaluating. The parser
+// agrees: its Lit.Value for a double-quoted part is the raw bytes, backslashes
+// included, because turning them back into the bytes they stand for is the
+// interpreter's job (mvdan.cc/sh/v3/expand), which would also expand the `$` in a
+// perfectly ordinary JSON body like `{"$schema":"..."}`.
+//
+// So a backslash is a byte here, exactly as it is everywhere else in a payload, and
+// a caller whose frame needs quotes writes it the way the JSON grammar wants it.
+// Single quotes have no escapes, which is the shell's rule as well and is why the
+// single-quoted spelling is the safe one to recommend.
 func unquoteWord(s string) string {
 	if len(s) >= 2 {
 		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
@@ -1013,7 +1073,30 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 	if len(stmt.Args) > 0 {
 		op, ok := directive.Lookup(stmt.Args[0])
 		if !ok {
-			return envelope.Slot{Code: 404, Headers: map[string]string{"Path": stmt.Path, "Error-Code": "unknown_directive"},
+			// A NOUN IS NOT A VERB, BUT IT IS A WORD IN THE GRAMMAR.
+			//
+			// `help file` answered "unknown directive: file" — true, and useless to a
+			// caller holding that word from `ls <session> file`. The tree's nouns
+			// (file, host, session, channel, forward, peer) are how a caller thinks
+			// about the surface, while help is indexed by verb, so the word that sends
+			// them here is the one word this page could not answer.
+			//
+			// The answer is DERIVED from the usage lines, not tabulated: every line that
+			// names the word is a page of it. A hand-kept map would drift the first time
+			// a verb was added, which is the same reason the flag list is derived.
+			if lines := usageLinesNaming(stmt.Args[0]); lines != "" {
+				return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path},
+					Body: stmt.Args[0] + " is a node, not a verb. These act on it:\n" + lines}
+			}
+			// 400, NOT 404 — AND THE SAME 400 THE BARE WORD GETS.
+			//
+			// Typing the word directly answered 400 ("this line is malformed"), while
+			// asking `help <word>` answered 404 ("this resource does not exist"). Same
+			// body, same situation, two answers: a caller that branches on the status
+			// concludes opposite things about the same missing verb depending on
+			// whether it asked for help first. Nothing is a resource here; the caller
+			// named a directive this build does not have, which is a bad request.
+			return envelope.Slot{Code: 400, Headers: map[string]string{"Path": stmt.Path, "Error-Code": "unknown_directive"},
 				Body: "unknown directive: " + stmt.Args[0]}
 		}
 		body := op.Usage + "\n"
@@ -1030,16 +1113,20 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 			// reads once it has decided to produce the thing.
 			body += "\n" + op.Detail + "\n"
 		}
-		capped, code := capGenerated(body, win)
-		return envelope.Slot{Code: code, Headers: map[string]string{"Path": stmt.Path}, Body: capped}
+		capped, code, cut := capGeneratedCounted(body, win)
+		headers := map[string]string{"Path": stmt.Path}
+		noteTruncated(headers, cut, win)
+		return envelope.Slot{Code: code, Headers: headers, Body: capped}
 	}
 	var b strings.Builder
 	for _, op := range directive.Ops() {
 		b.WriteString(op.Usage)
 		b.WriteByte('\n')
 	}
-	capped, code := capGenerated(b.String(), win)
-	return envelope.Slot{Code: code, Headers: map[string]string{"Path": stmt.Path}, Body: capped}
+	capped, code, cut := capGeneratedCounted(b.String(), win)
+	headers := map[string]string{"Path": stmt.Path}
+	noteTruncated(headers, cut, win)
+	return envelope.Slot{Code: code, Headers: headers, Body: capped}
 }
 
 // termGuide is the empty-call answer: where am I, what can I do, and what is here.
@@ -1052,6 +1139,25 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 
 	b.WriteString("termcp — a shell-like DSL controlling hosts over SSH.\n")
 	b.WriteString("Local (\"internal\", if enabled) and remote targets are treated identically.\n\n")
+
+	// THE SHORTEST PATH COMES FIRST. This page used to open on the whole worldview —
+	// six node kinds, two centres, nineteen verbs — which is the right reference and
+	// the wrong first screen: a caller who only wants a shell and one command read
+	// it, then asked "so what do I type first?". Three lines answer that before the
+	// grammar arrives; everything below is for the second visit.
+	b.WriteString("SHORTEST PATH — `run` does the whole loop, one call:\n")
+	b.WriteString("  ls host                      what is there (local and ssh, in columns)\n")
+	b.WriteString("  connect <host>               opens a channel, answers its channel (a1f3:1)\n")
+	b.WriteString("  run a1f3:1 $1                types the line, presses Enter, reads what came back\n")
+	// THE ONE LINE THAT PREVENTS THE WHOLE CLASS OF `run` MISREADING: the bytes go to
+	// whoever owns the channel's input, not to a queue. A caller that thinks it is
+	// submitting a job reads an eaten command as a successful one.
+	b.WriteString("                               into the TERMINAL: whoever owns the input reads it\n")
+	b.WriteString("                               (a program waiting for an answer TAKES your line).\n")
+	b.WriteString("                               `help run` has what that means for the reply.\n")
+	b.WriteString("  args: [\"make && test\"]\n")
+	b.WriteString("  input/key/read are the same three steps taken separately, for a TUI or a\n")
+	b.WriteString("  long-running command you want to watch between calls.\n\n")
 
 	b.WriteString("cmd = the DSL.  sh = a shell command.\n")
 	b.WriteString("cmd holds directives only. sh never appears in cmd — it enters as a value through\n")
@@ -1069,19 +1175,37 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 	b.WriteString("  channel  one shell on that link, <session>:<index> (e.g. a1f3:1).\n")
 	b.WriteString("           `open <session>` adds one; the mode follows ssh — --argv means\n")
 	b.WriteString("           a command with no terminal, no --argv means a terminal.\n")
-	b.WriteString("  file     <session> file <path>      — write/get/read/rm/create\n")
+	b.WriteString("  file     <session> file <path>      — read/write carry BYTES; get carries\n")
+	b.WriteString("           metadata and the upload/download urls; rm, create\n")
 	b.WriteString("  forward  <session> forward <id>     — open/close/ls\n")
 	b.WriteString("  peer     <session> mcp|cdp|jrpc <url> — open/read/call/close, through that\n")
 	b.WriteString("           session's network, so localhost means the host's localhost.\n")
 	b.WriteString("  Copy addresses from `ls`; never spell one.\n\n")
 
-	b.WriteString("TWO CENTRES:\n")
-	b.WriteString("  ls ext  CAPABILITY HUB — start here. Lists resident, capability-trimmed\n")
-	b.WriteString("          extensions: mcp servers, skills (read-only SFTP), prompts.\n")
-	b.WriteString("          Notes inside an extension are its operating manual.\n")
-	b.WriteString("  ls      SSH STATE & LIFECYCLE — every link, channel, forward and peer.\n")
-	b.WriteString("          Pass learn_mode:true and it expands the verbs that take the\n")
-	b.WriteString("          addresses it just printed.\n\n")
+	// THE POINTER IS CONDITIONAL, and that is the fix a first-time caller asked for:
+	// the guide used to open this section with "`ls ext` CAPABILITY HUB — start here",
+	// so the loudest instruction in the whole reply led to "(no extensions installed)"
+	// on an instance that has none. A recommendation that reads as "start here" has to
+	// be true on the instance answering, and this function already looks up live state
+	// (the `ls` block below), so it can look this up too.
+	ext := s.directiveExtension(ctx, directive.Statement{Op: "ls", Kind: "ext", Target: "ext", Path: "ls ext"}, win)
+	if ext.Code >= 200 && ext.Code < 300 && !strings.Contains(ext.Body, "no extensions") {
+		b.WriteString("TWO CENTRES:\n")
+		b.WriteString("  ls ext  CAPABILITY HUB — start here. Lists resident, capability-trimmed\n")
+		b.WriteString("          extensions: mcp servers, skills (read-only SFTP), prompts.\n")
+		b.WriteString("          Notes inside an extension are its operating manual.\n")
+		b.WriteString("  ls      SSH STATE & LIFECYCLE — every link, channel, forward and peer.\n")
+		b.WriteString("          Pass learn_mode:true and it expands the verbs that take the\n")
+		b.WriteString("          addresses it just printed.\n\n")
+	} else {
+		b.WriteString("WHERE TO LOOK:\n")
+		b.WriteString("  ls host  every saved connection target.\n")
+		b.WriteString("  ls       SSH STATE & LIFECYCLE — every link, channel, forward and peer.\n")
+		b.WriteString("           Pass learn_mode:true and it expands the verbs that take the\n")
+		b.WriteString("           addresses it just printed.\n")
+		b.WriteString("  ls ext   extensions (mcp servers, skills, prompts). None are installed\n")
+		b.WriteString("           on this instance, so there is nothing to start with there.\n\n")
+	}
 
 	b.WriteString("ACTIONS:\n")
 	for _, op := range directive.Ops() {
@@ -1105,8 +1229,40 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 			b.WriteString("  " + line + "\n")
 		}
 	}
-	body, code := capGenerated(b.String(), win)
-	return termReply{win: win, slots: []envelope.Slot{{Code: code, Body: body}}}
+	body, code, cut := capGeneratedCounted(b.String(), win)
+	headers := map[string]string{}
+	noteTruncated(headers, cut, win)
+	return termReply{win: win, slots: []envelope.Slot{{Code: code, Headers: headers, Body: body}}}
+}
+
+// usageLinesNaming returns every usage line that names word as a word, or "".
+//
+// Matching is on WORD BOUNDARIES: `help session` must not match `sessions`, and a
+// noun that happens to be a substring of another verb's argument (`host` inside
+// `--host`) is not what the caller typed. A line that names the word twice is still
+// printed once — the caller wants the verbs, not the count.
+func usageLinesNaming(word string) string {
+	word = strings.TrimSpace(word)
+	if word == "" {
+		return ""
+	}
+	var b strings.Builder
+	seen := map[string]bool{}
+	for _, op := range directive.Ops() {
+		if seen[op.Usage] {
+			continue
+		}
+		for _, field := range strings.FieldsFunc(op.Usage, func(r rune) bool {
+			return !(r == '_' || r == '-' || r == ':' || unicode.IsLetter(r) || unicode.IsDigit(r))
+		}) {
+			if field == word {
+				seen[op.Usage] = true
+				b.WriteString(op.Usage + "\n")
+				break
+			}
+		}
+	}
+	return b.String()
 }
 
 func dash(s string) string {
@@ -1246,8 +1402,22 @@ func listFromDoc(res *mcpgo.CallToolResult, listKey, field string) string {
 			continue
 		}
 		b.WriteString(getString(item, field, ""))
+		// WHERE IT IS, on the same line as the name. The kind column is the one that
+		// separates "the machine I am on" from "a machine I reach over ssh" — the
+		// first thing a reader of `ls host` is deciding — and `where` answers it
+		// (a local OS, or the user@host:port a remote entry dials).
+		if kind := getString(item, "kind", ""); kind != "" {
+			b.WriteString("\t" + kind)
+			b.WriteString("\t" + dash(getString(item, "where", "")))
+		}
 		if desc := getString(item, "description", ""); desc != "" {
 			b.WriteString("\t" + desc)
+		}
+		// A BROKEN ENTRY SAYS WHY, on the same line as its name. The column exists
+		// because a name alone cannot answer "can I connect to this?" — the reader of
+		// a listing is deciding what to use, and the reason is the part that decides.
+		if why := getString(item, "broken", ""); why != "" {
+			b.WriteString("\tbroken: " + why)
 		}
 		b.WriteByte('\n')
 	}
@@ -1260,7 +1430,14 @@ func listFromDoc(res *mcpgo.CallToolResult, listKey, field string) string {
 // extensionListing renders `ext list` as the boot manifest: name, state, handle,
 // and a one-line note. This is the call that gives a caller its toolset back after
 // its context was cleared, so it must be one call and must be scannable.
-func extensionListing(res *mcpgo.CallToolResult) string {
+//
+// THE HANDLE IS THE ADDRESS, NOT THE RAW CHANNEL ID (#159 D2). The reconciler
+// reports a shell id (`9ff338e1-68b`), which is a UUID fragment: it identifies the
+// channel but is not what the rest of the surface takes. An address is
+// `<session>:<index>` — the same spelling `ps` prints and every later command
+// pastes — so a caller that copies this row can act on it directly instead of
+// calling `get ext` to translate.
+func (s *Server) extensionListing(res *mcpgo.CallToolResult) string {
 	doc, ok := toolResultMap(res)
 	if !ok {
 		return toolResultText(res)
@@ -1276,7 +1453,10 @@ func extensionListing(res *mcpgo.CallToolResult) string {
 		state := getString(item, "status", "")
 		handle := getString(item, "session_id", "")
 		if shell := getString(item, "shell_id", ""); shell != "" {
-			handle = shell
+			// The address when it can be derived, the id otherwise: a shell-less
+			// extension (an SFTP-only window) has no channel and reports its
+			// session, which is exactly the address a file read takes.
+			handle = s.addressOf(getString(item, "session_id", ""), shell)
 		}
 		notes := strings.ReplaceAll(getString(item, "notes", ""), "\n", " ")
 		if len(notes) > 60 {
@@ -1290,33 +1470,95 @@ func extensionListing(res *mcpgo.CallToolResult) string {
 	return b.String()
 }
 
+// addressOf turns a session id and a channel id into the address the rest of the
+// surface speaks: `<session>:<index>`.
+//
+// It falls back to the channel id when the session is gone or the index is unknown
+// — a restored manifest can predate the index — because a handle that is merely
+// less convenient still lets the caller look the channel up, while an empty column
+// says nothing at all.
+func (s *Server) addressOf(sessionID, shellID string) string {
+	if sessionID == "" || shellID == "" {
+		return dash(shellID)
+	}
+	sess := s.sessMgr.Get(sessionID)
+	if sess == nil {
+		return shellID
+	}
+	for _, sh := range sess.ListChildShells() {
+		if sh.ID == shellID && sh.Index > 0 {
+			return handleOf(sessionID, sh.Index)
+		}
+	}
+	return shellID
+}
+
 // capGenerated applies the byte and line windows to a generated reply, in that
 // order, and reports whether it had to cut.
 // generatedSlot renders a generated body through the caller's window: the same
 // three axes that bound a stream bound a listing or a document.
 func generatedSlot(stmt directive.Statement, win termArgs, body string) envelope.Slot {
-	capped, code := capGenerated(body, win)
-	return envelope.Slot{Code: code, Headers: map[string]string{"Path": stmt.Path}, Body: capped}
+	capped, code, cut := capGeneratedCounted(body, win)
+	headers := map[string]string{"Path": stmt.Path}
+	noteTruncated(headers, cut, win)
+	return envelope.Slot{Code: code, Headers: headers, Body: capped}
+}
+
+// noteTruncated adds the header a cut generated reply carries, and nothing when
+// nothing was cut: a header that is always present is a header nobody reads.
+func noteTruncated(headers map[string]string, cut int, win termArgs) {
+	if cut <= 0 {
+		return
+	}
+	headers["Truncated"] = fmt.Sprintf("%d bytes withheld by this call's window (bytes_limit %d, lines_limit %d); raise the window to see the rest — a generated reply has no cursor to continue from",
+		cut, win.BytesLimit, win.LinesLimit)
 }
 
 func capGenerated(body string, win termArgs) (string, int) {
+	capped, code, _ := capGeneratedCounted(body, win)
+	return capped, code
+}
+
+// capGeneratedCounted is capGenerated plus HOW MUCH IT TOOK, because a listing cut by
+// the caller's own byte window used to be indistinguishable from a complete one.
+//
+// A generated reply has no stream, so there is no cursor to page it with and no
+// Content-Range to say where it stopped: `ls host` under `bytes_limit: 60` answered 200
+// with three of six entries, and the only hint was that the reply was shorter than the
+// limit — which a caller reading a table it has never seen cannot notice. The count is
+// what a header can be built from.
+//
+// The unit is bytes, not entries: a fold ("too big, ask for less") withholds the whole
+// body, and reporting a count there would suggest a partial answer that does not exist.
+// foldOrTruncate already appends its own notice to a truncated body; this number is for
+// the reply's headers, which is where a caller looks before reading the body at all.
+func capGeneratedCounted(body string, win termArgs) (string, int, int) {
 	if win.BytesLimit == 0 {
 		// The schema's zero-byte window: streamed replies hand back a handle and
 		// consume nothing; a generated reply has no stream, so it is simply empty.
-		return "", 204
+		return "", 204, 0
 	}
 	code := 200
+	cut := 0
 	if win.BytesLimit > 0 && len(body) > win.BytesLimit {
+		before := len(body)
 		body = foldOrTruncate(body, win.BytesLimit, win.OnBytesOverflow)
 		code = 206
+		if len(body) < before {
+			cut = before - len(body)
+		}
 	}
 	if win.LinesLimit > 0 {
 		if lines := strings.Count(body, "\n"); lines > win.LinesLimit {
+			before := len(body)
 			body = foldOrTruncateLines(body, win.LinesLimit, win.OnLinesOverflow)
 			code = 206
+			if len(body) < before {
+				cut += before - len(body)
+			}
 		}
 	}
-	return body, code
+	return body, code, cut
 }
 
 // setFlagString copies a string flag into a handler argument.

@@ -120,6 +120,25 @@
     overflow: hidden;
   }
   .shell-window-title .sw-conn { color: var(--term-fg); flex-shrink: 0; }
+  /* The name IS the rename control (see bindWindowTitleRename). It is a span with
+     role=button rather than a <button> because the header's drag handler skips
+     buttons, and a title that stopped dragging the window would be a worse trade
+     than a hand-applied button look. The pencil is the affordance, dimmed at rest
+     rather than hidden: a control that only appears on hover does not exist on a
+     phone, which is the viewport this exists for.
+
+     flex-shrink:1 is a correction, not a preference: `.sw-conn` is `flex-shrink: 0`,
+     so a long session name pushed the row past the title's overflow and the PENCIL
+     was the thing clipped off — an affordance that disappears exactly on the names
+     that need it most (a renamed session is usually a long one). */
+  .shell-window-title .sw-conn[role="button"] { display: inline-flex; align-items: center; gap: 3px; padding: 1px 3px; margin: -1px -3px; border-radius: 4px; cursor: pointer; min-width: 0; flex-shrink: 1; }
+  .shell-window-title .sw-conn[role="button"]:hover { background: var(--term-white-08); }
+  .shell-window-title .sw-conn[role="button"]:focus-visible { outline: 2px solid var(--term-accent); outline-offset: -2px; }
+  .sw-conn-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .sw-conn-pencil { display: inline-flex; align-items: center; flex-shrink: 0; opacity: .45; }
+  .sw-conn[role="button"]:hover .sw-conn-pencil,
+  .sw-conn[role="button"]:focus-visible .sw-conn-pencil { opacity: .9; }
+  .sw-conn-pencil svg { display: block; }
   .shell-window-title .shell-dead-badge {
     flex-shrink: 0;
     align-self: center;
@@ -808,6 +827,14 @@
        the session glyph, this sliver, the lock, the tabs and the two remaining
        window buttons without scrolling at all. */
     .shell-window-title-cluster { min-width: 44px; }
+    /* The title's rename control is the ONLY way to rename a session on touch:
+       the dock — and with it the tab whose right-click menu carried the verb —
+       is hidden on coarse pointers, so there was no rename here at all before
+       this. It is the 11px pencil plus the name sliver, which is under the ~32px
+       comfortable tap minimum, so the press area grows vertically into the 34px
+       header without moving the text. Horizontal padding stays put: the name
+       sliver is already the tightest thing on the row at 320px. */
+    .shell-window-title .sw-conn[role="button"] { padding-top: 7px; padding-bottom: 7px; margin-top: -7px; margin-bottom: -7px; }
   }
 
   /* Control group at the left of the terminal header. Order matches the DOM:

@@ -343,13 +343,19 @@ function refreshSessionTabbar() {
         e.preventDefault(); e.stopPropagation();
         closeDockEntry(tab._entry);
       });
-      /* A tab is the ONLY place a session is listed now that the session plate is
-         gone, so the per-session actions that used to live on its card have to be
-         reachable from here or they are unreachable: the approval gate, the
-         rename, and copying the session URL. They go behind a context menu rather
-         than onto the tab's face — a tab is 28px tall and already carries a label,
-         a review badge and a close key, and a lock glyph among them would be a
-         fourth unlabelled icon in a row of them. */
+      /* A tab is the only place a session is listed now that the session plate is
+         gone, so the per-session actions that have no home on the window's own
+         header have to be reachable from here: the approval gate and the copy of
+         the session URL. They go behind a context menu rather than onto the tab's
+         face — a tab is 28px tall and already carries a label, a review badge and
+         a close key, and a lock glyph among them would be a fourth unlabelled icon
+         in a row of them.
+
+         Rename is NOT here any more: it lives on the window's own title (see
+         bindWindowTitleRename), because a right-click has no meaning on a phone —
+         and on a phone the dock is hidden entirely, so this menu does not exist
+         there at all. The menu keeps the verb for a session with no window open,
+         whose title there is nothing to click. */
       tab.addEventListener('contextmenu', function (e) {
         e.preventDefault();
         openSessionTabMenu(tab._entry, e.clientX, e.clientY);
@@ -477,6 +483,100 @@ function copySessionUrl(s) {
     .catch(function () { showCopyToast(t('toast.copy.failed')); });
 }
 
+/** Make a terminal window's own title the rename control.
+ *
+ *  The session plate's card had "click the name to rename". When the plate went,
+ *  the rename survived only as an item in the dock tab's RIGHT-CLICK menu — a
+ *  gesture with no meaning on a phone, and one nothing on the page announces. The
+ *  window's title bar is where a name is read, and it is already on screen on
+ *  every viewport, so that is where the control belongs.
+ *
+ *  The name shown is the session's, not the window's `_connName`: a window is
+ *  opened from a label, but the session may have been renamed since — here or by
+ *  an agent — so the snapshot is what the title reads (paintWindowTitleName). A
+ *  window whose session is not in the snapshot yet (a dial in progress, an
+ *  extension's status card) gets no control at all rather than a prompt that would
+ *  PATCH an id that cannot resolve. */
+function bindWindowTitleRename(win) {
+  if (!win || win._termcpTitleRenameBound) return;
+  var el = win.querySelector('.shell-window-title .sw-conn');
+  if (!el) return;
+  win._termcpTitleRenameBound = true;
+  /* The label gets its own span so a repaint can rewrite the text without
+     removing the pencil that sits beside it. */
+  var nameEl = document.createElement('span');
+  nameEl.className = 'sw-conn-name';
+  nameEl.textContent = el.textContent;
+  el.textContent = '';
+  el.appendChild(nameEl);
+  /* The pencil is the affordance: a bare name that renames on click is the same
+     hidden door the context menu was. It is a span, not a button, because the
+     header's drag handler skips `button` and the name has to keep dragging the
+     window. */
+  var pencil = document.createElement('span');
+  pencil.className = 'sw-conn-pencil';
+  pencil.setAttribute('aria-hidden', 'true');
+  pencil.innerHTML = '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13l-3 1 1-3z"/></svg>';
+  el.appendChild(pencil);
+  el.setAttribute('role', 'button');
+  el.setAttribute('tabindex', '0');
+  /* Declarative, not a t() call: the label is read here but rewritten on every
+     language switch by applyI18n, which is the hook every other control on this
+     header uses. A t() call would freeze it in the language the window was opened
+     in. */
+  el.setAttribute('data-i18n-title', 'session.aria.rename');
+  el.setAttribute('data-i18n-aria', 'session.aria.rename');
+  applyI18n(el);
+  /* The header drag starts on mousedown, so the press must not reach it. The
+     dblclick guard is separate on purpose: the header's own dblclick maximizes,
+     and stopping the CLICK does not stop the dblclick that follows it — a double
+     tap on the name would full-screen the window and prompt twice. */
+  el.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+  el.addEventListener('dblclick', function (e) { e.stopPropagation(); });
+  var rename = function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var s = sessionForTabWindow(win);
+    if (!s) return;
+    renameSessionById(s);
+  };
+  el.addEventListener('click', rename);
+  el.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    rename(e);
+  });
+  /* A window that already has its session in the snapshot paints now rather than
+     waiting for the next frame — otherwise a restored window shows its dial label
+     until something unrelated emits a session frame. */
+  paintWindowTitleName(win, sessionForTabWindow(win));
+}
+
+/** The name a window's title shows: the session's own, else the profile it dialled.
+ *
+ *  A default name (`session-…`) IS the profile's, so the profile half already says
+ *  it — the same rule sessionDockLabel applies, so a window and its tab cannot
+ *  disagree about what the session is called. Neither of those may leave the title
+ *  empty: a session with no profile (an internal one, or one whose profile was
+ *  deleted) still shows its default name, and a window with no snapshot record
+ *  keeps the label it was opened with. */
+function windowTitleName(s, win) {
+  var name = String((s && s.name) || '').trim();
+  if (name && name.indexOf('session-') !== 0) return name;
+  var conn = String((s && s.ssh_config) || '').trim();
+  if (conn) return conn;
+  if (name) return name;
+  return String((win && win._connName) || '');
+}
+
+/** Repaint a window's title name from the session snapshot. Called from the
+ *  session frame, so a rename made anywhere (this title, a tab's menu, an agent)
+ *  lands on the window itself rather than only on its tab. */
+function paintWindowTitleName(win, s) {
+  if (!win || !s) return;
+  var el = win.querySelector('.sw-conn-name');
+  if (el) el.textContent = windowTitleName(s, win);
+}
+
 /** The per-session menu behind a tab's right-click.
  *
  *  A tab is the only place a session is listed now, so this is the only way to
@@ -510,7 +610,10 @@ function openSessionTabMenu(entry, x, y) {
       key: 'lock',
       icon: gated ? SVG_LOCK_CLOSED : SVG_LOCK_OPEN,
       label: t('review.mode'),
-      hint: t(gated ? 'review.disableTip' : 'review.enableTip'),
+      /* Two literal calls rather than one ternary argument: the i18n scanner reads
+         t('key'), so a key that only appears inside a conditional looks unused —
+         and "looks unused" is how a live string gets deleted as an orphan. */
+      hint: gated ? t('review.disableTip') : t('review.enableTip'),
       on: gated,
       run: function () {
         /* The card passed the pressed state it had painted; the menu reads it
@@ -1242,7 +1345,18 @@ function clampShellWindowIntoContainer(win) {
   var box = host.getBoundingClientRect();
   var areaW = host.clientWidth || box.width;
   var areaH = host.clientHeight || box.height;
+  /* A container with no area cannot say where "inside" is. Measured mid-resize it
+     can report 0, and every clamp below would then resolve to the container's own
+     origin — moving the window for a reason that does not exist. */
+  if (!areaW || !areaH) return;
   var r = win.getBoundingClientRect();
+  /* NO LAYOUT BOX, NOTHING TO CLAMP. A hidden, minimized, or not-yet-placed window
+     measures 0x0 at 0,0, and clamping that rect would set left/top to the
+     container's top-left corner: the window would come back from the tab bar at
+     the corner instead of where the reader left it. This is reachable now that the
+     clamp also runs on focus (see bringShellWindowToFront), which is a path a
+     hidden window can take. */
+  if (!r.width || !r.height) return;
   /* The leading edge is the container's own top, or the header's lower edge when
      that is further down; the trailing edge still counts from the container. */
   var floor = Math.max(box.top, appHeaderBottom());

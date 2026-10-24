@@ -56,9 +56,6 @@ func termArgToolOptions() []mcpgo.ToolOption {
 			if v, ok := boundValue(d.Min); ok {
 				opts = append(opts, mcpgo.Min(v))
 			}
-			if v, ok := boundValue(d.Max); ok {
-				opts = append(opts, mcpgo.Max(v))
-			}
 			out = append(out, mcpgo.WithNumber(d.Name, opts...))
 		case argBool:
 			out = append(out, mcpgo.WithBoolean(d.Name,

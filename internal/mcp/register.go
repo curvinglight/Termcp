@@ -9,6 +9,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
+	"github.com/open-mcp-ai/termcp/internal/task"
 )
 
 // New creates and configures the MCP server with all tools registered.
@@ -42,6 +43,7 @@ func New(sessMgr *session.Manager, msgMgr *message.Manager, sshConfigs *sshconfi
 		sshConfigs:  sshConfigs,
 		forwardMgr:  forwardMgr,
 		connections: newConnRegistry(),
+		tasks:       task.NewManager(),
 	}
 	for _, opt := range opts {
 		opt(s)

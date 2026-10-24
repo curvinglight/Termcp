@@ -697,62 +697,33 @@ func TestApprovalHidesTheEnterChip(t *testing.T) {
 	}
 }
 
-// A session card's pending-review badge must survive the grid rebuilding itself.
+// The pending-review badge is painted by applyApprovalCounts, which is the only
+// renderer left now that the session plate is gone.
 //
-// The grid is re-rendered from scratch on every session frame, and submitting a
-// request emits one of those frames (the manager's list-change broadcast). When
-// the badge was only painted by a separate pass, the very frame that announced
-// the request wiped it: measured in a browser, the tab bar read "1" while the
-// card stayed empty. Rendering the badge as part of the tile is what fixes it,
-// so the assertion is on the tile builder rather than on any paint call.
-func TestSessionTileRendersItsOwnReviewBadge(t *testing.T) {
-	sess := readAssetLF(t, "static/js/sessions.js")
-
-	if !strings.Contains(sess, "function reviewBadgeHtml(sid)") {
-		t.Fatal("the tile needs a badge builder; a separate paint pass is wiped by the next re-render")
-	}
-	// The tile must call it while building the card, not leave a static empty div.
-	if !strings.Contains(sess, "reviewBadgeHtml(sid) +") {
-		t.Error("the tile markup must include reviewBadgeHtml(sid), or the badge only exists until the next frame")
-	}
-	if strings.Contains(sess, `'<div class="sess-review" hidden></div>' +`) {
-		t.Error("the tile still hardcodes an empty hidden badge; that is the shape that got wiped")
-	}
-
-	// It reads the counts already in hand, so a re-render is self-sufficient.
-	// The body is taken up to the next function, not to the first "}": the early
-	// return's closing brace comes first and would cut the slice short.
-	body := between(t, sess, "reviewBadgeHtml(sid) {", "\n}")
-	if !strings.Contains(body, "_approvalCounts") {
-		t.Error("the badge must render from _approvalCounts, or a re-render has nothing to draw from")
-	}
-	if !strings.Contains(body, "hidden") {
-		t.Error("with nothing waiting the badge must be hidden rather than showing a 0")
-	}
-	// The label is translated, so the assertion is on the catalog key rather than
-	// on an English literal: what matters is that the badge renders a sentence
-	// around the number, and that the sentence is not merely the number again.
-	if !strings.Contains(body, "tCount('review.badge.one', 'review.badge.other'") {
-		t.Error("the badge must render a translated label, not a bare number")
-	}
-	for _, lang := range []string{"en", "zh-Hans", "zh-Hant"} {
-		v := loadCatalogs(t)[lang]["review.badge.other"]
-		if !strings.Contains(v, "{count}") || strings.TrimSpace(strings.Replace(v, "{count}", "", 1)) == "" {
-			t.Errorf("%s: review.badge.other must wrap {count} in words, got %q", lang, v)
-		}
-	}
-
-	// The paint pass still has to update an already-built tile (a decision made in
-	// another tab changes the number without a re-render).
+// The card's own badge builder went with the cards (issue #160): `renderTileGrid`
+// and `reviewBadgeHtml` were 275 lines no snapshot could reach, because the only
+// region left is the archive. What still has to hold is that the badge updates on
+// a decision made elsewhere — an already-open window must not keep showing the
+// count it was built with.
+func TestApprovalCountsRepaintWhatIsAlreadyOpen(t *testing.T) {
 	appr := readAssetLF(t, "static/js/approval.js")
 	paint := between(t, appr, "function applyApprovalCounts() {", "\n}")
 	if !strings.Contains(paint, "badge.textContent") {
-		t.Error("applyApprovalCounts must write the tile badge's text, not only toggle it")
+		t.Error("applyApprovalCounts must write the badge's text, not only toggle it")
 	}
 	// And the same for the lock's count. It once showed a red 0 because only its
 	// visibility was written and never its number.
 	if !strings.Contains(paint, "num.textContent = String(n)") {
 		t.Error("applyApprovalCounts must write the lock count's number as well as its visibility")
+	}
+	// The label is translated, so the assertion is on the catalog key rather than
+	// on an English literal: what matters is that the badge renders a sentence
+	// around the number, and that the sentence is not merely the number again.
+	for _, lang := range []string{"en", "zh-Hans", "zh-Hant"} {
+		v := loadCatalogs(t)[lang]["review.badge.other"]
+		if !strings.Contains(v, "{count}") || strings.TrimSpace(strings.Replace(v, "{count}", "", 1)) == "" {
+			t.Errorf("%s: review.badge.other must wrap {count} in words, got %q", lang, v)
+		}
 	}
 }
 

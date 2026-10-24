@@ -40,6 +40,43 @@ const (
 	defaultBytesLimit      = 8192
 	defaultLinesLimit      = 200
 	defaultTotalBytesLimit = 32768
+
+	// THE WINDOW IS TWO COSTS THE CALLER PAYS, AND NEITHER IS A WALL.
+	//
+	// It bounds how long one call may wait and how much one call may bring into the
+	// caller's context, because both are costs paid by the model on the other side.
+	// Waiting long holds a turn open; reading a lot fills a context.
+	//
+	//	NEITHER HAS A HARD CAP, and the reason is the same for both: the caller is the
+	//	party paying, it is the only party that knows the job, and this server has no
+	//	basis to overrule the one decision it cannot see the whole of. So these three
+	//	numbers are SIZES TO STAY UNDER, published as such in the argument schema, and a
+	//	larger value is honoured. The reply then says what happened — `Waited` and
+	//	`Still-Running` for time, `Truncated` for a generated reply, `Content-Range` for
+	//	a windowed one — so a value that ran into someone else's ceiling is visible as a
+	//	fact rather than as a refusal.
+	//
+	//	There IS a real ceiling on time and it is not this server's: the MCP transport in
+	//	front of the caller may give up sooner (30s on the SSE bridge, 15s on a peer
+	//	call), and past that the reply is lost while the command runs on. Refusing above
+	//	a number this server picked made the caller's vocabulary depend on a timeout
+	//	somewhere it cannot see; the headers let it discover the real ceiling itself.
+	//
+	//	windowBytesMax is about eight thousand tokens: past it a reply stops being
+	//	something a caller reads and becomes something it works through. windowLinesMax
+	//	is the same kind of number for a log tail, already past what one call should
+	//	carry and bounded by the byte window anyway.
+	maxWaitSeconds = 60
+	windowBytesMax = 32768
+	windowLinesMax = 2000
+	// minWindowBytes is the narrowest byte window that can make progress. A window
+	// never ends inside a character, so a window narrower than the widest character any
+	// accepted charset can produce withholds the same bytes on every call and advances
+	// the cursor nowhere: 1-3 bytes answers an unsatisfied range forever, which is what
+	// "no data" looks like. 4 is utf8.UTFMax; the charset-specific width is deliberately
+	// not consulted, because a floor that moves with a flag is harder to hold in mind
+	// than "one character".
+	minWindowBytes = 4
 )
 
 // termArgs is the parsed window of one term call: the parameters that decide how
@@ -52,14 +89,21 @@ const (
 // can READ), and they never reach the shell — bytes sent to a shell are shaped by
 // the shell, not by this protocol.
 type termArgs struct {
-	TimeoutSeconds  float64
+	TimeoutSeconds float64
+	// TimeoutSet says the caller NAMED a timeout, which is not the same as the value it
+	// ended up with. `timeout` has a default (2s), so every reply carries a number whether
+	// or not anyone asked for one — and a subsystem that must fall back to its own default
+	// (a peer call waits 15s: short enough for a 30s host watchdog, long enough for an
+	// ordinary CDP evaluate) cannot tell "the caller asked for 2 seconds" from "nobody
+	// asked". It read the second as the first, so the 15s default was dead code and every
+	// peer call through the term door was bounded by 2 seconds instead.
+	TimeoutSet      bool
 	BytesLimit      int
 	LinesLimit      int
 	TotalBytesLimit int
 	OnTimeOverflow  string
 	OnBytesOverflow string
 	OnLinesOverflow string
-	PipeTo          string
 	LearnMode       bool
 
 	// StructuredContent also sends the reply as the JSON projection, on top of the
@@ -67,15 +111,6 @@ type termArgs struct {
 	// the text is the copy a caller usually reads, so the JSON twin is a duplicate
 	// paid for on every call. See envelope.Reply.StructuredContent.
 	StructuredContent bool
-
-	// AllowEscapes permits unquoted control bytes and raw escape sequences in cmd.
-	//
-	// OFF by default, because a raw carriage return in a payload does not print a
-	// character — the terminal treats it as "submit this line", so one call can run
-	// two commands while answering 200 for one. The same is true of Ctrl-C, Ctrl-D
-	// and Ctrl-Z. A caller that genuinely needs those bytes has two honest ways to
-	// say so: this flag, or `vars` (which carries the value as data, never as syntax).
-	AllowEscapes bool
 
 	// Vars holds values substituted into cmd at AST parse time, by variable name.
 	//
@@ -103,7 +138,16 @@ type termArgs struct {
 	//
 	// A positional reference anywhere else (beside other words, in a flag value, in a
 	// target) is substituted as ONE QUOTED WORD, so a value can never turn into
-	// syntax the caller did not write.
+	// syntax the caller did not write. In a region no shell reads — a flag value, a
+	// protocol frame — nothing quotes it, because nothing would unquote it.
+	//
+	// WHAT COUNTS AS A REFERENCE IS THE GRAMMAR'S ANSWER, and that is the whole rule:
+	// a `$` the parser reported is a reference; one it did not report the caller kept
+	// from being parsed. So `run h:1 echo '$1'` sends the literal, `--data '$1'` sends
+	// the literal, and `--data $1` sends the value — the same sentence, three
+	// destinations, no per-region quoting rules to remember. The one region the grammar
+	// never reads is a `call` payload (a JSON frame is not a shell word), so there the
+	// bytes are read directly.
 	//
 	// $0 is refused rather than bound to the first element: the shell gives $0 a
 	// meaning (the program's own name) that an argument list does not have, so
@@ -192,58 +236,6 @@ func (s *Server) Term(ctx context.Context, cmd string, args map[string]any) enve
 
 // executeTerm parses cmd and runs it, accumulating the reply.
 func (s *Server) executeTerm(ctx context.Context, cmd string, win termArgs) termReply {
-	// Raw control bytes in the command text are refused unless the caller said
-	// otherwise. A carriage return is the case that matters: the shell parses
-	// `echo a\rNoSuch` as one command of four words, but the terminal treats the \r
-	// as "submit this line" — so one call runs two commands and answers 200 for one.
-	// The same is true of Ctrl-C, Ctrl-D, Ctrl-Z, NUL and ESC.
-	//
-	// The refusal names BOTH ways out, because either is a real choice: turn the
-	// gate off (`allow_escapes`), or pass the data so it never becomes syntax
-	// (`env`). Refusing without saying what to do instead is the half-measure that
-	// leaves a caller stuck.
-	//
-	// THE ARGUMENTS ARE SCANNED TOO, and that is not redundant: a value reaches the
-	// terminal through `args` or `vars` without appearing in cmd at all, so scanning
-	// cmd alone let `args: ["a\x03b"]` through. The observed result was worse than a
-	// missing check — the terminal read the byte as an ACTION, echoed `^C`, and the
-	// shell dropped into its `quote>` continuation prompt, with the reply still 200.
-	// Quoting does not help: a control byte inside single quotes is still a control
-	// byte to the terminal, which is why the gate has to look at the values.
-	if !win.AllowEscapes {
-		where, b, name, found := "", byte(0), "", false
-		if b, name, found = directive.DetectRawControl(cmd); found {
-			where = "cmd"
-		}
-		if !found {
-			for i, a := range win.Args {
-				if b, name, found = directive.DetectRawControl(a); found {
-					where = fmt.Sprintf("args[%d]", i)
-					break
-				}
-			}
-		}
-		if !found {
-			for k, v := range win.Vars {
-				if b, name, found = directive.DetectRawControl(v); found {
-					where = "vars[" + k + "]"
-					break
-				}
-			}
-		}
-		if found {
-			return termReply{win: win, slots: []envelope.Slot{{
-				Code: 400,
-				Headers: map[string]string{
-					"Error-Code": "raw_control_byte",
-				},
-				Body: fmt.Sprintf("%s contains an unquoted %s, which the terminal acts on instead of printing.\n"+
-					"Either pass the data through the `vars` argument (it is substituted as a quoted value, so it never becomes syntax:\n"+
-					"  vars: {\"NAME\": \"<value>\"}, cmd: \"run <handle> echo $NAME\"),\n"+
-					"or set allow_escapes: true if you really mean to send byte 0x%02x.", where, name, b),
-			}}}
-		}
-	}
 	file, err := directive.ParseWithSubst(cmd, directive.Subst{Named: win.Vars, Pos: win.Args})
 	if err != nil {
 		// A directive the caller invented (an alias) is unknown to the parser by
@@ -283,6 +275,38 @@ func (s *Server) executeTerm(ctx context.Context, cmd string, win termArgs) term
 // the learn_mode attach below already runs for every statement. Removing it is why
 // the MCP server is now safe for concurrent Term calls.
 func (s *Server) runStatements(ctx context.Context, stmts []directive.Statement, win termArgs) termReply {
+	// RAW CONTROL BYTES IN A SHELL LINE ARE REFUSED, and the check reads the PARSED
+	// statements rather than cmd as typed, because what decides is which layer receives
+	// the byte. `get "a\rb"` names a PATH, and a path may contain anything — the
+	// caller's bytes are the answer there. `run h:1 echo a\rb` hands the byte to a
+	// TERMINAL, which acts on it (submits the line, interrupts, sends EOF) instead of
+	// printing it: one call runs two commands and answers 200 for one of them.
+	//
+	// THE TWO LANGUAGES ARE WHY THIS IS NOT A FLAG ANY MORE. cmd is DSL text and a
+	// shell line is a value, so a keystroke is not something you type into either — it
+	// is a directive: `key <channel> ctrl-c`. There is no legitimate control byte in a
+	// shell line, which is what makes a refusal safe without an override.
+	//
+	// A VALUE CANNOT SMUGGLE ONE EITHER: `args: ["a\rb"]` substituted into a payload
+	// lands in that payload, which is exactly the region this reads. The same bytes in
+	// `--data` or in a Path go to a destination no terminal reads, and pass.
+	//
+	// THIS IS THE FUNNEL, so the check sits here rather than at the parse: a statement
+	// reached through an alias expansion never passes the caller's parse, and that is
+	// the path a substituted value would take into the terminal.
+	if _, name, found := controlByteInShell(stmts); found {
+		return termReply{win: win, slots: []envelope.Slot{{
+			Code: 400,
+			Headers: map[string]string{
+				"Error-Code": "raw_control_byte",
+			},
+			Body: fmt.Sprintf("the shell line contains a raw %s, which the terminal acts on instead of printing.\n"+
+				"A shell line is text a terminal will read byte by byte, so there is no way to send this one as a line.\n"+
+				"To press a key, name it: `key <channel> ctrl-c` (`help key` lists the names).\n"+
+				"If the byte is DATA — a path, a file's contents — send it to a destination no terminal reads: "+
+				"`--data`, a Path, a frame. Those arrive as written.", name),
+		}}}
+	}
 	out := termReply{win: win, seenUsage: map[string]bool{}, previousOK: true}
 
 	// GROUPS ARE THE UNIT OF CONCURRENCY. `a & b` is two statements that run
@@ -318,9 +342,6 @@ func (s *Server) runStatements(ctx context.Context, stmts []directive.Statement,
 		}
 	}
 
-	if win.PipeTo != "" {
-		out.slots = s.forwardSlotsToStdin(ctx, win.PipeTo, out.slots)
-	}
 	return out
 }
 
@@ -423,38 +444,29 @@ func skippedSlot(stmt directive.Statement, op, why string) envelope.Slot {
 	}
 }
 
-// forwardSlotsToStdin implements pipe_to: the reply's bytes go into another
-// handle's stdin, and stay out of the reply body.
+// controlByteInShell reports the first raw control byte sitting in a region the
+// TERMINAL will receive, and names where it is.
 //
-// It is the one parameter in the schema that made a promise nothing kept — the
-// argument was parsed and then read by nobody, so a caller that asked for a pipe
-// got its bytes back inline instead. The rule is one call, one target: whatever
-// this call produced, in order, into one channel. Type-and-enter is deliberately
-// not implied (the bytes are written as they are), because a pipeline stage takes
-// raw input, not a shell line.
-//
-// The forwarded bytes leave the reply body — that is the point of asking — and a
-// target that does not resolve adds its own failing slot, because silently
-// returning the bytes anyway would tell the caller the pipe worked.
-func (s *Server) forwardSlotsToStdin(ctx context.Context, target string, slots []envelope.Slot) []envelope.Slot {
-	var body strings.Builder
-	for _, slot := range slots {
-		if slot.Code < 400 {
-			body.WriteString(slot.Body)
+// The regions are the two the parser marked as shell syntax: a statement's payload
+// and the word list of `--argv`. Everything else the caller wrote — a path, a flag
+// value, a frame — is bytes for something that is not a line editor, so a control
+// byte there is data and arrives as written. That split is the same one the escaping
+// rule uses (see directive.Subst), and it is why this reads parsed statements instead
+// of scanning cmd: the question is never "does the text contain a byte" but "which
+// layer reads it".
+func controlByteInShell(stmts []directive.Statement) (b byte, name string, found bool) {
+	for _, st := range stmts {
+		regions := []string{st.Payload}
+		if argv, ok := st.Flag("argv"); ok {
+			regions = append(regions, argv)
+		}
+		for _, text := range regions {
+			if b, name, found = directive.DetectRawControl(text); found {
+				return b, name, true
+			}
 		}
 	}
-	if body.Len() == 0 {
-		return slots
-	}
-	if _, fail := s.callTool(ctx, "shell_input", argsOf("shell_id", target, "text", body.String())); fail != nil {
-		return append(slots, failureSlot(fail))
-	}
-	for i := range slots {
-		if slots[i].Code < 400 {
-			slots[i].Body = ""
-		}
-	}
-	return slots
+	return 0, "", false
 }
 
 // parseErrorSlot renders a directive-level failure as one slot, so a bad
@@ -514,7 +526,7 @@ func (s *Server) parseErrorSlot(err error) envelope.Slot {
 		body += fmt.Sprintf("\nHINT: %q follows a `%s`, whose payload is ONE shell line. `;` and `&&` in\n"+
 			"cmd are termcp syntax — `;` separates statements and `&&` gates the next one — so a\n"+
 			"shell command line with its own operators belongs in args:\n"+
-			"  cmd: \"%s <handle> $1\"   args: [\"pwd; whoami\"]   or   args: [\"make && echo ok\"]",
+			"  cmd: \"%s <channel> $1\"   args: [\"pwd; whoami\"]   or   args: [\"make && echo ok\"]",
 			derr.Op, derr.AfterPayload, derr.AfterPayload)
 	}
 	if derr.Parsed > 0 {
@@ -599,10 +611,22 @@ func (t termReply) applyTotalCap(slots []envelope.Slot) []envelope.Slot {
 	total := 0
 	for i, slot := range slots {
 		if total >= t.win.TotalBytesLimit {
+			// AN EMPTY 206 IS NOT AN ANSWER. The statement RAN — this runs after
+			// execution — and its output was withheld because the reply had already
+			// spent the caller's total. The old reply was a slot with headers, code
+			// 206 and no body, which is what "this statement had nothing to say" looks
+			// like; the caller had no way to tell that a statement it asked for had
+			// produced output it never saw.
 			slot.Body = ""
 			if slot.Code < 400 {
 				slot.Code = 206
 			}
+			if slot.Headers == nil {
+				slot.Headers = map[string]string{}
+			}
+			slot.Headers["Dropped"] = fmt.Sprintf(
+				"this statement ran and its output was withheld: the reply had spent total_bytes_limit (%d). Run it alone, or raise total_bytes_limit",
+				t.win.TotalBytesLimit)
 			slots[i] = slot
 			continue
 		}
@@ -804,4 +828,4 @@ func fmtBytes(n int) string { return fmt.Sprintf("%d B", n) }
 // `help`/`learn_mode`, not in the tool's name or blurb. That is the difference
 // between a tool surface that can grow and one that cannot — every directive this
 // text listed would be a line to edit the day the command space gains one.
-const termDescription = "Run one terminal line on this instance and read its result: a session's bytes, a file, a listing, a directive's own output. No cmd = bearings (what runs, what is installed, the syntax); ext list = pinned capability (MCP servers, skills trees). Window parameters bound how much comes back, never what the command does."
+const termDescription = "Run one terminal line on this instance and read its result: a session's bytes, a file, a listing, a directive's own output. No cmd = bearings (what runs, what is installed, the syntax); ls ext = pinned capability (MCP servers, skills trees). Window parameters bound how much comes back, never what the command does."

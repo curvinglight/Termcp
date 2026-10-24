@@ -81,6 +81,20 @@ func sweepStaleBrowserProfiles() {
 // isolated profile and browser lifetime belong to this probe on every OS.
 func renderedProbeDOM(t *testing.T, chrome, path string) string {
 	t.Helper()
+	return renderedProbeDOMSized(t, chrome, path, 0, 0)
+}
+
+// renderedProbeDOMSized is renderedProbeDOM at a viewport the test chooses.
+//
+// THE SIZE IS PART OF THE QUESTION for anything about layout: the page has a
+// desktop frame and a narrow stacked one, and which of the two is under test is
+// decided by the width the browser happens to have. Left to the default window, a
+// test about the desktop columns was measuring the phone layout — and would have
+// passed or failed for reasons that had nothing to do with the code.
+//
+// A zero width leaves the browser's own window size alone.
+func renderedProbeDOMSized(t *testing.T, chrome, path string, width, height int) string {
+	t.Helper()
 	// The budget covers launching Chrome, loading the page and rendering the
 	// result. 30s was measured on a warm local machine and expired on a loaded CI
 	// runner (the read deadline fired at Page.navigate before the probe had
@@ -200,6 +214,11 @@ func renderedProbeDOM(t *testing.T, chrome, path string) string {
 	}
 	sessionID = attachment.SessionID
 	call("Page.enable", map[string]any{})
+	if width > 0 && height > 0 {
+		call("Emulation.setDeviceMetricsOverride", map[string]any{
+			"width": width, "height": height, "deviceScaleFactor": 1, "mobile": false,
+		})
+	}
 	call("Page.setLifecycleEventsEnabled", map[string]any{"enabled": true})
 	var navigation struct {
 		LoaderID  string `json:"loaderId"`

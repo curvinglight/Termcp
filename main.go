@@ -184,16 +184,31 @@ func main() {
 	isDaemonChild := os.Getenv(daemon.EnvChild) != ""
 	var idleTimeout time.Duration
 	if idleTimeoutArg != "" {
-		if daemonCmd != actionStart && daemonCmd != actionStdio && !isDaemonChild {
-			fmt.Fprintln(os.Stderr, "--idle-timeout only applies when a daemon instance is launched (termcp daemon start or termcp daemon stdio)")
-			os.Exit(2)
-		}
+		// A FLAG THAT DOES NOT APPLY IS NOT AN ERROR HERE (issue #152).
+		//
+		// This used to os.Exit(2), and the failure was SILENT to whatever launched the
+		// process: Start-Process returns a handle, the parent moves on, and the port
+		// simply never opens. The only way to tell "still starting" from "refused to
+		// start" was to poll the port.
+		//
+		// The distinction that matters is not "was this flag typed" but "can this
+		// invocation honour it". A value that cannot be PARSED is still an error — the
+		// caller asked for something specific and is not getting it. A value that parses
+		// but has no effect on a foreground instance is a no-op with a warning, because
+		// a launcher passing a common set of flags is the normal case and the cost of
+		// honouring it is one line on stderr.
 		d, err := time.ParseDuration(idleTimeoutArg)
 		if err != nil || d < 0 {
 			fmt.Fprintf(os.Stderr, "invalid --idle-timeout %q: expected a duration like 10m, or 0 to disable\n", idleTimeoutArg)
 			os.Exit(2)
 		}
-		idleTimeout = d
+		if daemonCmd != actionStart && daemonCmd != actionStdio && !isDaemonChild {
+			fmt.Fprintf(os.Stderr,
+				"note: --idle-timeout %s has no effect on a foreground instance; it only applies to "+
+					"a launched daemon (termcp daemon start / termcp daemon stdio). Continuing.\n", idleTimeoutArg)
+		} else {
+			idleTimeout = d
+		}
 	}
 
 	// The stdio forms' optional endpoint value names the endpoint the bridge
@@ -420,10 +435,6 @@ func runServer(cfg *config.Config, idleTimeoutArg string, idleTimeout time.Durat
 	}
 	mcpSrv.SetConnectionsListener(webuiH.NotifyClientsChanged)
 
-	// An approval decision must also wake an agent parked on shell_notify, so it
-	// learns the outcome without polling. Fan-out stays in one place: the web UI
-	// keeps its own listener (installed in Register) and this one forwards the
-	// same transitions to the notify subsystem's rules.
 	if verifier != nil {
 		mainSrv.Handler = auth.Middleware(verifier, mux)
 	}

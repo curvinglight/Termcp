@@ -7,24 +7,39 @@ import (
 	"time"
 )
 
+// TrimTail says how many trailing bytes of a window cannot complete a character, so
+// the read hands back whole ones and leaves the rest for the next read.
+//
+// THE BUFFER OWNS BYTES AND KNOWS NOTHING ABOUT TEXT. Where a character ends depends
+// on the charset, the charset is a property of the READ REQUEST, and the caller is the
+// only one holding it — so the rule travels with the call rather than being guessed
+// here. nil means "cut exactly where I said": a caller reading raw bytes (the browser
+// repainting a terminal, a frame) has no characters to protect.
+type TrimTail func(window []byte) int
+
 // Read returns bytes available ahead of the reader's cursor, then advances the cursor.
 // If maxBytes > 0, at most that many bytes are returned and the cursor advances by that amount;
 // if maxBytes == 0, all bytes from the cursor to the end of the buffer are returned.
 func (b *Buffer) Read(ctx context.Context, readerID int, timeout time.Duration, maxBytes int) ([]byte, error) {
-	return b.ReadLimited(ctx, readerID, timeout, maxBytes, 0)
+	return b.ReadLimited(ctx, readerID, timeout, maxBytes, 0, nil)
 }
 
 // ReadLimited returns output with byte and line limits applied before advancing the cursor.
 // If maxLines > 0, at most that many newline-terminated lines are returned; remaining
 // bytes stay unread so HasMore stays true.
-func (b *Buffer) ReadLimited(ctx context.Context, readerID int, timeout time.Duration, maxBytes, maxLines int) ([]byte, error) {
+//
+// trim, when non-nil, withholds a trailing sequence the caller's charset cannot
+// complete. Those bytes stay UNREAD, so the next read delivers them whole: the cursor
+// advances by what was actually returned, which is the same rule every other window
+// here follows.
+func (b *Buffer) ReadLimited(ctx context.Context, readerID int, timeout time.Duration, maxBytes, maxLines int, trim TrimTail) ([]byte, error) {
 	b.mu.Lock()
 	rs, ok := b.readers[readerID]
 	if !ok {
 		b.mu.Unlock()
 		return nil, ErrReader
 	}
-	if data := b.drainLocked(rs, maxBytes, maxLines); data != nil {
+	if data := b.drainLocked(rs, maxBytes, maxLines, trim); data != nil {
 		b.mu.Unlock()
 		return data, nil
 	}
@@ -52,7 +67,7 @@ func (b *Buffer) ReadLimited(ctx context.Context, readerID int, timeout time.Dur
 	default:
 	}
 
-	return b.waitForData(readerID, timeout, maxBytes, maxLines, wake, ctxDone)
+	return b.waitForData(readerID, timeout, maxBytes, maxLines, trim, wake, ctxDone)
 }
 
 // waitForData blocks until there is data, the deadline passes, the context is
@@ -68,7 +83,7 @@ func (b *Buffer) ReadLimited(ctx context.Context, readerID int, timeout time.Dur
 // one of the things it waits on - measured, 24 waiters went from 48 goroutines to
 // 24. The accuracy of the deadline is unchanged (both overshoot by about the same
 // amount on this machine); what changes is how much a waiter costs.
-func (b *Buffer) waitForData(readerID int, timeout time.Duration, maxBytes, maxLines int, wake <-chan struct{}, ctxDone <-chan struct{}) ([]byte, error) {
+func (b *Buffer) waitForData(readerID int, timeout time.Duration, maxBytes, maxLines int, trim TrimTail, wake <-chan struct{}, ctxDone <-chan struct{}) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
 
 	for {
@@ -78,7 +93,7 @@ func (b *Buffer) waitForData(readerID int, timeout time.Duration, maxBytes, maxL
 			b.mu.Unlock()
 			return nil, ErrReader
 		}
-		if data := b.drainLocked(rs, maxBytes, maxLines); data != nil {
+		if data := b.drainLocked(rs, maxBytes, maxLines, trim); data != nil {
 			b.mu.Unlock()
 			return data, nil
 		}
@@ -121,7 +136,7 @@ func (b *Buffer) waitForData(readerID int, timeout time.Duration, maxBytes, maxL
 
 // drainLocked copies up to one slice from readPos forward and advances readPos. b.mu held.
 // maxBytes/maxLines limit how far the cursor advances; unread data stays available.
-func (b *Buffer) drainLocked(rs *readerState, maxBytes, maxLines int) []byte {
+func (b *Buffer) drainLocked(rs *readerState, maxBytes, maxLines int, trim TrimTail) []byte {
 	end := int64(len(b.master))
 	if rs.readPos >= end {
 		return nil
@@ -145,12 +160,22 @@ func (b *Buffer) drainLocked(rs *readerState, maxBytes, maxLines int) []byte {
 		}
 	}
 	s := b.master[rs.readPos:endPos]
+	// THE CUT IS SOMEBODY ELSE'S DECISION. Trimming a trailing incomplete character
+	// needs the charset, which the buffer does not have and must not learn: it is a
+	// byte log, and the charset belongs to the read request. So the caller passes the
+	// rule (see TrimTail), and this is the one place it is applied — after every limit
+	// has been applied, before the cursor moves, because the withheld bytes have to
+	// stay unread for the next read to deliver them whole.
+	if trim != nil {
+		if drop := trim(s); drop > 0 && drop < len(s) {
+			s = s[:len(s)-drop]
+		}
+	}
 	out := make([]byte, len(s))
 	copy(out, s)
-	rs.readPos = endPos
+	rs.readPos += int64(len(s))
 	return out
 }
-
 func (b *Buffer) HasMore(readerID int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -170,6 +195,48 @@ func (b *Buffer) Cursor(readerID int) int64 {
 		return b.baseOffset + rs.readPos
 	}
 	return -1
+}
+
+// Seek moves one reader's cursor to an absolute stream offset.
+//
+// It exists because a POSITIONAL read (offset, from_line, tail_lines) does not move
+// any cursor, and a cursor that never moves is a cursor that lies: `read <channel>`
+// promises "the new bytes since the last read", while every `run` reads positionally —
+// so after a series of runs the first plain read replayed the whole channel from byte
+// zero (issue #162, S2). The caller had already seen those bytes; the reader had no
+// way to know.
+//
+// Backwards is allowed on purpose: `--offset 0` is a legal read, and a caller that
+// pages back and forth should not have its cursor pinned forward by that. Callers that
+// want "never rewind" ask for it (see advanceCursor in the mcp layer) rather than
+// getting it silently here.
+//
+// An offset before the retained window is clamped to the earliest byte still held,
+// because those bytes are gone: refusing would make a legal read fail for a reason the
+// caller cannot act on, and the reply's Content-Range already says where it really
+// started. An offset past the end is refused — that one is a caller mistake, and
+// silently clamping it forward would skip bytes the caller has not seen.
+func (b *Buffer) Seek(readerID int, pos int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	rs, ok := b.readers[readerID]
+	if !ok {
+		return ErrReader
+	}
+	end := b.baseOffset + int64(len(b.master))
+	if pos > end {
+		return fmt.Errorf("offset %d is past the end of the stream (%d)", pos, end)
+	}
+	if pos < b.baseOffset {
+		pos = b.baseOffset
+	}
+	rs.readPos = pos - b.baseOffset
+	// A reader parked at the new position may now have data (or may no longer be the
+	// reason a waiter is blocked), so waiters re-check. Seeking backwards over data a
+	// waiter is already blocked on is the case that needs this: without the wake it
+	// would sit there while bytes it can now read are available.
+	b.wakeLocked()
+	return nil
 }
 
 // BaseOffset returns the absolute offset of the earliest retained byte. Bytes

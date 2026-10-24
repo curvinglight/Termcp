@@ -26,8 +26,11 @@ func TestWriteToFinishedPipeSaysWhatHappened(t *testing.T) {
 
 	for _, cmd := range []string{"run " + h + " extra", "input " + h + " extra"} {
 		got := termText(t, s, map[string]any{"cmd": cmd, "timeout": 2})
-		if !strings.HasPrefix(got, "TERM/1 5") {
-			t.Fatalf("%s: expected a failure, got:\n%s", cmd, got)
+		// 409, NOT 5xx: the channel's process is over, which is a state of the thing
+		// being addressed, not a fault of the server. A 5xx sent a caller to retry a
+		// write that can never land (issue #144).
+		if !strings.HasPrefix(got, "TERM/1 409") {
+			t.Fatalf("%s: expected 409 (the channel is over, the line was fine), got:\n%s", cmd, got)
 		}
 		for _, want := range []string{"PIPE channel", "read " + h, "open <session>"} {
 			if !strings.Contains(got, want) {
@@ -88,4 +91,38 @@ func TestFinishedPipeRefusesTheWriteNotTheRead(t *testing.T) {
 		t.Errorf("the transcript must survive the refusal:\n%s", got)
 	}
 	termText(t, s, map[string]any{"cmd": "close " + h})
+}
+
+// TestCallerMistakesInInputAreNotServerFaults pins issue #144.
+//
+// A typo in a key name answered 500 operation_failed, and so did a write to a pipe
+// whose process had finished. Both are the same class of mistake — the request was
+// wrong — and 5xx says the opposite: retry, alarm, file a bug against the server.
+// The two are opposite in a way that matters to the caller (one line to fix, one
+// channel that is over), so they get two different 4xx codes.
+func TestCallerMistakesInInputAreNotServerFaults(t *testing.T) {
+	s := newTestServer(t)
+	h := openPipe(t, s, "sleep 30")
+	defer termText(t, s, map[string]any{"cmd": "close " + h})
+
+	// An unknown key name: the caller's argument, so 400 and a list to pick from.
+	got := termText(t, s, map[string]any{"cmd": "key " + h + " boguskey"})
+	if !strings.HasPrefix(got, "TERM/1 400") {
+		t.Errorf("an unknown key name answered %q, want 400:\n%s", strings.SplitN(got, "\n", 2)[0], got)
+	}
+	if !strings.Contains(got, "unknown key \"boguskey\"") {
+		t.Errorf("the refusal stopped naming the key:\n%s", got)
+	}
+	// The list is the useful half: it is what turns the error into a fix.
+	if !strings.Contains(got, "ctrl+c") {
+		t.Errorf("the refusal stopped listing the supported keys:\n%s", got)
+	}
+
+	// A channel whose process is gone: the resource's state, so 409.
+	dead := handleFrom(t, termText(t, s, map[string]any{"cmd": "connect internal --argv sh -c 'echo hi'"}))
+	waitForShellToExit(t, s, shellIDFromHandle(t, s, dead))
+	got = termText(t, s, map[string]any{"cmd": "key " + dead + " enter", "timeout": 2})
+	if !strings.HasPrefix(got, "TERM/1 409") {
+		t.Errorf("a key sent to a finished process answered %q, want 409:\n%s", strings.SplitN(got, "\n", 2)[0], got)
+	}
 }

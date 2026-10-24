@@ -68,6 +68,25 @@ func (s *Store) configPath(name string) (string, error) {
 	return filepath.Join(s.root(), name, "config.toml"), nil
 }
 
+// Exists reports whether a template is stored under name.
+//
+// ONE STAT, and that is the point: the alternative callers reached for was
+// `List()` — a ReadDir plus a Stat per entry — which turns "is this one configured"
+// into a whole-directory scan. Asking that question once per extension made the
+// listing O(n²) in filesystem calls (issue #152: 80 templates is 6480 stats), which
+// is milliseconds on a warm Linux box and seconds on a Windows machine where every
+// stat can be inspected first.
+//
+// An unusable name (one the reader would reject) is not a stored template.
+func (s *Store) Exists(name string) bool {
+	p, err := s.configPath(name)
+	if err != nil {
+		return false
+	}
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
 // Load reads and validates one extension by name.
 func (s *Store) Load(name string) (*Extension, error) {
 	p, err := s.configPath(name)

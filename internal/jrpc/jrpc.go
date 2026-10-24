@@ -92,14 +92,16 @@ var ErrClosed = errors.New("the channel is closed")
 // a wait with mu held made Close block until the reader's window expired, so
 // "stop now" became "stop in a few seconds".
 //
-// The three mutating concerns each have a mechanism that fits it:
+// The mutating concerns each have a mechanism that fits it:
 //
 //   - serialising calls is a ONE-SLOT SEMAPHORE (callGate). It is acquired, used,
 //     and released — never held while blocking on anything else.
-//   - hand-off between the socket reader and callers is the in channel. gorilla
-//     allows one reader, and readLoop is it.
-//   - the frame backlog is ev, itself a channel, so appending and popping need no
-//     coordination at all.
+//   - hand-off between the socket reader and callers is the DISPATCHER: one
+//     goroutine that is the only reader of the wire, and that decides where each
+//     frame goes. See dispatch below for why there cannot be two.
+//   - the frame backlog is ev, a slice guarded by evMu, because the queue has to be
+//     searched rather than popped: "the first frame with no id" is a filter, and a
+//     channel can only be drained.
 type Channel struct {
 	url       string
 	transport Transport
@@ -118,15 +120,22 @@ type Channel struct {
 	// next is the next id to hand out.
 	next atomic.Int64
 
-	// ev holds frames that arrived while a call waited for its own answer. A channel
-	// rather than a slice: it is the only structure that lets one goroutine append
-	// while another pops without a lock. Each entry carries the sequence number the
-	// wire reader gave it, so a caller that takes one can say WHICH frame it got and
-	// resume from there.
-	ev chan Framed
+	// ev holds frames no caller was waiting for: events, and answers to calls that
+	// already gave up. A slice rather than a channel because readers FILTER it —
+	// "the next frame with no id" and "anything at all" are different questions
+	// about the same queue, and popping to look is how a frame gets destroyed by a
+	// reader that did not want it.
+	evMu sync.Mutex
+	ev   []Framed
+
+	// waiters are the calls in flight, by id. The dispatcher hands an answer
+	// straight to the call that asked for it, which is the whole point of being the
+	// only reader: the match is decided in one place instead of raced for.
+	waitMu sync.Mutex
+	wait   map[string]chan Framed
 
 	// log is the receive history: every frame, numbered, retained in a bounded
-	// ring. The ev channel above is a QUEUE (popped once, then gone); this is the
+	// ring. The ev queue above is a BACKLOG (read once, then gone); this is the
 	// other question — "what arrived after n" — which has to stay answerable twice
 	// because CDP never replays an event.
 	log *frameLog
@@ -134,11 +143,20 @@ type Channel struct {
 	// shut reports that Close ran.
 	shut atomic.Bool
 
-	// in carries every frame the socket delivers; readErr carries why it stopped.
-	in      chan Framed
+	// readErr carries why the socket stopped; done is closed by Close, releasing
+	// blocked readers and senders; dead is closed by the read loop when the socket
+	// stops delivering, so a waiter learns the difference between "nothing yet" and
+	// "nothing ever again" without waiting out its whole window.
 	readErr chan error
-	done    chan struct{} // closed by onceClose, releasing blocked readers and senders
-	closeIn sync.Once     // closes c.in exactly once, whichever path ends the loop
+	done    chan struct{}
+	dead    chan struct{}
+	deadOne sync.Once
+
+	// evCond is signalled when ev gains a frame. The dispatcher appends; readers
+	// wait on it. A condition variable rather than a channel because a reader
+	// FILTERS the queue ("the next frame with no id") and must put back what it did
+	// not want, which a channel cannot do without spinning.
+	evCond *sync.Cond
 }
 
 // deadlineFreeConn wraps a net.Conn whose SetDeadline is unimplemented.
@@ -206,10 +224,11 @@ func Open(ctx context.Context, rawURL string, dial DialFunc) (*Channel, error) {
 	c := &Channel{
 		url:      rawURL,
 		callGate: make(chan struct{}, 1),
-		ev:       make(chan Framed, maxEvents),
+		wait:     make(map[string]chan Framed),
 		done:     make(chan struct{}),
 		log:      newFrameLog(maxEvents*8, 8<<20),
 	}
+	c.evCond = sync.NewCond(&c.evMu)
 	// The default transport dials from this process. Replacing its DialContext is the
 	// whole of the change: every request the channel makes, and every socket it opens,
 	// then travels inside the SSH connection.
@@ -230,8 +249,8 @@ func Open(ctx context.Context, rawURL string, dial DialFunc) (*Channel, error) {
 			return nil, fmt.Errorf("dial %s: %w", rawURL, err)
 		}
 		c.conn = conn
-		c.in = make(chan Framed, maxEvents)
 		c.readErr = make(chan error, 1)
+		c.dead = make(chan struct{})
 		go c.readLoop()
 	case "http", "https":
 		c.transport = HTTP
@@ -248,13 +267,26 @@ func (c *Channel) Transport() Transport { return c.transport }
 func (c *Channel) URL() string { return c.url }
 
 // readLoop is the channel's ONLY reader of the socket, for the life of the
-// connection.
+// connection — and therefore also the DISPATCHER: it decides, once, where each
+// frame goes.
 //
 // gorilla permits exactly one concurrent reader, and one reader that never stops is
-// also what keeps read deadlines off the socket: a wait now happens on c.in or on the
-// caller's context, never inside a read, so a window that expires leaves nothing
-// behind. The goroutine ends when the socket fails or Close runs — a socket close
-// makes the blocked read return, which is the only way out of it.
+// also what keeps read deadlines off the socket: a wait now happens on a channel or
+// on the caller's context, never inside a read, so a window that expires leaves
+// nothing behind. The goroutine ends when the socket fails or Close runs — a socket
+// close makes the blocked read return, which is the only way out of it.
+//
+// THE ROUTING IS THE POINT. Two consumers want frames from this socket — a Call
+// waiting for its own answer, and a reader (Take/Next/Recv) wanting the next frame of
+// some shape — and they used to compete for the same channel. That is a race the
+// caller loses silently: a Take issued while a call is in flight can lift the answer
+// out of the queue first, and the call then waits out its window and reports "no
+// answer" while the frame sits in a reader that did not ask for it. Deciding here, by
+// id, is what makes the two questions independent: an answer goes to the call that
+// asked for it, and everything else goes to the backlog.
+//
+// A frame is recorded in the log BEFORE any of that, so the history stays complete
+// whatever the routing does with the copy.
 func (c *Channel) readLoop() {
 	for {
 		_, raw, err := c.conn.ReadMessage()
@@ -265,7 +297,14 @@ func (c *Channel) readLoop() {
 			case c.readErr <- err:
 			default: // a reason was already recorded
 			}
-			c.closeIn.Do(func() { close(c.in) })
+			// The socket is gone: a waiter learns it here instead of waiting out its
+			// whole window for an answer that can no longer arrive. (Closing on the
+			// channel rather than broadcasting, because a broadcast only wakes a parked
+			// reader once — a later call would park again and time out.)
+			c.deadOne.Do(func() { close(c.dead) })
+			// A reader parked on the backlog has to learn that nothing more is
+			// coming, or it waits out its whole window for a frame that cannot arrive.
+			c.evCond.Broadcast()
 			return
 		}
 		payload := strings.TrimSpace(string(raw))
@@ -276,60 +315,124 @@ func (c *Channel) readLoop() {
 		// (the destructive read, a call waiting for its answer) sees a subset or
 		// a copy of this; numbering here is what makes `since n` mean "what the
 		// peer sent after n" rather than "what was still queued".
-		rec := c.record(payload)
-		// The send can block when nobody is reading and the buffer is full, and
-		// closing the socket does NOT release it — the read already succeeded. done is
-		// what Close closes, so this goroutine always ends.
-		select {
-		case c.in <- rec:
-		case <-c.done:
-			c.closeIn.Do(func() { close(c.in) })
-			return
-		}
+		c.dispatch(c.record(payload))
 	}
 }
 
-// awaitFrame returns the next frame from the socket, waiting no longer than ctx.
+// dispatch routes one frame: to the call waiting for its id, or to the backlog.
 //
-// nil and true mean a frame arrived; "" and false mean the wait itself expired (or
-// the socket is gone) — which is an answer about THIS WINDOW, not about the socket.
-// Nothing here can damage the connection.
-func (c *Channel) awaitFrame(ctx context.Context) (Framed, bool) {
+// AN ANSWER NOBODY IS WAITING FOR IS NOT RUBBISH. It goes to the backlog like an
+// event, because it is still the frame a later reader is owed: a peer answers a
+// `send`, or a call gave up just before its answer landed, and the only other copy
+// is the one the wire already delivered.
+func (c *Channel) dispatch(rec Framed) {
+	if rec.Event {
+		c.buffer(rec)
+		return
+	}
+	key := idKey(rec.Data)
+	if key == "" {
+		c.buffer(rec)
+		return
+	}
+	c.waitMu.Lock()
+	ch, waiting := c.wait[key]
+	c.waitMu.Unlock()
+	if !waiting {
+		c.buffer(rec)
+		return
+	}
+	// A one-slot channel and a non-blocking send: the waiter is either parked on it
+	// or already gone, and a blocked dispatcher would stall the only socket reader.
 	select {
-	case frame, ok := <-c.in:
-		if !ok {
-			return Framed{}, false
-		}
-		return frame, true
-	case <-c.done:
-		// Close ran, so nothing more will arrive. Without this arm a waiting reader
-		// would only ever see its window expire, turning "stop now" into "stop in a few
-		// seconds".
-		return Framed{}, false
-	case <-ctx.Done():
-		return Framed{}, false
+	case ch <- rec:
+	default:
+		c.buffer(rec)
 	}
 }
 
-// awaitAnswer waits for the frame carrying want, buffering anything else, up to ctx.
+// idKey renders a frame's id for map lookup, or "" when it has none.
+//
+// The text form is what makes `1` and `"1"` the same key: a JSON-RPC peer may echo
+// a numeric id as a string, and refusing that would be a protocol-lawyer's answer to
+// a question nobody asked.
+func idKey(payload string) string {
+	var probe struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &probe); err != nil {
+		return ""
+	}
+	if len(probe.ID) == 0 || bytes.Equal(probe.ID, []byte("null")) {
+		return ""
+	}
+	return unquoteID(string(probe.ID))
+}
+
+// waitKey renders an id VALUE the same way idKey renders one read off the wire, so a
+// waiter registered under a key matches the frame that carries it. The two sides have
+// to agree on the spelling: this side has the value it put in the frame, the other has
+// the JSON text the peer echoed.
+func waitKey(want any) string {
+	switch v := want.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	default:
+		return unquoteID(jsonText(want))
+	}
+}
+
+// awaitAnswer waits for the frame carrying want, up to ctx.
+//
+// THE ANSWER IS DELIVERED, NOT COMPETED FOR. This registers a one-slot channel under
+// the id and lets the dispatcher hand the frame to it, so a concurrent Take cannot
+// lift it out from underneath: the routing decision was already made by id, in one
+// place. What this used to do was read the shared queue itself and put back what it
+// did not want, which meant an answer could be taken by whoever read first.
 func (c *Channel) awaitAnswer(ctx context.Context, want any) (string, error) {
-	for {
+	key := waitKey(want)
+	if key == "" {
+		// No id on the frame we sent, so no answer can be matched to it. That is a
+		// notification, and Call on one is a caller error rather than a wait.
+		return "", errors.New("the frame carries no id, so no answer can be matched to it")
+	}
+	ch := make(chan Framed, 1)
+	c.waitMu.Lock()
+	c.wait[key] = ch
+	c.waitMu.Unlock()
+	// DEREGISTERING IS WHERE A DEADLINE RACE IS MADE HARMLESS. The dispatcher can
+	// deliver in the same instant the window closes; if this simply returned, that
+	// frame would sit in a channel nobody will ever read again and the result would
+	// be gone. So whatever arrived is put back into the backlog on the way out,
+	// where a later Take can still find it.
+	defer func() {
+		c.waitMu.Lock()
+		delete(c.wait, key)
+		c.waitMu.Unlock()
 		select {
-		case frame, ok := <-c.in:
-			if !ok {
-				return "", c.readFailure()
-			}
-			if carriesID(frame.Data, want) {
-				return frame.Data, nil
-			}
-			c.buffer(frame)
-		case <-c.done:
-			return "", ErrClosed
-		case <-ctx.Done():
-			// The window expired with no answer. Nothing was damaged, so a later call
-			// can still use the channel.
-			return "", ctx.Err()
+		case rec := <-ch:
+			c.buffer(rec)
+		default:
 		}
+	}()
+	select {
+	case rec := <-ch:
+		return rec.Data, nil
+	case <-c.dead:
+		// The socket stopped: an answer can no longer arrive, and this is NOT a
+		// timeout — the caller has to be able to tell "the peer went away" from "the
+		// peer is thinking".
+		return "", c.readFailure()
+	case <-c.done:
+		return "", ErrClosed
+	case <-ctx.Done():
+		// The window expired with no answer. Nothing was damaged, so a later call
+		// can still use the channel.
+		return "", ctx.Err()
 	}
 }
 
@@ -469,55 +572,123 @@ func (c *Channel) TakeFramed(ctx context.Context) (Framed, bool) {
 	if c.transport != WS {
 		return Framed{}, false
 	}
-	return c.awaitFrame(ctx)
+	// Wait on the backlog until a frame arrives, Close runs, or ctx expires.
+	c.evMu.Lock()
+	defer c.evMu.Unlock()
+	for len(c.ev) == 0 {
+		if c.shut.Load() || ctx.Err() != nil || c.socketGone() {
+			return Framed{}, false
+		}
+		// A helper goroutine releases the condition when ctx or done closes, so a
+		// wait can end on the caller's deadline.
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				c.evCond.Broadcast()
+			case <-c.done:
+				c.evCond.Broadcast()
+			case <-stop:
+			}
+		}()
+		c.evCond.Wait()
+		close(stop)
+		if len(c.ev) > 0 {
+			break
+		}
+		if c.shut.Load() || ctx.Err() != nil || c.socketGone() {
+			return Framed{}, false
+		}
+	}
+	frame := c.ev[0]
+	c.ev = c.ev[1:]
+	return frame, true
 }
 
 // Next waits up to the context's deadline for the next frame that is NOT an
 // answer to a call, and returns it.
 //
-// This is what makes recv worth having. An event arrives on its own schedule — a
-// page finishing a load fires Page.loadEventFired AFTER Page.navigate answered —
-// so a reader that only looks at what a previous call happened to catch sees
-// nothing. Next reads the socket itself, so the wait is the caller's window and
-// not a guess about how long a peer takes.
-//
-// On a channel with no push side (HTTP answers per request) it reports "nothing"
-// immediately rather than waiting out a deadline that could not be met.
+// SKIPPING IS NOT CONSUMING. An answer to a send is owed to a later Take, so Next
+// leaves it in the backlog rather than dropping it or putting it back at the end of
+// the queue. The queue is a slice rather than a channel precisely for this: finding
+// the first event is a filter, and what is not taken stays where it was.
 func (c *Channel) Next(ctx context.Context) (string, bool) {
 	if c.shut.Load() {
 		return "", false
 	}
-	if frame, ok := c.pop(); ok {
+	if frame, ok := c.popEvent(); ok {
 		return frame.Data, true
 	}
 	if c.transport != WS {
 		return "", false
 	}
-	// THE WAIT IS ON A CHANNEL, NOT ON THE SOCKET. A read deadline that fires leaves
-	// gorilla's cached read error set forever, so one expired window made the channel
-	// permanently deaf while the peer's frame sat unread on the wire.
+	c.evMu.Lock()
+	defer c.evMu.Unlock()
 	for {
-		frame, ok := c.awaitFrame(ctx)
-		if !ok {
+		for i, f := range c.ev {
+			if f.Event {
+				c.ev = append(c.ev[:i], c.ev[i+1:]...)
+				return f.Data, true
+			}
+		}
+		if c.shut.Load() || ctx.Err() != nil || c.socketGone() {
 			return "", false
 		}
-		if hasID(frame.Data) {
-			// An answer to a call nobody is waiting for is still data: keep it.
-			c.buffer(frame)
-			continue
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				c.evCond.Broadcast()
+			case <-c.done:
+				c.evCond.Broadcast()
+			case <-stop:
+			}
+		}()
+		c.evCond.Wait()
+		close(stop)
+		if c.shut.Load() || ctx.Err() != nil {
+			return "", false
 		}
-		return frame.Data, true
+	}
+}
+
+// popEvent extracts the oldest event frame, leaving any answers in place.
+func (c *Channel) popEvent() (Framed, bool) {
+	c.evMu.Lock()
+	defer c.evMu.Unlock()
+	for i, f := range c.ev {
+		if f.Event {
+			c.ev = append(c.ev[:i], c.ev[i+1:]...)
+			return f, true
+		}
+	}
+	return Framed{}, false
+}
+
+// socketGone reports that the read loop has stopped, so no further frame can
+// arrive on this channel.
+func (c *Channel) socketGone() bool {
+	if c.dead == nil {
+		return false
+	}
+	select {
+	case <-c.dead:
+		return true
+	default:
+		return false
 	}
 }
 
 // pop takes the oldest buffered frame.
 func (c *Channel) pop() (Framed, bool) {
-	select {
-	case frame := <-c.ev:
-		return frame, true
-	default:
+	c.evMu.Lock()
+	defer c.evMu.Unlock()
+	if len(c.ev) == 0 {
 		return Framed{}, false
 	}
+	frame := c.ev[0]
+	c.ev = c.ev[1:]
+	return frame, true
 }
 
 // Close shuts the channel. A socket is closed with a normal closure frame so the
@@ -617,27 +788,26 @@ func (c *Channel) httpPost(ctx context.Context, frame map[string]any) (*http.Res
 	return resp, nil
 }
 
-// buffer keeps an unmatched frame for Recv, dropping the oldest past the cap.
+// buffer keeps an unmatched frame for a later reader, dropping the oldest past the
+// cap.
 //
-// A non-blocking send: a full backlog means the reader is not draining, and the
-// documented policy for that is "lose the oldest" — blocking here would stall the
-// only socket reader instead.
+// A slice rather than a channel because readers FILTER it: "the next frame with no
+// id" and "anything at all" are two questions about one queue, and a queue that can
+// only be popped is how a frame gets destroyed by a reader that did not want it.
+//
+// The cap is the documented policy for a reader that is not draining: lose the
+// oldest, never block the only socket reader.
 func (c *Channel) buffer(frame Framed) {
 	if frame.Data == "" {
 		return
 	}
-	for {
-		select {
-		case c.ev <- frame:
-			return
-		default:
-		}
-		// Full: drop the oldest and retry.
-		select {
-		case <-c.ev:
-		default:
-		}
+	c.evMu.Lock()
+	c.ev = append(c.ev, frame)
+	if len(c.ev) > maxEvents {
+		c.ev = append(c.ev[:0], c.ev[len(c.ev)-maxEvents:]...)
 	}
+	c.evCond.Broadcast()
+	c.evMu.Unlock()
 }
 
 // deadlineOf is the read/write deadline for one call: the context's own, or the

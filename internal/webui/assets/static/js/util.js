@@ -181,6 +181,22 @@ function splitCommandLine(line) {
   return out;
 }
 
+/**
+ * The message a failed upload should show.
+ *
+ * The upload endpoint answers errors as JSON ({"error":"..."}), and a proxy or a
+ * dead connection answers with something else entirely — HTML, an empty body, or
+ * nothing at all. Parsing is attempted, never assumed: a toast that says
+ * "undefined" is worse than one that says "500".
+ */
+function uploadErrorText(xhr) {
+  try {
+    var doc = JSON.parse(xhr.responseText || '');
+    if (doc && doc.error) return String(doc.error);
+  } catch (e) { /* not JSON; fall through to the status */ }
+  return String(xhr.status) + (xhr.statusText ? ' ' + xhr.statusText : '');
+}
+
 function showCopyToast(msg) {
   msg = msg || t('toast.copied');
   var el = document.getElementById('ui-copy-toast');
@@ -694,6 +710,21 @@ function bringShellWindowToFront(win) {
     refreshSessionTabbar();
     return;
   }
+
+  /* A WINDOW IS CHECKED FOR BEING OFF-SCREEN WHEN IT GAINS FOCUS.
+   *
+   * The clamp exists, but until now it only ran on drag release, so anything else
+   * that moved the container out from under a window left it there: shrink the
+   * browser and a window placed at 1400px sits entirely past the right edge at
+   * 900px, with no header left to grab. Clicking its tab is the moment the reader
+   * asks for it, so that is the moment to bring it back — every activation path
+   * already funnels through here (tab bar, session tile, extension card, restore,
+   * duplicate, drag start), which is why the check belongs at this point and not
+   * in a resize listener that would move windows the reader never touched.
+   *
+   * Full-screen and tiled windows are excluded by the returns above: their
+   * geometry is the stylesheet's, and an inline left/top would override it. */
+  if (typeof clampShellWindowIntoContainer === 'function') clampShellWindowIntoContainer(win);
 
   var band = shellZBand();
   if (!window._shellZSeq || window._shellZSeq < band.low || window._shellZSeq >= band.high) {

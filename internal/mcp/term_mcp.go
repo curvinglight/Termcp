@@ -54,7 +54,7 @@ func (s *Server) mcpStdio(ctx context.Context, stmt directive.Statement, sub str
 			// `cdp send 'not json'` already answered 400; the two used to disagree about
 			// what "sent" means.
 			if !json.Valid([]byte(payload)) {
-				return badRequest(stmt, "the frame is not JSON")
+				return badRequest(stmt, "the frame is not JSON\n"+frameSpelling)
 			}
 			frame = payload
 		}
@@ -383,4 +383,25 @@ func isSyntaxEOF(err error) bool {
 		return false
 	}
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// closedReadCursor and setClosedReadCursor keep one read position per CLOSED
+// channel, which is where the default `read` of a persisted stream starts.
+//
+// A live channel's position lives in its ring-buffer reader; a closed one has no
+// such reader, and a position that is not kept anywhere is a default read that
+// replays the same bytes forever (#159 C1).
+func (s *Server) closedReadCursor(key string) int64 {
+	s.closedReadMu.Lock()
+	defer s.closedReadMu.Unlock()
+	return s.closedReads[key]
+}
+
+func (s *Server) setClosedReadCursor(key string, at int64) {
+	s.closedReadMu.Lock()
+	defer s.closedReadMu.Unlock()
+	if s.closedReads == nil {
+		s.closedReads = make(map[string]int64)
+	}
+	s.closedReads[key] = at
 }

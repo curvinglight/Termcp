@@ -16,8 +16,10 @@ const (
 	// A pattern like "." matches every line, so without a bound the "filtered"
 	// read would be larger than the unfiltered one it replaced.
 	grepDefaultLimit = 200
-	// grepMaxLimit is the ceiling a caller may ask for.
-	grepMaxLimit = 5000
+	// grepRecommendedLimit is the number of matches one reply should stay under, published
+	// as a recommendation. It is not a ceiling: the caller pays for the reply, and a
+	// silent cap would answer a different question than the one asked.
+	grepRecommendedLimit = 5000
 	// grepMaxScanBytes bounds how much transcript one --grep will read. The scan
 	// is local (memory or a local file), but "local" is not "free": a 200 MB log
 	// is still 200 MB of reading, and a caller that asked for the last 20 errors
@@ -55,10 +57,12 @@ func (s *Server) readGrep(ctx context.Context, stmt directive.Statement, win ter
 			return badRequest(stmt, "`--grep-limit` must be a number, got "+strconv.Quote(v))
 		}
 		if n > 0 {
+			// NO SILENT CEILING. It used to be capped at grepMaxLimit, so a caller that asked
+			// for 10000 matches got 5000 and learned the ceiling only if the reply happened to
+			// truncate — a space budget is the caller's to choose (it pays for the reply), and
+			// a capped number is a different call than the one it made. The scan is bounded
+			// separately (grepMaxScanBytes), so a large limit cannot make the server read more.
 			limit = n
-		}
-		if limit > grepMaxLimit {
-			limit = grepMaxLimit
 		}
 	}
 
@@ -75,6 +79,14 @@ func (s *Server) readGrep(ctx context.Context, stmt directive.Statement, win ter
 	}
 	if boolFlag(stmt, "raw") {
 		args["strip_ansi"] = false
+	}
+	// THE SAME ENCODING APPLIES TO A SEARCH, and it has to: `--grep 以下` against a
+	// GBK transcript compared a UTF-8 pattern with GBK bytes, scanned 282 real lines,
+	// matched none, and answered 200 — indistinguishable from "that string is not
+	// there" (issue #149). The decode happens in the reader, so the pattern and the
+	// text it is matched against are both characters.
+	if v, ok := stmt.Flag("encoding"); ok {
+		args["charset"] = v
 	}
 	// A GREP DOES NOT CONSUME THE TRANSCRIPT: it uses a positional read (from_line 1),
 	// which is stateless and never touches the caller's live cursor. An ordinary read
@@ -147,7 +159,7 @@ func (s *Server) readGrep(ctx context.Context, stmt directive.Statement, win ter
 		"Matches":       fmt.Sprint(hits),
 	}
 	if truncated {
-		headers["Truncated"] = fmt.Sprintf("showing %d of %d matches; raise --grep-limit (max %d)", len(matched), hits, grepMaxLimit)
+		headers["Truncated"] = fmt.Sprintf("showing %d of %d matches; raise --grep-limit (recommended max %d)", len(matched), hits, grepRecommendedLimit)
 	}
 
 	// The line window applies to the MATCHES: `--tail 5` on a grep means the last

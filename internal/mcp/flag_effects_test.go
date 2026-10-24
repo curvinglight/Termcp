@@ -19,7 +19,12 @@ func TestFlagsThatOnlyMatterServerSide(t *testing.T) {
 	t.Run("read-cursor-advances", func(t *testing.T) {
 		h := openPty(t, s)
 		defer termText(t, s, map[string]any{"cmd": "close " + h})
-		termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo cursor-marker"}})
+		// TYPED, NOT RUN. `run` reads the window it produced, and that read now advances
+		// the default cursor (issue #162 S2), so a plain read after it has nothing left
+		// to return and two empty replies would look like "the cursor never advanced".
+		// input/key do not read, so the bytes are still there for the read to consume.
+		termText(t, s, map[string]any{"cmd": "input " + h + " $1", "args": []any{"echo cursor-marker"}})
+		termText(t, s, map[string]any{"cmd": "key " + h + " enter"})
 		waitForContent(t, s, h, "cursor-marker")
 
 		first := termText(t, s, map[string]any{"cmd": "read " + h})

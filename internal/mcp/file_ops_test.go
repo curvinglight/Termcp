@@ -121,7 +121,12 @@ func TestEveryWriteOpReachesTheFile(t *testing.T) {
 			t.Fatal(err)
 		}
 		dst := filepath.Join(dir, "dst.txt")
-		write("write " + sid + " file " + dst + " --local-path " + src)
+		res := write("write " + sid + " file " + dst + " --local-path " + src)
+		// A TRANSFER ANSWERS WITH A RECEIPT (202 Accepted, #158). Wait for the task
+		// using `get task <id>` — the way a caller does.
+		if taskID := headerValueOr(res, "Task", ""); taskID != "" {
+			termText(t, s, map[string]any{"cmd": "get task " + taskID, "timeout": 5})
+		}
 		if b, _ := os.ReadFile(dst); string(b) != "uploaded body" {
 			t.Errorf("uploaded content = %q, want %q", b, "uploaded body")
 		}

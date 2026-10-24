@@ -199,9 +199,11 @@ func TestConsoleStateIsPaintedOnTheWindow(t *testing.T) {
 func TestEmptyPlatesSpeakThroughTheCatalog(t *testing.T) {
 	sessions := readAssetLF(t, "static/js/sessions.js")
 	css := readAppCSS(t)
-	for _, want := range []string{"t('plate.sessions.empty')", "t('plate.archive.empty')", "'sess-plate-empty'"} {
+	// ONE plate is left: the archive. Its sentence is `archive.empty.hint`, and the
+	// card plate's `plate.sessions.empty` went with the cards (#160).
+	for _, want := range []string{"t('archive.empty.hint')", "sess-plate-empty"} {
 		if !strings.Contains(sessions, want) {
-			t.Errorf("sessions.js misses %q; an empty plate would say nothing", want)
+			t.Errorf("sessions.js misses %q; an empty archive would say nothing", want)
 		}
 	}
 	// A sentence in the stylesheet is a sentence no catalog can translate. The
@@ -211,7 +213,7 @@ func TestEmptyPlatesSpeakThroughTheCatalog(t *testing.T) {
 	}
 	// Before the first server frame every plate is trivially empty; claiming "no
 	// live sessions" then would be a statement about a list the page has not read.
-	if !strings.Contains(sessions, "rows.length === 0 && window._lastSessionsSnapshot") {
+	if !strings.Contains(sessions, "window._lastSessionsSnapshot ? t('archive.empty.hint') : ''") {
 		t.Error("the empty state must wait for the first snapshot, not announce emptiness on a page that has not loaded yet")
 	}
 

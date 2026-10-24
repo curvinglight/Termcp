@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/directive"
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
@@ -37,6 +39,30 @@ func (s *Server) handleStartSession(ctx context.Context, request mcpgo.CallToolR
 	cmd, execArgs := sshconfig.EffectiveCommand(ent, command, toolArgs)
 	if strings.TrimSpace(cmd) == "" && len(execArgs) > 0 {
 		return toolError(CodeInvalidArgument, "%s", "command is required when args are provided"), nil
+	}
+
+	// A PROFILE'S SHELL MUST EXIST, AND THAT IS CHECKABLE BEFORE ANYTHING STARTS.
+	//
+	// issue #154: a profile with default_shell = "nosuchshell_xyz" answered 200 with a
+	// handle, and `ls` a moment later showed the channel already `exited` — the caller
+	// was promised a pty and got a corpse, with the reason only visible by reading the
+	// channel. For automation the difference is everything: 200 means "you have a
+	// shell".
+	//
+	// The check is the PROFILE's shell, not the caller's command. A command is allowed
+	// to be anything and to exit immediately (`--argv echo hi` is a working one-shot),
+	// so a session that dies quickly is not by itself a failure. A profile is different:
+	// it names the shell every session on that host gets, it was written once and
+	// reused, and if the program is missing then every session from it is dead on
+	// arrival. That is a fact about the config, so it is answered as one.
+	//
+	// Only the loopback case can be checked here — a remote profile's PATH lives on the
+	// target, and probing it would mean running something on the host to answer a
+	// question about the config. For remote the check is skipped rather than guessed.
+	if command == "" && len(toolArgs) == 0 && ent != nil && remote == nil {
+		if err := profileShellExists(ent); err != nil {
+			return toolError(CodeShellNotFound, "%s", err.Error()), nil
+		}
 	}
 
 	mode := sshconfig.EffectiveMode(ent, getString(args, "mode", ""))
@@ -101,6 +127,35 @@ func stderrReceipt(mode string) string {
 		return "separate"
 	}
 	return "merged(pty)"
+}
+
+// profileShellExists reports why a loopback profile's default_shell cannot be run.
+//
+// The first field is the program and the rest are its arguments, matching how
+// EffectiveDefaultShell splits the line — so `bash -l` checks `bash`, which is the
+// only part that has to exist.
+//
+// A profile that names no shell is fine: the session then asks the server for its
+// own, which is the case that cannot fail here.
+func profileShellExists(ent *sshconfig.Entry) error {
+	line := sshconfig.EffectiveDefaultShell(ent)
+	if line == "" {
+		return nil
+	}
+	// THE PROGRAM NAME COMES FROM THE GRAMMAR, not from splitting on whitespace: a shell
+	// path is a shell WORD, and `"C:\Program Files\pwsh.exe" -NoLogo` is one word followed
+	// by an argument. Splitting it by hand read the path as `"C:\Program` and reported a
+	// profile as broken when the only thing wrong was how this function read it.
+	prog, _, err := directive.SplitArgv(line)
+	if err != nil || prog == "" {
+		// An unparseable shell line is the profile's problem, and it is reported where the
+		// profile is used rather than guessed at here.
+		return nil
+	}
+	if _, err := exec.LookPath(prog); err != nil {
+		return fmt.Errorf("default_shell %q is not runnable on this host, so every session from this profile would die on arrival: %w", prog, err)
+	}
+	return nil
 }
 
 func (s *Server) handleSendInput(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -186,7 +241,7 @@ func (s *Server) writeShellInput(ctx context.Context, shell *session.ChildShell,
 	// An agent's keystrokes are tagged as AI input, so a transcript can say who
 	// typed what. The bytes themselves reach the log through the terminal's echo.
 	if err := shell.SendTerminalBytesFrom([]byte(text), false, callerInputSource(ctx)); err != nil {
-		return nil, toolError(CodeOperationFailed, "%s", err.Error())
+		return nil, toolError(inputErrCode(err), "%s", err.Error())
 	}
 	return result, nil
 }
@@ -235,13 +290,13 @@ func (s *Server) pressShellKey(ctx context.Context, shell *session.ChildShell, k
 		// ctrl+c interrupts a running process, and a bare enter runs an empty line,
 		// either of which a reviewer must still see.
 		if _, err := shell.CommitStagedForApproval(callerSource(ctx), key, repeat); err != nil {
-			return nil, toolError(CodeOperationFailed, "%s", err.Error())
+			return nil, toolError(inputErrCode(err), "%s", err.Error())
 		}
 		return reviewFields(true), nil
 	}
 
 	if err := shell.PressKeyFrom(key, repeat, callerInputSource(ctx)); err != nil {
-		return nil, toolError(CodeOperationFailed, "%s", err.Error())
+		return nil, toolError(inputErrCode(err), "%s", err.Error())
 	}
 	return map[string]any{"success": true}, nil
 }
@@ -433,9 +488,28 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 		return bad, nil
 	}
 
+	// A CLOSED CHANNEL KEEPS ITS OWN POSITION (#159 C1).
+	//
+	// `read <ch>` on a live channel means "what is new since my last read". On a
+	// closed one it used to mean "the tail", which reads the same and is not: the
+	// same call returned the same bytes on every poll, so a caller watching an
+	// extension's output re-read its whole history each time and the offsets never
+	// moved. The cursor makes the closed case mean what the live case means; an
+	// explicit offset (0 included) is still the full replay, and an explicit tail
+	// is still a tail.
+	key := ""
+	if src.Live == nil && p.Offset == nil && p.FromLine == 0 && p.TailLines == nil && !p.TailBytes {
+		key = src.SessID + "\x00" + src.ShellID
+		at := s.closedReadCursor(key)
+		p.Offset = &at
+	}
+
 	w, err := transcript.Read(ctx, src, p)
 	if err != nil {
 		return toolResultForErr(err), nil
+	}
+	if key != "" {
+		s.setClosedReadCursor(key, w.End)
 	}
 	return jsonResult(windowResult(w, src)), nil
 }
@@ -508,12 +582,18 @@ func parseReadParams(args map[string]any) (readParams, *mcpgo.CallToolResult) {
 		// scanTailWindow read as "no line limit" and answered with the ENTIRE
 		// buffer. The smallest possible request produced the largest possible
 		// answer.
+		// THE SESSION'S ENCODING, when the caller knows it. A terminal is not a
+		// UTF-8 device: a zh-CN Windows console writes GBK, and without this the
+		// reply was a refusal the caller could not act on (issue #149).
+		Charset:   getString(args, "charset", ""),
 		TailLines: intPtrFromArgs(args, "tail_lines"),
 		FromLine:  int64(getFloat64(args, "from_line", 0)),
 		Stream:    getString(args, "stream", ""),
 	}
 	if p.Timeout < 0 || p.Timeout > 60 {
-		return readParams{}, toolError(CodeInvalidArgument, "%s", fmt.Sprintf("timeout must be between 0 and 60, got %v", p.Timeout))
+		// NO UPPER BOUND: this is the same number the `timeout` argument documents as a
+		// recommendation. Refusing it here would make the tool's own schema a lie.
+		return readParams{}, toolError(CodeInvalidArgument, "%s", fmt.Sprintf("timeout must not be negative, got %v", p.Timeout))
 	}
 	if err := transcript.ValidateParams(p); err != nil {
 		return readParams{}, toolResultForErr(err)
@@ -539,10 +619,17 @@ func windowResult(w transcript.Window, src *transcript.Source) map[string]any {
 		"end_offset":         w.End,
 		"total_bytes":        w.Total,
 		"partial_tail_bytes": w.PartialTail,
-		"source":             src.SourceName(),
-		"session_id":         src.SessID,
-		"shell_id":           src.ShellID,
-		"session_status":     string(src.Status),
+		// Non-zero only when the window was rolled back to avoid ending inside a
+		// character. The bytes are still in the stream (the window stops before them),
+		// so this is a count, not a loss.
+		"trimmed_bytes": w.Trimmed,
+		// Bytes inside the range that a stream filter passed over. Non-zero means the
+		// cursor moved past bytes this reply did not show.
+		"stream_omitted_bytes": w.StreamOmitted,
+		"source":               src.SourceName(),
+		"session_id":           src.SessID,
+		"shell_id":             src.ShellID,
+		"session_status":       string(src.Status),
 	}
 	if w.TotalLines > 0 {
 		result["total_lines"] = w.TotalLines
@@ -799,4 +886,25 @@ func int64PtrFromArgs(args map[string]any, key string) *int64 {
 	}
 	v := int64(getFloat64(args, key, 0))
 	return &v
+}
+
+// inputErrCode classifies a failed write to a channel.
+//
+// THE TWO FAILURES ON THIS PATH ARE OPPOSITES AND USED TO SHARE ONE STATUS. A typo
+// in a key name answered 500 operation_failed, and so did writing to a pipe whose
+// process had already finished: a caller that retries on 5xx, alarms on 5xx, or
+// files a bug against 5xx does the wrong thing in both cases. One of them is the
+// caller's line being wrong (400), the other is the resource's state (409).
+//
+// The sentinels are in internal/session, next to the errors they name, because
+// that is where the distinction is created; a surface that guessed from the
+// message text would be re-deriving it in the wrong layer.
+func inputErrCode(err error) string {
+	switch {
+	case errors.Is(err, session.ErrUnknownKey):
+		return CodeInvalidArgument
+	case errors.Is(err, session.ErrProcessGone):
+		return CodeSessionNotRunning
+	}
+	return CodeOperationFailed
 }

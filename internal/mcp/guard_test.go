@@ -328,15 +328,14 @@ func TestGuardGatesLocalPath(t *testing.T) {
 
 var _ = context.Background
 
-// TestGuardResolvesIndirectResourceIDs pins the last two ways a call could name
-// work without naming a session.
+// TestGuardResolvesIndirectResourceIDs pins the way a call could name work
+// without naming a session.
 //
-// Two tools address what they act on by the RESOURCE's own id: forward(action=close)
-// takes forward_id and shell_notify(action=unregister) takes rule_id. Neither
-// argument was one the guard read, so the call resolved to no session, skipped the
-// check, and reached the handler — a caller holding a restricted extension handle
-// could close a tunnel it was never granted, or unregister a rule belonging to a
-// session it may not touch. That is the same hole the REST forward-close route had
+// forward(action=close) addresses what it acts on by the RESOURCE's own id:
+// forward_id. That argument was not one the guard read, so the call resolved to no
+// session, skipped the check, and reached the handler — a caller holding a
+// restricted extension handle could close a tunnel it was never granted. That is
+// the same hole the REST forward-close route had
 // (internal/webui/handler_forward.go looks the owner up for exactly this reason),
 // on the surface an extension handle actually reaches.
 //

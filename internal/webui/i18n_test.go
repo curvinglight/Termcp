@@ -225,10 +225,10 @@ func TestCoreKeysTranslated(t *testing.T) {
 		// session card can raise: a page whose columns or prompts are untranslated
 		// is untranslated, whatever the rest of the catalog says.
 		"sec.archive", "nav.extensions", "nav.nethub",
-		"session.delete.title", "session.delete.message", "session.status.running",
+		"session.delete.title", "session.status.running",
 		"modal.forward.title", "modal.conn.titleAdd", "modal.start.title",
 		"common.cancel", "common.delete", "common.close", "common.confirm",
-		"fw.panel.title", "win.files.tab", "win.notify.tab", "win.term.tab",
+		"fw.panel.title", "win.files.tab", "win.term.tab",
 		"common.download", "common.upload", "banner.dismiss", "lang.auto",
 		"modal.forward.dir.local", "modal.forward.dir.remote",
 	}

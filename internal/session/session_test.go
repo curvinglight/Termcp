@@ -711,7 +711,7 @@ func TestChildShell_ReadTerminalStreamWithMaxLinesPreservesUnreadData(t *testing
 		t.Fatal(err)
 	}
 
-	output, _, _, err := cs.ReadTerminalStream(context.Background(), r, 0, false, 2, 0)
+	output, _, _, err := cs.ReadTerminalStream(context.Background(), r, 0, false, 2, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,7 +722,7 @@ func TestChildShell_ReadTerminalStreamWithMaxLinesPreservesUnreadData(t *testing
 		t.Fatal("expected unread output after max_lines read")
 	}
 
-	output, _, _, err = cs.ReadTerminalStream(context.Background(), r, 0, false, 0, 0)
+	output, _, _, err = cs.ReadTerminalStream(context.Background(), r, 0, false, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

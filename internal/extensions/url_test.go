@@ -111,6 +111,45 @@ func TestCreateURLTemplateThroughApplyArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("the notes describe the shape that was created", func(t *testing.T) {
+		// #159 D1: the preset filled in the STDIO recipe before the URL was known,
+		// so a create kept instructions whose first line tells the reader to run a
+		// command this template does not have. An author's own notes are still
+		// theirs, which is the other half of the rule.
+		viaURL := Preset(KindMCP)
+		viaURL.Name, viaURL.Target = "http-ext", "internal"
+		if err := ApplyArgs(&viaURL, map[string]any{
+			"url": "https://mcp.example.com/mcp",
+		}, false); err != nil {
+			t.Fatalf("ApplyArgs: %v", err)
+		}
+		if viaURL.Notes != mcpHTTPNotes {
+			t.Errorf("a url create kept the stdio recipe:\n%s", viaURL.Notes)
+		}
+
+		viaCommand := Preset(KindMCP)
+		viaCommand.Name, viaCommand.Target = "stdio-ext", "internal"
+		if err := ApplyArgs(&viaCommand, map[string]any{
+			"command": "node", "args": []any{"server.js"},
+		}, false); err != nil {
+			t.Fatalf("ApplyArgs: %v", err)
+		}
+		if viaCommand.Notes != mcpNotes {
+			t.Errorf("a stdio create should keep the stdio recipe, got:\n%s", viaCommand.Notes)
+		}
+
+		mine := Preset(KindMCP)
+		mine.Name, mine.Target = "mine", "internal"
+		if err := ApplyArgs(&mine, map[string]any{
+			"url": "https://mcp.example.com/mcp", "notes": "ask the billing team first",
+		}, false); err != nil {
+			t.Fatalf("ApplyArgs: %v", err)
+		}
+		if mine.Notes != "ask the billing team first" {
+			t.Errorf("an author's notes were overwritten: %q", mine.Notes)
+		}
+	})
+
 	t.Run("an explicit command still wins and still collides", func(t *testing.T) {
 		// The fix clears only what the caller did not name. A caller that names
 		// both answered one question twice, and that refusal is the point of the
@@ -329,7 +368,7 @@ func TestURLTemplateAvailableWithoutAnExternalBinary(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			out, _, _, err := shell.ReadTerminalStream(context.Background(), reader, time.Second, true, 0, 0)
+			out, _, _, err := shell.ReadTerminalStream(context.Background(), reader, time.Second, true, 0, 0, nil)
 			if err == nil && strings.Contains(out, id) {
 				return out
 			}

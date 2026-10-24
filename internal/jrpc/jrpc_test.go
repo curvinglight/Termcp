@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -209,4 +210,240 @@ func TestCallDeadlineIsNotUnbounded(t *testing.T) {
 // channel's framing and locking rather than where the bytes came from.
 func localDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
+// TestTakeDoesNotStealTheAnswerACallIsWaitingFor pins the race between the two
+// readers of one socket.
+//
+// Call waits for the frame carrying its id; Take waits for the next frame of any
+// kind. Both read c.in, and only Call takes the callGate, so a Take issued while a
+// call is in flight can lift that call's answer out of the channel first. The call
+// then sits until its window expires and reports "no answer" — while the answer was
+// delivered to somebody else, which is what "the result was swallowed" looks like
+// from the caller's side.
+//
+// The peer here answers slowly on purpose: the answer must still be in flight when
+// Take starts waiting, otherwise the test proves nothing.
+func TestTakeDoesNotStealTheAnswerACallIsWaitingFor(t *testing.T) {
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			// Long enough that Take is already parked on c.in when this lands.
+			time.Sleep(150 * time.Millisecond)
+			_ = conn.WriteJSON(map[string]any{
+				"id":     frame["id"],
+				"result": map[string]any{"echo": frame["method"]},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), localDial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	// A reader that starts before the call and waits across it: exactly what a
+	// `read` or a `recv` issued in the same turn as a `call` does.
+	taken := make(chan string, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		if frame, ok := ch.Take(ctx); ok {
+			taken <- frame
+		}
+	}()
+	// Let Take reach its wait before the call writes anything.
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	answer, err := ch.Call(ctx, map[string]any{"method": "Runtime.evaluate"})
+	if err != nil {
+		t.Fatalf("the call lost its answer to a concurrent Take: %v", err)
+	}
+	if !strings.Contains(answer, "Runtime.evaluate") {
+		t.Fatalf("the call returned something else: %s", answer)
+	}
+	select {
+	case got := <-taken:
+		t.Fatalf("Take returned the frame the call was waiting for: %s", got)
+	default:
+	}
+}
+
+// TestAnAnswerNobodyIsWaitingForStaysReadable pins the other half of the routing
+// rule: a frame carrying an id is NOT an event, but it is not rubbish either.
+//
+// A peer answers a `send` (a frame written without waiting), and nothing is
+// registered for that id. It has to reach the reader that comes looking later —
+// through the same queue events go to — because otherwise the only copy is the
+// one the wire already delivered and dropped.
+func TestAnAnswerNobodyIsWaitingForStaysReadable(t *testing.T) {
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			// Always an answer, never an event: the case Take has to be able to
+			// hand back and Next has to be able to skip.
+			_ = conn.WriteJSON(map[string]any{
+				"id":     frame["id"],
+				"result": map[string]any{"echo": frame["method"]},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), localDial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	if err := ch.Send(t.Context(), map[string]any{"id": 7, "method": "Page.navigate"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	frame, ok := ch.Take(ctx)
+	if !ok {
+		t.Fatal("the answer to a send never reached the reader")
+	}
+	if !strings.Contains(frame, "Page.navigate") {
+		t.Fatalf("Take returned something else: %s", frame)
+	}
+}
+
+// TestNextSkipsAnAnswerAndKeepsItForTake pins that "next event" is a filter, not a
+// drain.
+//
+// Next must not hand an answer to an event reader, and it must not destroy it
+// either: it is still the frame a later Take is owed. Re-queueing it (what the
+// previous implementation did) is not the same thing — with the queue full of
+// answers, push-then-pop spins forever.
+func TestNextSkipsAnAnswerAndKeepsItForTake(t *testing.T) {
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			_ = conn.WriteJSON(map[string]any{"id": frame["id"], "result": map[string]any{"echo": 1}})
+			_ = conn.WriteJSON(map[string]any{"method": "Page.loadEventFired"})
+		}
+	}))
+	defer srv.Close()
+
+	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), localDial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	if err := ch.Send(t.Context(), map[string]any{"id": 11, "method": "Page.enable"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	event, ok := ch.Next(ctx)
+	if !ok {
+		t.Fatal("Next never returned the event")
+	}
+	if strings.Contains(event, `"id"`) {
+		t.Fatalf("Next handed an answer to an event reader: %s", event)
+	}
+	// The answer is still there: skipping is not consuming.
+	answer, ok := ch.Take(ctx)
+	if !ok {
+		t.Fatal("Next consumed the answer instead of skipping it")
+	}
+	if !strings.Contains(answer, `"id"`) {
+		t.Fatalf("the frame left behind is not the answer: %s", answer)
+	}
+}
+
+// TestAnAnswerArrivingAsTheWindowClosesIsNotLost pins the delivery/timeout race.
+//
+// The dispatcher can hand a call its answer in the same instant the call's window
+// expires. If the call simply returns, that frame is in a channel nobody will read
+// again and the result is gone — the same disappearance as the stealing bug, only
+// harder to see because it needs a deadline to land on a delivery.
+func TestAnAnswerArrivingAsTheWindowClosesIsNotLost(t *testing.T) {
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			// Land the answer right around the caller's deadline.
+			time.Sleep(60 * time.Millisecond)
+			_ = conn.WriteJSON(map[string]any{"id": frame["id"], "result": map[string]any{"echo": 1}})
+		}
+	}))
+	defer srv.Close()
+
+	ch, err := Open(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), localDial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	// A window that closes while the answer is in flight, over and over: whichever
+	// side of the deadline each attempt lands on, the frame must be findable.
+	for i := 0; i < 12; i++ {
+		ctx, cancel := context.WithTimeout(t.Context(), 55*time.Millisecond)
+		_, err := ch.Call(ctx, map[string]any{"id": 100 + i, "method": "Runtime.evaluate"})
+		cancel()
+		if err == nil {
+			continue // answered in time; nothing to recover
+		}
+		// The call gave up. The answer may still arrive, and must be readable.
+		readCtx, readCancel := context.WithTimeout(t.Context(), 2*time.Second)
+		found := false
+		for !found {
+			frame, ok := ch.Take(readCtx)
+			if !ok {
+				break
+			}
+			if strings.Contains(frame, `"id":`+strconv.Itoa(100+i)) {
+				found = true
+			}
+		}
+		readCancel()
+		if !found {
+			t.Fatalf("round %d: the answer to a call that timed out is nowhere", i)
+		}
+	}
 }

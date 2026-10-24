@@ -49,8 +49,12 @@ func TestCloseNoSuchTargetReturns404(t *testing.T) {
 		"close nosuchhandle123",
 		"close nosuchsession456",
 	} {
+		// THE STATUS LINE. A target name is caller-chosen text, so a substring search
+		// for "404" answers the wrong question: it would pass on a 200 whose body
+		// happened to mention the number, and fail on a 404 that echoed a name
+		// containing it.
 		res := termText(t, s, map[string]any{"cmd": cmd})
-		if !strings.Contains(res, "404") {
+		if !strings.HasPrefix(res, "TERM/1 404") {
 			t.Errorf("%q must return 404, got:\n%s", cmd, res)
 		}
 	}

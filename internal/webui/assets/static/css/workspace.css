@@ -23,6 +23,11 @@
 .workspace-frame {
   display: grid;
   grid-template-columns: var(--nethub-w) minmax(0, 1fr) var(--ext-w);
+  /* minmax(0, 1fr), not the implicit `auto` row: an auto row is sized by its
+     content, so `max-height: 100%` on a column would resolve against a height the
+     column itself produced — which is the loop this whole block exists to break.
+     A definite row is what makes the three ceilings below expressible at all. */
+  grid-template-rows: minmax(0, 1fr);
   align-items: start;
   gap: 16px;
   --nethub-w: 276px;
@@ -42,6 +47,15 @@
    * second column. */
   --ext-w: 260px;
   transition: grid-template-columns .24s ease;
+  /* THE FRAME IS THE ROW THE COLUMNS SHARE, so it is the element that has to carry
+     the available height down to them: `.dock` is a flex column with a definite
+     height, and this is its flexible child. `min-height: 0` is what lets it shrink
+     instead of growing the page.
+     It lives here, with the rest of the frame's geometry, and not in base.css next
+     to .dock: two rules for one element is how the two files start disagreeing, and
+     the tests that read the stylesheet take the FIRST textual occurrence of
+     `.workspace-frame {`, so a second one would be graded instead of this one. */
+  flex: 1 1 auto; min-height: 0;
 }
 .workspace-panel { min-width: 0; }
 /* The right column's two desktop states. Expanded it holds the archive;
@@ -66,7 +80,16 @@
    its tiles become items of the body's wrap row, and the body itself is what
    scrolls. JS keeps replacing the grid's children, which is unaffected — the
    element is still the mount point, it just has no box of its own. */
-.workspace-exts { display: flex; flex-direction: column; min-width: 0; }
+.workspace-exts {
+  display: flex; flex-direction: column; min-width: 0;
+  /* THE MIDDLE COLUMN HAD NO CEILING AT ALL, and it is the one that grows without
+     bound: one card per extension. Measured with 80 of them at 1400x900 it was
+     1456px, the page overflowed by 794px, and the dock — the page's only way back to
+     a session — was pushed below the viewport. The other two columns were capped and
+     this one was not, so the frame was as tall as this plate.
+     Capped by the row, like its neighbours; the body below already scrolls. */
+  max-height: 100%;
+}
 
 /* ---- The plate's header bar -------------------------------------------------
    ONE bar holding the title trigger and the batch keys, not a trigger with a
@@ -439,6 +462,11 @@
   position: sticky; top: 68px; z-index: var(--z-sticky);
   min-width: 0; min-height: 0; align-self: start;
   display: flex; flex-direction: column;
+  /* THE COLUMN ENDS WHERE THE VIEWPORT DOES, AND NO ARITHMETIC IS INVOLVED.
+     `align-self: start` keeps the plate hugging its content (and keeps `sticky`
+     meaningful), so a `max-height: 100%` against the grid row is what caps it
+     without stretching it. The row is definite — see grid-template-rows above. */
+  max-height: 100%;
   color: var(--text-secondary);
 }
 .nethub-btn {
@@ -489,7 +517,19 @@
      a constant error and not a content one is what made it hard to see: 30 nodes
      and 60 nodes overflowed by exactly the same 13px, with an empty list too.
      test/session_switch asserts the arithmetic that keeps this honest. */
-  max-height: calc(100dvh - var(--app-header-h, 60px) - var(--dock-h, 44px) - 90px);
+  /* THE CEILING IS THE COLUMN'S, NOT A SECOND OPINION ABOUT IT.
+   *
+   * It used to be `calc(100dvh - --app-header-h - --dock-h - 90px)`: an arithmetic
+   * over two MEASURED values, one of which (`--dock-h`) is published by an element
+   * in this same layout. That is a loop with a constant bolted on — the panel's
+   * height depended on a measurement whose own height could depend on the page the
+   * panel had just changed — and the constant was wrong on top of it: measured at
+   * 1400x900 the page overflowed by 40px with a full archive and 112px with a status
+   * banner up, which put a scrollbar on a page whose whole design is that it never
+   * scrolls. `flex` does this calculation correctly and cannot disagree with itself:
+   * the column is capped (see .nethub), so the plate takes what is left below the
+   * trigger and scrolls inside it. */
+  flex: 1 1 auto; min-height: 0;
   margin-top: 8px; padding: 10px 0 12px;
   overflow: hidden; opacity: 1; visibility: visible;
   border: 1px solid var(--accent-border); background: var(--bg-subtle);
@@ -514,8 +554,9 @@
   }
   .workspace-frame.nethub-collapsed #nethub .nethub-rail {
     /* Same ceiling as the body it replaces: the rail takes the panel's place in
-       the column, so it must not be allowed to grow past it either. */
-    max-height: calc(100dvh - var(--app-header-h, 60px) - var(--dock-h, 44px) - 90px);
+       the column, so it takes the same leftover height rather than a second
+       derivation of it. */
+    flex: 1 1 auto; min-height: 0;
     padding: 10px 0 12px; opacity: 1; pointer-events: auto;
   }
 }
@@ -818,7 +859,9 @@
    it rather than only in the rule it inherits. */
 .extpanel-body {
   display: flex; flex-direction: column; min-height: 0;
-  max-height: calc(100dvh - var(--app-header-h, 60px) - var(--dock-h, 44px) - 90px);
+  /* The ceiling is `.nethub-body`'s (the archive is a .nethub); this rule is only
+     the part that is the ARCHIVE's — see the comment on .nethub-body. */
+  flex: 1 1 auto;
 }
 #extpanel-body > #archive-grid {
   flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
@@ -1256,6 +1299,22 @@
   min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font: 500 .74rem var(--font-mono); color: var(--text-primary);
+}
+/* The name is a BUTTON (it renames), so it has to stop looking like one: a row is
+   scanned, not operated. It keeps the text metrics exactly, drops the chrome, and
+   grows the underline + accent only when pointed at or focused — the same
+   affordance the window title uses, because it is the same control. */
+.archive-row-rename {
+  appearance: none; -webkit-appearance: none;
+  margin: 0; padding: 0; border: 0; background: none;
+  text-align: left; cursor: pointer;
+  border-bottom: 1px solid transparent;
+}
+.archive-row-rename:hover,
+.archive-row-rename:focus-visible {
+  color: var(--accent);
+  border-bottom-color: currentColor;
+  outline: none;
 }
 /* Under the name: where it ran, and what it ran. The profile is a chip because it
    is a name from a fixed set (a connection), and the command is loose text because
@@ -1782,6 +1841,11 @@
      squeezed into the leftover 0px middle track. */
   .workspace-frame,
   .workspace-frame.ext-on { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 8px 0; }
+  /* ONE COLUMN, STACKED, SO THE PAGE SCROLLS AGAIN. The desktop rule makes body
+     exactly one viewport tall and clips the workspace to it; here the plate takes a
+     full row beneath the two triggers and grows with them, so the page has to be its
+     own content height again or the bottom of the list would be unreachable. */
+  body { height: auto; }
   .nethub { order: 1; }
   /* The archive is a .nethub now, so its order has to outrank the generic
      .nethub { order: 1 } above it — the hosts column keeps the left edge and the

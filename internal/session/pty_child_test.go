@@ -63,7 +63,7 @@ func TestSession_PtyChildShellsAreIndependent(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	drain := func(sh *shell) string {
-		out, _, _, _ := sh.cs.ReadTerminalStream(context.Background(), sh.readerID, 200*time.Millisecond, true, 0, 0)
+		out, _, _, _ := sh.cs.ReadTerminalStream(context.Background(), sh.readerID, 200*time.Millisecond, true, 0, 0, nil)
 		return out
 	}
 	// Discard startup noise so assertions only see `stty size` output.

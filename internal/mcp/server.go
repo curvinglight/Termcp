@@ -14,6 +14,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/message"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
+	"github.com/open-mcp-ai/termcp/internal/task"
 )
 
 // Server wraps the MCP SSE server, streamable HTTP handler, and tool handlers.
@@ -43,6 +44,12 @@ type Server struct {
 	// It is fed by mcp-go's session hooks, which is the only place a client
 	// attaching or detaching is observable.
 	connections *connRegistry
+
+	// tasks tracks the asynchronous file transfers this process started (#158).
+	// Transfers are always async: a caller behind a tool-call watchdog that fires
+	// at 30s cannot synchronously move a 30 MB binary, and an interrupted transfer
+	// used to leave a truncated file with no error anywhere.
+	tasks *task.Manager
 	// connListener is called when that set changes, so the Web UI can refresh
 	// without polling. Set by main to the same broadcast the session list uses.
 	connListener func()
@@ -58,6 +65,23 @@ type Server struct {
 	// report 204 and then skip the frames behind it on the next call — silently.
 	recvCursorMu sync.Mutex
 	recvCursors  map[string]int64
+
+	// closedReads is where each CLOSED channel's plain `read` has read up to.
+	//
+	// A live channel's position lives in its ring-buffer reader, which is the only
+	// place it can live while bytes are still arriving. A closed one has no such
+	// reader — its bytes come from the persisted log — so the position has to be
+	// kept here or the default read has no way to mean "what is new since last
+	// time". Without it the default read answered with the tail of the history on
+	// every call: the same bytes, forever, with offsets that never advanced
+	// (#159 C1).
+	//
+	// ponytail: one int64 per (session, channel) ever read after closing, never
+	// evicted. Bounded by the number of channels this process has read, which is
+	// the same order as the sessions it holds; an LRU is the right shape if a
+	// daemon ever outlives thousands of them.
+	closedReadMu sync.Mutex
+	closedReads  map[string]int64
 }
 
 // Option customizes a Server at construction time. Options keep New's signature

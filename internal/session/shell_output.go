@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/ansi"
+	"github.com/open-mcp-ai/termcp/internal/buffer"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -19,7 +20,7 @@ import (
 // need no lock (see field docs below).
 
 func (s *Session) readOutput(ctx context.Context, readerID int, timeout time.Duration, stripAnsi bool, maxLines int, persist bool, maxBytes int) (string, error) {
-	data, err := s.buf.ReadLimited(ctx, readerID, timeout, maxBytes, maxLines)
+	data, err := s.buf.ReadLimited(ctx, readerID, timeout, maxBytes, maxLines, nil)
 	if err != nil && err != io.EOF {
 		return "", err
 	}
@@ -55,12 +56,12 @@ func (s *Session) ReadOutputForReader(ctx context.Context, readerID int, timeout
 // follow the last '\n'. Both are properties of the raw window, computed before
 // any cleaning, so line-protocol consumers know whether the chunk they received
 // ends on a line boundary whatever stripping did to the text.
-func (s *Session) ReadTerminalStream(ctx context.Context, readerID int, timeout time.Duration, stripAnsi bool, maxLines int, maxBytes int) (string, []byte, int64, error) {
+func (s *Session) ReadTerminalStream(ctx context.Context, readerID int, timeout time.Duration, stripAnsi bool, maxLines int, maxBytes int, trim buffer.TrimTail) (string, []byte, int64, error) {
 	cs := s.PrimaryShell()
 	if cs == nil {
 		return "", nil, 0, fmt.Errorf("session shell has exited")
 	}
-	return cs.ReadTerminalStream(ctx, readerID, timeout, stripAnsi, maxLines, maxBytes)
+	return cs.ReadTerminalStream(ctx, readerID, timeout, stripAnsi, maxLines, maxBytes, trim)
 }
 
 // OutputByteRange returns a copy of retained raw output bytes [start, start+max) and total retained length.
@@ -93,6 +94,12 @@ func (s *Session) BufferLen() int64 {
 	}
 	return s.buf.Len()
 }
+
+// DefaultReaderID is the reader every channel mints first, and the one `read` uses when
+// the caller names no reader_id. It is a convention between two packages (the channel
+// creates it, the MCP layer reads it), so it is named once here instead of being the
+// literal 0 in both.
+const DefaultReaderID = 0
 
 // DefaultOutputReaderID is the first ring-buffer reader created with the session.
 // MCP read_output defaults to this ID. The Web UI loads older bytes via GET /output-range and streams new output with RegisterReader().
@@ -157,8 +164,8 @@ func (cs *ChildShell) UnregisterReader(id int) {
 // The second return value is the raw window (before any cleaning) and the third
 // its partial tail (bytes after the last '\n' of this read); see the Session
 // wrapper above.
-func (cs *ChildShell) ReadTerminalStream(ctx context.Context, readerID int, timeout time.Duration, stripAnsi bool, maxLines int, maxBytes int) (string, []byte, int64, error) {
-	data, err := cs.buf.ReadLimited(ctx, readerID, timeout, maxBytes, maxLines)
+func (cs *ChildShell) ReadTerminalStream(ctx context.Context, readerID int, timeout time.Duration, stripAnsi bool, maxLines int, maxBytes int, trim buffer.TrimTail) (string, []byte, int64, error) {
+	data, err := cs.buf.ReadLimited(ctx, readerID, timeout, maxBytes, maxLines, trim)
 	if err != nil && err != io.EOF {
 		return "", nil, 0, err
 	}
@@ -185,6 +192,29 @@ func (cs *ChildShell) ReaderCursor(readerID int) int64 {
 		return -1
 	}
 	return cs.buf.Cursor(readerID)
+}
+
+// AdvanceDefaultReader moves this channel's default reader (the one `read` uses when
+// the caller names no reader_id) to pos, never backwards.
+//
+// A positional read does not move any cursor, so a caller whose flow is
+// `run; run; run; read` got the whole channel replayed from byte zero on that last
+// read — the bytes it had already been shown. Advancing here is what makes `read`'s
+// documented default ("the new bytes since the last read") true for the flow callers
+// actually use. Never backwards, because `run` showing a window that starts before the
+// cursor is not a reason to forget bytes already shown.
+func (cs *ChildShell) AdvanceDefaultReader(pos int64) {
+	if cs.buf == nil {
+		return
+	}
+	// Reader 0 is minted at channel creation for exactly this purpose (see
+	// newShell: "default reader 0 for MCP read_output").
+	if cur := cs.buf.Cursor(DefaultReaderID); cur >= pos {
+		return
+	}
+	// A failed seek is not worth failing the call for: the bytes are in the reply
+	// either way, and the worst case is the old behaviour of re-showing them.
+	_ = cs.buf.Seek(DefaultReaderID, pos)
 }
 
 func (cs *ChildShell) IsBufferClosed() bool {

@@ -121,12 +121,17 @@ func ApplyArgs(ext *Extension, args map[string]any, update bool) error {
 	if !update {
 		ApplyDefaults(ext)
 	}
-	// A stored template that still carries its kind's preset recipe and has just
-	// changed shape (stdio server → HTTP endpoint, or back) gets the recipe that
-	// describes it now. An author's own notes are never touched — isPresetNotes is
-	// what tells the two apart — and neither is a call that named `notes` at all,
-	// including one that cleared it: "give me the default" and "leave it empty"
-	// are different requests, and only the first is what an absent key means.
+	// A STORED TEMPLATE THAT STILL CARRIES ITS KIND'S PRESET RECIPE, and has just
+	// changed shape (stdio server → HTTP endpoint, or back), gets the recipe that
+	// describes it now. Two things are deliberately untouched: an author's own text
+	// (isPresetNotes is what tells the two apart) and a call that named `notes` at
+	// all, including one that cleared it — "give me the default" and "leave it
+	// empty" are different requests, and only the first is what an absent key means.
+	//
+	// CREATE NEEDS THIS TOO (#159 D1). The preset fills in the stdio recipe before the
+	// URL is known, so `create ext x --kind mcp --url …` described a program it does
+	// not run. ApplyDefaults now asks isPresetNotes as well, and this line covers the
+	// update path, where defaults are deliberately not re-merged.
 	if update && !hasOpt(args, "notes") && isPresetNotes(ext.Notes) {
 		ext.Notes = PresetNotes(ext)
 	}

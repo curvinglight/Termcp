@@ -19,20 +19,6 @@ func (h *Handler) handleListForwards(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"forwards": h.ForwardMgr.List()})
 }
 
-// handleListNotifications returns active shell notification rules, optionally
-// filtered by shell_id and/or session_id query parameters.
-func (h *Handler) handleListNotifications(w http.ResponseWriter, r *http.Request) {
-	// Shell notification rules (the retired `watch` directive) are gone. The
-	// endpoint stays so an older Web UI build reading it gets an empty list
-	// instead of a 404.
-	writeJSON(w, http.StatusOK, map[string]any{"notifications": []any{}})
-}
-
-// handleDeleteNotification answers 404: there are no rules left to delete.
-func (h *Handler) handleDeleteNotification(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotFound, map[string]any{"error": "notification rule not found"})
-}
-
 func (h *Handler) handleDeleteForward(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	slog.Info("handleDeleteForward called", "forward_id", id)

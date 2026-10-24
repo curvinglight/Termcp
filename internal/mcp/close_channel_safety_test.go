@@ -20,7 +20,14 @@ func TestCloseChannelDoesNotTearDownSession(t *testing.T) {
 	h2 := handleFrom(t, text2)
 
 	// Write something to s2 so it has an output record.
+	//
+	// WAIT FOR THE WRITE TO LAND, rather than sleeping or reading immediately. `run`
+	// returns as soon as the bytes are in the channel, and a shell that is still
+	// starting (a heavy profile, a cold page cache, a loaded CI runner) echoes them
+	// later — an immediate read then finds only the shell's banner and the test fails
+	// over the scheduler, not over the behaviour it is pinning.
 	termText(t, s, map[string]any{"cmd": "run " + h2 + " echo IN_S2", "timeout": 2})
+	waitForContent(t, s, h2, "IN_S2")
 
 	// 1. `close <channel> --force` must be REFUSED (400), not silently destroy s1.
 	got := termText(t, s, map[string]any{"cmd": "close " + h2 + " --force"})

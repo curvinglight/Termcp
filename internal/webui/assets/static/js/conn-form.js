@@ -1083,7 +1083,6 @@ function reasonLabel(r) {
 }
 
 loadForwards();
-loadNotifications();
 loadConnections();
 startUIWebSocket();
 

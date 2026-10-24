@@ -229,7 +229,12 @@ func (b *bridge) forwardSSE(msg []byte) {
 	if id, ok := requestKey(msg); ok {
 		b.recordPending(id)
 	}
-	req, err := http.NewRequestWithContext(b.ctx, http.MethodPost, target, bytes.NewReader(msg))
+	// A POST gets its own deadline (#158): a remote server that accepts the TCP
+	// connection and sits silently would otherwise hold the goroutine until the
+	// entire bridge shuts down.
+	postCtx, cancelPost := context.WithTimeout(b.ctx, 30*time.Second)
+	defer cancelPost()
+	req, err := http.NewRequestWithContext(postCtx, http.MethodPost, target, bytes.NewReader(msg))
 	if err != nil {
 		b.fail(msg, fmt.Sprintf("POST %s: %v", target, err))
 		return
@@ -294,6 +299,9 @@ func resolveEndpoint(streamURL, endpoint string) string {
 }
 
 func (b *bridge) postStreamable(msg []byte) (*http.Response, error) {
+	// NO DEADLINE HERE, deliberately: this POST's response body IS the tool's answer,
+	// so a fixed cap would cut a legitimately slow call at 30s. The wait is the
+	// caller's to bound, and the bridge's own context ends it at shutdown.
 	req, err := http.NewRequestWithContext(b.ctx, http.MethodPost, b.cfg.URL, bytes.NewReader(msg))
 	if err != nil {
 		return nil, err

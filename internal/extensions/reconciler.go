@@ -1020,16 +1020,15 @@ func (r *Reconciler) onSessionDead(sessionID string) {
 // Status reports the runtime state of one extension. ok is false for a name the
 // store does not hold.
 func (r *Reconciler) Status(name string) (Status, bool) {
-	names, err := r.store.List()
-	if err != nil {
+	// ONE STAT, NOT A DIRECTORY LISTING. This used to call store.List() — a ReadDir
+	// plus a Stat per entry — to answer "is this name configured", so a caller
+	// asking about every extension did N×(N+1) filesystem calls. `ls ext` with 80
+	// templates was 6480 of them (issue #152); the reply was correct either way, and
+	// on a machine that scans each one it was slower than the whole rest of the call.
+	if !r.store.Exists(name) {
 		return Status{}, false
 	}
-	for _, n := range names {
-		if n == name {
-			return r.state(name).snapshot(), true
-		}
-	}
-	return Status{}, false
+	return r.state(name).snapshot(), true
 }
 
 // List reports every extension's runtime state, sorted the way the store sorts

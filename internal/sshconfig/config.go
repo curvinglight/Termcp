@@ -77,11 +77,24 @@ func ParseAndValidate(data []byte) (*Entry, error) {
 	}
 	k := strings.TrimSpace(strings.ToLower(e.Kind))
 	if k == "" {
-		return nil, fmt.Errorf("config must set \"kind\" to %q or %q", KindInternal, KindRemote)
+		// ErrInvalid, not a bare error: a profile with no kind is the CALLER's
+		// document being incomplete, and answering it with operation_failed (500)
+		// reads like an outage — a caller that retries on 5xx retries a config that
+		// will never work.
+		return nil, fmt.Errorf("config must set \"kind\" to %q or %q: %w", KindInternal, KindRemote, ErrInvalid)
 	}
 	e.Kind = k
 	switch k {
 	case KindInternal:
+		// A DIAL FIELD ON AN INTERNAL PROFILE DOES NOTHING, AND SAYING SO IS THE FIX.
+		// `kind = "internal"` means the built-in loopback connection; host/user/port
+		// beside it parse cleanly, are never read, and the session connects to
+		// localhost anyway. That is the one combination where the caller's mental
+		// model and reality diverge with no signal at all: they believe they are
+		// reaching 10.99.99.99.
+		if err := refuseDialFieldsOnInternal(&e); err != nil {
+			return nil, err
+		}
 		if err := validateDefaultMode(&e); err != nil {
 			return nil, err
 		}
@@ -98,8 +111,39 @@ func ParseAndValidate(data []byte) (*Entry, error) {
 		}
 		return &e, nil
 	default:
-		return nil, fmt.Errorf("unknown kind %q (use %q or %q)", e.Kind, KindInternal, KindRemote)
+		return nil, fmt.Errorf("unknown kind %q (use %q or %q): %w", e.Kind, KindInternal, KindRemote, ErrInvalid)
 	}
+}
+
+// refuseDialFieldsOnInternal rejects a loopback profile that carries dial settings.
+//
+// Names the fields rather than saying "unexpected field": the caller has to delete
+// them, and "host, user, port" is the edit list.
+func refuseDialFieldsOnInternal(e *Entry) error {
+	var found []string
+	if strings.TrimSpace(e.Host) != "" {
+		found = append(found, "host")
+	}
+	if strings.TrimSpace(e.User) != "" {
+		found = append(found, "user")
+	}
+	if e.Port != 0 {
+		found = append(found, "port")
+	}
+	if strings.TrimSpace(e.Password) != "" {
+		found = append(found, "password")
+	}
+	if strings.TrimSpace(e.PrivateKey) != "" {
+		found = append(found, "private_key")
+	}
+	if e.Jump != nil {
+		found = append(found, "jump")
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("kind = %q is the built-in loopback connection, so %s would be accepted and ignored; remove it or use kind = %q: %w",
+		KindInternal, strings.Join(found, ", "), KindRemote, ErrInvalid)
 }
 
 func validateDefaultMode(e *Entry) error {
@@ -109,7 +153,7 @@ func validateDefaultMode(e *Entry) error {
 		return nil
 	}
 	if dm != "pty" && dm != "pipe" {
-		return fmt.Errorf("default_mode must be \"pty\" or \"pipe\"")
+		return fmt.Errorf("default_mode must be \"pty\" or \"pipe\", got %q: %w", e.DefaultMode, ErrInvalid)
 	}
 	e.DefaultMode = dm
 	return nil
@@ -136,6 +180,28 @@ func validateDialSpec(d *DialSpec, label string) error {
 	}
 	if _, err := sshclient.ParseProxyURL(d.Proxy); err != nil {
 		return fmt.Errorf("%s: %w", label, err)
+	}
+	// A TIMEOUT ABOVE THE CAP IS NOT A TIMEOUT, and a negative one is a typo. Zero stays
+	// legal and means "the default" (an entry written before this field existed has no value
+	// at all); anything else has to be inside the range the dialler honours, or the caller is
+	// setting a number that will be replaced without a word at dial time.
+	//
+	// A SHORT TIMEOUT IS LEGAL. The floor is 1 second, not the 30 second default: failing
+	// fast is a legitimate thing to ask for, and refusing it would leave a script with no way
+	// to bound a dial. The dialler owns the range (session.ClampDialTimeoutSeconds) and this
+	// asks it rather than restating the numbers — two copies of a bound drift apart, and the
+	// copy that drifts is always the one that is not enforcing anything.
+	// NEGATIVE IS REFUSED; EVERYTHING ELSE IS THE CALLER'S NUMBER.
+	//
+	// A dial timeout above the recommendation is a request this server has no basis to
+	// overrule — a slow link or a long bastion chain is a real reason to want one — so it
+	// is stored and honoured. Below zero is a typo, not a wish, and it is the one value
+	// the dialler has to replace to have anything to do at all.
+	if d.DialTimeoutSeconds < 0 {
+		return fmt.Errorf("%s dial_timeout_seconds must not be negative, got %d "+
+			"(0 means the default, %ds; %ds is the value to stay under): %w",
+			label, d.DialTimeoutSeconds, session.DefaultDialTimeoutSeconds,
+			session.RecommendedDialTimeoutSeconds, ErrInvalid)
 	}
 	return nil
 }
@@ -238,6 +304,9 @@ func ParseInternalOverride(data []byte, base *Entry) (*Entry, error) {
 		return nil, fmt.Errorf("the internal profile must keep kind = %q, got %q", KindInternal, k)
 	}
 	e.Kind = KindInternal
+	if err := refuseDialFieldsOnInternal(&e); err != nil {
+		return nil, err
+	}
 	if err := validateDefaultMode(&e); err != nil {
 		return nil, err
 	}

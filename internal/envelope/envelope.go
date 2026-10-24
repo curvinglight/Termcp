@@ -172,6 +172,21 @@ func parseRange(v string) (start, end int64, ok bool) {
 	return start, end, true
 }
 
+// RangeEnd returns the END of a Content-Range this package wrote, and reports whether
+// the header held a range at all.
+//
+// Content-Range is inclusive ("bytes 399-639/640" is 241 bytes ending at 639), while a
+// read cursor points at the next byte to deliver — so the cursor a caller advances to
+// is end+1. That +1 is the whole reason this helper exists instead of each caller
+// re-deriving it and one of them getting it off by one.
+func RangeEnd(v string) (int64, bool) {
+	_, end, ok := parseRange(v)
+	if !ok {
+		return 0, false
+	}
+	return end + 1, true
+}
+
 // rangeTotal reads the total out of a Content-Range, or -1 when unknown.
 func rangeTotal(v string) int64 {
 	_, total, found := strings.Cut(v, "/")

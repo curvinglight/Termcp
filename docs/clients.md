@@ -225,8 +225,8 @@ Web UI 的 **API / MCP** 页面（`/api.html`）给出两种 HTTP 传输与 stdi
 # 公开端点：读文档本身不需要 token
 curl -fsS http://<host>:18765/api.md
 
-# 一条命令：与 MCP 的 term(cmd:"ps") 完全等价
-curl -sS -X POST http://<host>:18765/api/term -d '{"cmd":"ps"}'
+# 一条命令：与 MCP 的 term(cmd:"ls") 完全等价
+curl -sS -X POST http://<host>:18765/api/term -d '{"cmd":"ls"}'
 ```
 
 指令空间由实例自述，不需要另写教程：
@@ -288,4 +288,4 @@ claude mcp add --transport http termcp http://your-server:18765/stream --header 
 
 - **不再需要 `defer_loading`。** 那个机制解决的是「工具太多，先别给 schema」；一个工具没有可延后加载的部分。`--mcp-defer-tools` 与分类表已删除。
 - **客户端不必理解任何标记。** 丢掉未知字段的网关（实测某些 Codex 链路会丢掉 `defer_loading`）只会丢掉一个不存在的字段，不会丢工具。
-- **能力不随工具数增长。** 装一个 MCP server、一条技能扩展、十条别名之后，`tools/list` 逐字节不变；差异只出现在 `cmd` 的返回内容里（`ext list` / `ps` 不同），不在工具面。
+- **能力不随工具数增长。** 装一个 MCP server、一条技能扩展、十条别名之后，`tools/list` 逐字节不变；差异只出现在 `cmd` 的返回内容里（`ls ext` / `ls` 不同），不在工具面。

@@ -80,7 +80,13 @@ STRESS_CPU ?= 1,2,4
 
 test-stress:
 	$(call race_notice,make test-stress)
-	go test $(STRESS_PKGS) -count=$(STRESS_COUNT) -cpu=$(STRESS_CPU) -shuffle=on $(race_flag) -timeout 900s
+# THE TIMEOUT IS PER PACKAGE AND THE ROUNDS MULTIPLY. -count=2 -cpu=1,2,4 is six
+# passes of every package, so a package that takes ~150s alone needs ~900s here —
+# the old 900s limit was exactly that with no room, and a machine that is busy ON
+# SOMETHING ELSE pushes it over. A timeout reports as "panic: test timed out" with
+# no failing assertion, which reads like a hang and is not one; it is the budget.
+# Run this on an idle machine, otherwise the number it produces is the machine's.
+	go test $(STRESS_PKGS) -count=$(STRESS_COUNT) -cpu=$(STRESS_CPU) -shuffle=on $(race_flag) -timeout 1800s
 
 # 发布 PR：将 Unreleased 归档到指定版本，并同步 server.json。
 prepare-release:

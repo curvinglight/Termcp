@@ -26,7 +26,10 @@ func TestArchiveRendersRowsNotCards(t *testing.T) {
 	}
 	for _, want := range []string{
 		`'archive-row'`,
-		`class="archive-row-name"`,
+		`archive-row-name`,
+		/* The name is the rename control, so it is a button: an archived session has
+		   no dock tab to right-click (issue #160). */
+		`archive-row-rename`,
 		`class="archive-row-age"`,
 		/* The row is the thing the batch component ticks, and it is keyed by the
 		   session's ID. A name is a label: two archived sessions can share one (a
@@ -282,13 +285,13 @@ func TestTheArchiveExportsAFolderPerSession(t *testing.T) {
 	}
 	// A folder per session, named from the session, holding a record and its shells.
 	for _, want := range []string{
-		"/session.txt",           // the session's own record
-		"/shell-",                // one file per channel
-		"/shells",                // the list that says how many there are
-		"fetchAllShellOutput(",   // where a shell's complete bytes come from
-		"fetchAllSessionLines(",  // the fallback for records with no live shells
-		"zipStore(",              // packed, not concatenated
-		"safeZipSegment(",        // names are user-controlled
+		"/session.txt",          // the session's own record
+		"/shell-",               // one file per channel
+		"/shells",               // the list that says how many there are
+		"fetchAllShellOutput(",  // where a shell's complete bytes come from
+		"fetchAllSessionLines(", // the fallback for records with no live shells
+		"zipStore(",             // packed, not concatenated
+		"safeZipSegment(",       // names are user-controlled
 	} {
 		if !strings.Contains(fn, want) {
 			t.Errorf("the export is missing %s: a session must be a folder with its shells in it", want)
@@ -988,7 +991,7 @@ func TestCollapsingOneColumnLeavesTheOtherAlone(t *testing.T) {
 //
 // Leading the run makes the row say the sentence in the order the reader needs:
 //
-//     [✓] ......... 3 [⤓] [🗑]
+//	[✓] ......... 3 [⤓] [🗑]
 //
 // which also puts the destructive key in the corner where it belongs, furthest
 // from the invert check it must never be confused with.
@@ -1068,8 +1071,8 @@ func TestTheArchiveIsOneColumnOfRows(t *testing.T) {
 // interpolable: CSS drops a transition between an intrinsic keyword and a length.
 // Measured at 1440x900, sampling every frame across the .24s window:
 //
-//   px -> px             15 distinct widths   (56 -> 67 -> 89 -> ... -> 260)
-//   fit-content -> px    2  distinct widths   (260, then 56: one frame, a snap)
+//	px -> px             15 distinct widths   (56 -> 67 -> 89 -> ... -> 260)
+//	fit-content -> px    2  distinct widths   (260, then 56: one frame, a snap)
 //
 // The archive opens and closes by class toggle, so BOTH states have to be plain
 // lengths or the animation is silently lost — which is exactly how "the collapse
@@ -1148,12 +1151,12 @@ func TestTheArchiveExportIsComplete(t *testing.T) {
 	// Page from where the last window ended, using the SERVER's `end` (an absolute
 	// offset), not a locally computed length: the server may clamp or re-align.
 	for _, want := range []string{
-		"&start=",          // paging by absolute offset
-		"j.end",            // the server's end offset is the next start
-		"j.total",          // and total is what says when to stop
-		"start = end",      // advance from what was served
-		"end >= total",     // normal exit
-		"end <= start",     // no-progress guard, or a clamped window spins forever
+		"&start=",      // paging by absolute offset
+		"j.end",        // the server's end offset is the next start
+		"j.total",      // and total is what says when to stop
+		"start = end",  // advance from what was served
+		"end >= total", // normal exit
+		"end <= start", // no-progress guard, or a clamped window spins forever
 	} {
 		if !strings.Contains(fn, want) {
 			t.Errorf("fetchAllShellOutput is missing %q: paging must advance on the server's own offsets "+
@@ -1194,4 +1197,40 @@ func stripJSComments(src string) string {
 	src = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(src, "")
 	src = regexp.MustCompile(`(?m)//.*$`).ReplaceAllString(src, "")
 	return src
+}
+
+// TestAnArchivedRowCanBeRenamedFromItsName pins issue #160's reachability claim.
+//
+// Renaming an archived session used to have one path: right-click its tab in the
+// dock. The dock lists RUNNING sessions only, so an archived one usually has no tab
+// at all — and a right-click has no meaning on the phone this page is mostly used
+// from. The server has always accepted the rename (`PATCH /api/sessions/{id}` works
+// on a DEAD session); only the way in was missing.
+//
+// The assertions are about the WIRING, not the markup: a name that is not a control,
+// or one wired to a second implementation of the PATCH, would both pass a screenshot.
+func TestAnArchivedRowCanBeRenamedFromItsName(t *testing.T) {
+	sessions := readAssetLF(t, "static/js/sessions.js")
+
+	// The name is a control rather than a span, so a keyboard reaches it too.
+	if !strings.Contains(sessions, `class="archive-row-name archive-row-rename"`) {
+		t.Fatal("the archive row's name is not a rename control; an archived session has no other way in")
+	}
+	// It calls the ONE rename implementation, the same one the tab menu uses: a
+	// second prompt + PATCH would be a second set of rules for the same edit.
+	body := between(t, sessions, "querySelector('.archive-row-rename')", "\n    });")
+	if !strings.Contains(body, "renameSessionById(s)") {
+		t.Errorf("the name click must go through renameSessionById, got:\n%s", body)
+	}
+	// And it must not fall through to the row's own handler, which opens the
+	// transcript: renaming a session and then finding its terminal behind the prompt
+	// is the bug this guard exists for.
+	if !strings.Contains(body, "stopPropagation()") {
+		t.Errorf("the rename click must stop propagating to the row's open handler:\n%s", body)
+	}
+	// The dock tab's menu keeps its item: a session WITH a window is still renamed
+	// there, and the two entries must not drift into different behaviour.
+	if !strings.Contains(readAssetLF(t, "static/js/shell-windows.js"), "renameSessionById(s)") {
+		t.Error("the tab menu's rename went away; a session with a window loses its entry too")
+	}
 }

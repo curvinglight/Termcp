@@ -695,299 +695,19 @@ function renderSessionGrid(bannerMsg) {
   // real session, or select-all would reach only the sessions the server
   // already knows about.
   var all = sessionsWithPending();
-  /* Two renderers, because the two plates answer different questions. A card is
-     for a session you might still open and work in; the archive is a LEDGER of
-     things that are over, read in passing, so it is a dense list of rows. Both
-     read the same region table, the same snapshot and the same selection set —
-     only the markup differs, which is what keeps select-all and the batch trash
-     working on either shape. */
+  /* ONE renderer now. The session plate that drew cards for live sessions was
+     removed (a window is the live session's own surface), which left this loop with
+     a single reachable branch: `renderTileGrid` and its helpers were 275 lines no
+     snapshot could reach. The region table still says which half of the snapshot
+     this column draws, so the shape of the pass did not change — only the choice
+     that no longer existed. */
   _sessionRegions.forEach(function (region) {
-    if (region.dead) renderArchiveRows(region, all);
-    else renderTileGrid(region, all);
+    renderArchiveRows(region, all);
   });
   var present = {};
   all.forEach(function (s) { if (s && s.id) present[s.id] = true; });
   pruneSessionSelections(present);
   updateSessionBatchBar();
-}
-
-/** Render one region's tiles, from the half of the snapshot that region owns.
- *  The card itself is identical in both, so a session keeps its look when it
- *  moves from running to over. */
-function renderTileGrid(region, all) {
-  var grid = document.getElementById(region.gridId);
-  if (!grid) return;
-  var selectedIds = region.ids;
-  grid.innerHTML = '';
-  // Unified card: DEAD sessions are the same tile as running ones (the registry
-  // retains them); a DEAD tile opens its terminal window in read-only mode.
-  var rows = all.filter(function (s) { return isDeadSession(s) === region.dead; });
-  /* A rowless plate says why it is rowless instead of being a blank strip. It
-     only appears once a snapshot has arrived: before the first frame every plate
-     is trivially empty, and "no live sessions" would be a claim about a list the
-     page has not read yet. */
-  if (rows.length === 0 && window._lastSessionsSnapshot) grid.appendChild(sessionPlateEmpty(region));
-  rows.forEach(function (s) {
-    var sid = s.id || '';
-    // This plate renders one kind of session, so the card's DEAD state follows
-    // from which plate built it — the same reason the card markup is shared.
-    var dead = region.dead;
-    var isSelected = selectedIds.has(sid);
-    var tile = document.createElement('div');
-    var tileClass = 'conn-tile sess-tile' + (dead ? ' archived' : '') + (isSelected ? ' batch-selected' : '');
-    tile.className = tileClass;
-    tile.setAttribute('data-sid', sid);
-    // Re-apply a pending notify_user highlight across re-renders.
-    if (sid && _uiNotifHighlights && _uiNotifHighlights[sid]) {
-      tile.classList.add('sess-notified');
-    }
-    // A dial in progress: the card shows the profile it is dialling and a
-    // spinner instead of the live/dead lamp. Everything else on the card is
-    // suppressed below rather than branched here, so the two kinds of card
-    // cannot drift apart in structure.
-    var pending = !!s._pending;
-    var nm = String((s.name || '').trim());
-    var entryLine = pending
-      ? (nm || t('tab.connecting'))
-      : (nm && nm.indexOf('session-') !== 0 ? nm : displaySessionShort(s));
-    /* Status lamp at the left of the id: green while the session is up, red once
-       it is over. The reason still travels in the tooltip. A connecting card has
-       neither state yet, so it gets the spinner the pending window already uses
-       and says what it is doing in the same tooltip slot. */
-    var statusText = pending
-      ? t('session.status.connecting')
-      : (dead
-          ? t('session.status.dead', { reason: reasonLabel(s.reason) })
-          : t('session.status.running'));
-    var statusIc = pending
-      ? '<span class="sess-status-ic is-connecting" title="' +
-        escapeHtml(statusText) + '" role="img" aria-label="' +
-        escapeHtml(statusText) + '"></span>'
-      :
-        '<span class="sess-status-ic ' + (dead ? 'is-dead' : 'is-live') + '" title="' +
-        escapeHtml(statusText) + '" role="img" aria-label="' +
-        escapeHtml(statusText) + '"></span>';
-
-    /* Approval lock: a state indicator that is also the switch. It sits in the
-       meta row with the lamp and the id, which is already the line that reads
-       "what state is this session in". Only live sessions can be gated — a DEAD
-       session has no input to gate. */
-    var gated = !!s.approval_mode;
-    var lockHtml = (!dead && !pending)
-      ? '<button type="button" class="sess-lock' + (gated ? ' is-on' : '') + '" ' +
-          'title="' + escapeHtml(gated ? t('review.disableTip') : t('review.enableTip')) + '" ' +
-          'aria-pressed="' + (gated ? 'true' : 'false') + '" ' +
-          'aria-label="' + escapeHtml(t('review.mode')) + '">' +
-          (gated ? SVG_LOCK_CLOSED : SVG_LOCK_OPEN) +
-        '</button>'
-      : '';
-
-    // The corner key cancels the dial rather than deleting a session: there is
-    // nothing on the server to delete yet, and the abort is what stops the
-    // handshake.
-    var actionCornerHtml = pending
-      ? '<button type="button" class="sess-x" title="' + escapeHtml(t('session.cancelDial.title')) + '" ' +
-        'aria-label="' + escapeHtml(t('session.cancelDial.title')) + '">' +
-        '<svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" d="M2 2l8 8M10 2L2 10"/></svg>' +
-        '</button>'
-      :
-        '<button type="button" class="sess-x" title="Delete session" data-i18n-title="session.delete.title" aria-label="Delete session" data-i18n-aria="session.delete.title">' +
-        '<svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" d="M2 2l8 8M10 2L2 10"/></svg>' +
-        '</button>';
-
-    /* The name line is the rename control, and the sid line copies the session
-       URL. Neither exists for a dial in progress: there is no session to rename
-       and no id to address yet, so a connecting card keeps both elements but
-       leaves them inert (no role, no tab stop, and the sid slot carries the
-       status word in place of an id that does not exist). The elements are kept
-       rather than dropped so the two cards stay the same shape — the CSS grid
-       that places them then needs no second variant. */
-    /* Which agent started this session, when one claimed a namespace. The tag
-       is what makes two agents' sessions tellable apart on the plate without
-       opening either — the isolation itself is server-side (session_list only
-       returns the caller's own), so this chip is the operator's view of it. */
-    var clientName = pending ? '' : sessionClientName(s);
-    var clientHtml = clientName
-      ? '<span class="sess-client" title="' + escapeHtml(t('session.client.tip', { name: clientName })) + '">' + escapeHtml(clientName) + '</span>'
-      : '';
-
-    var nameRowHtml =
-      '<div class="sess-name-row">' +
-      '<input type="checkbox" class="sess-checkbox" title="Select session" data-i18n-title="session.aria.select" aria-label="Select session" data-i18n-aria="session.aria.select"' + (isSelected ? ' checked' : '') + '>' +
-      (pending
-        ? '<div class="sess-entry-line">' + escapeHtml(entryLine) + '</div>'
-        : '<div class="sess-entry-line" role="button" tabindex="0" title="Rename session" data-i18n-title="session.aria.rename" aria-label="Rename session" data-i18n-aria="session.aria.rename">' + escapeHtml(entryLine) + '</div>') +
-      clientHtml +
-      '</div>';
-    /* The lamp sits in the meta row, immediately before the sid: that row is the
-       line that reads "what state is this session in". A connecting card swaps
-       the lamp for the spinner and the id for the status word, but keeps both
-       slots in this one row, so the row reads the same way on either card. The
-       sid span is written out in both branches rather than hoisted into a
-       variable, because the row's own markup is what a test pins. */
-    tile.innerHTML =
-      '<div class="conn-tile-stack">' +
-      actionCornerHtml +
-      '<div class="icon-wrap" title="' + escapeHtml(dead ? t('session.openHistory') : t('session.openTerminal')) + '"><span class="sess-terminal-ic">' + terminalIconImgHtml() + '</span></div>' +
-      '</div>' +
-      '<div class="sess-tile-body">' +
-      nameRowHtml +
-      '<div class="sess-meta-row">' +
-      statusIc +
-      lockHtml +
-      (pending
-        ? '<span class="sess-sid-line is-pending">' + escapeHtml(statusText) + '</span>'
-        : '<span class="sess-sid-line" role="button" tabindex="0" title="Copy session URL" data-i18n-title="session.aria.copyUrl" aria-label="Copy session URL" data-i18n-aria="session.aria.copyUrl">' + escapeHtml(sid) + '</span>') +
-      '</div>' +
-      reviewBadgeHtml(sid) +
-      '</div>' +
-      '<div class="sess-fwd-info" style="display:none"></div>';
-
-    /* A pending card's tooltip says what it is doing; the real card's names what
-       opening it will do. */
-    tile.title = pending
-      ? statusText + ' · ' + escapeHtml(s._pendingConn || '')
-      : (dead ? t('session.openHistory.tip') : t('session.openTerminal')) + ' · ' + sid;
-
-    var lockBtn = tile.querySelector('.sess-lock');
-    if (lockBtn) {
-      lockBtn.onclick = function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        toggleSessionApproval(s, gated, lockBtn);
-      };
-    }
-
-    var sx = tile.querySelector('.sess-x');
-    var delConf = {
-      title: t('session.delete.title'),
-      message: t('session.delete.message', { name: entryLine }),
-      okText: t('common.delete'),
-      danger: true
-    };
-    if (sx) {
-      sx.onclick = function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        /* Cancelling a dial needs no confirmation: the user is undoing their own
-           click, nothing is destroyed, and the abort is immediate on purpose.
-           Confirming would put a dialog between the user and the one gesture
-           whose whole point is "stop now". */
-        if (pending) {
-          cancelPendingConn(s._pendingConn);
-          renderSessionGrid('');
-          return;
-        }
-        confirmDialog(delConf).then(function (ok) {
-          if (!ok) return;
-          fetch(apiPath('/api/sessions/') + encodeURIComponent(s.id), { method: 'DELETE' })
-            .then(function (r) {
-              if (!r.ok && r.status !== 204) return r.json().then(function (er) { throw new Error((er && er.error) || 'HTTP ' + r.status); });
-              var w = getShellWindowBySid(s.id);
-              if (w) closeShellWindow(w);
-            })
-            .catch(function (err) { showCopyToast(t('toast.delete.failed', { msg: String(err.message || err) })); });
-        });
-      };
-    }
-
-    var checkbox = tile.querySelector('.sess-checkbox');
-    if (checkbox) {
-      checkbox.addEventListener('mousedown', function (e) { e.stopPropagation(); });
-      checkbox.addEventListener('click', function (e) {
-        // Do NOT preventDefault() here: that would revert the checkbox toggle.
-        e.stopPropagation();
-        if (checkbox.checked) selectedIds.add(sid);
-        else selectedIds.delete(sid);
-        tile.classList.toggle('batch-selected', checkbox.checked);
-        updateSessionBatchBar();
-      });
-    }
-
-    /* The sid copies what the button next to it used to: the session URL. The
-       button went because the id is already the thing you aim at. */
-    var sidEl = tile.querySelector('.sess-sid-line');
-    if (sidEl) {
-      var doCopy = function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        copyTextToClipboard(resourceUrlSession(sid)).then(function () { showCopyToast(); }).catch(function () { showCopyToast(t('toast.copy.failed')); });
-      };
-      sidEl.addEventListener('mousedown', function (e) { e.stopPropagation(); });
-      sidEl.addEventListener('click', doCopy);
-      sidEl.addEventListener('keydown', function (e) {
-        if (e.key !== 'Enter' && e.key !== ' ') return;
-        doCopy(e);
-      });
-    }
-
-    var nameEl = tile.querySelector('.sess-entry-line');
-    var doRename = function (e) {
-      e.preventDefault();
-      e.stopPropagation();
-      /* A connecting card renders its name as plain text (no role/tabindex), so
-         this handler is unreachable for it — the guard is here because the name
-         element is found by class on both kinds of card, and renaming a
-         synthetic id would PATCH an endpoint that cannot resolve it. */
-      if (pending || !nameEl.hasAttribute('role')) return;
-      var cur = String((s.name || '').trim());
-      if (cur.indexOf('session-') === 0) cur = '';
-      var input = prompt(t('session.prompt.rename'), cur);
-      if (input === null) return;
-      var newName = input.trim();
-      if (!newName || (cur && newName === cur)) { showCopyToast(t('session.toast.unchanged')); return; }
-      fetch(apiPath('/api/sessions/') + encodeURIComponent(sid), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newName })
-      })
-        .then(function (r) {
-          if (!r.ok) return r.json().then(function (er) { throw new Error((er && er.error) || 'HTTP ' + r.status); });
-          showCopyToast(t('session.toast.renamed'));
-          // Local optimistic refresh; the server broadcast reconciles shortly.
-          var snap = (window._lastSessionsSnapshot || []).slice();
-          for (var i = 0; i < snap.length; i++) {
-            if (snap[i] && snap[i].id === sid) { snap[i].name = newName; }
-          }
-          applySessionsSnapshot(snap);
-        })
-        .catch(function (err) { showCopyToast(t('toast.rename.failed', { msg: (err.message || err) })); });
-    };
-    /* The name is the rename control: the pencil it replaced sat next to the sid
-       and read as "edit the id", which is not what it did. */
-    nameEl.addEventListener('mousedown', function (e) { e.stopPropagation(); });
-    nameEl.addEventListener('click', doRename);
-    nameEl.addEventListener('keydown', function (e) {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      doRename(e);
-    });
-
-    tile.onclick = function (e) {
-      if (e.target.closest('.sess-x') || e.target.closest('.sess-checkbox') || e.target.closest('.sess-entry-line') || e.target.closest('.sess-sid-line') || e.target.closest('.sess-status-ic')) return;
-      /* A connecting card has no session to open. Its click raises the pending
-         window instead, which is the one actionable thing that exists for a dial
-         in progress and the same thing the connection list does for it. */
-      if (pending) {
-        var pw = typeof getPendingShellWindowForConn === 'function' ? getPendingShellWindowForConn(s._pendingConn) : null;
-        if (pw) bringShellWindowToFront(pw);
-        return;
-      }
-      clearSessNotified(sid); // opening the session acknowledges its notification highlight
-      /* The card names the position, so a click on the session grid still opens
-         the terminal at the pointer; a keyboard activation has none and centres. */
-      focusSessionWindow(s.name || '', s.id, windowPositionFromClick(e), dead ? { readOnly: true } : null);
-    };
-    if (!dead && !pending) {
-      var fwdInfo = tile.querySelector('.sess-fwd-info');
-      var fwds = (window._lastForwards || []).filter(function(f) { return f.ssh_config === s.name; });
-      if (fwds.length > 0) {
-        fwdInfo.style.display = 'block';
-        fwdInfo.textContent = tCount('fwd.count.one', 'fwd.count.other', { count: fwds.length }) + ': ' + fwds.map(function(f){ return f.listen_addr + '\u2192' + f.target_addr; }).join(', ');
-      }
-    }
-    grid.appendChild(tile);
-  });
-  applyI18n(grid);
 }
 
 /** A compact age for an archive row ("3h ago").
@@ -1114,7 +834,15 @@ function renderArchiveRows(region, all) {
     row.innerHTML =
       '<input type="checkbox" class="archive-row-tick" tabindex="-1" aria-hidden="true">' +
       '<span class="archive-row-main">' +
-        '<span class="archive-row-name">' + escapeHtml(label) + '</span>' +
+        /* THE NAME IS THE RENAME CONTROL, and it is the only one an archived
+           session has: the dock lists running sessions only, so an archived row has
+           no tab to right-click, and the session plate's cards — whose name-click
+           used to rename — are gone. Clicking the name therefore renames, which is
+           the same gesture the window title now carries, and the same
+           renameSessionById behind it. It is a <button> so the keyboard reaches it
+           and the row's own "open" click does not swallow it. */
+        '<button type="button" class="archive-row-name archive-row-rename" title="' +
+          escapeHtml(t('session.rename.hint')) + '">' + escapeHtml(label) + '</button>' +
         '<span class="archive-row-meta">' +
           (endpoint ? '<span class="archive-row-chip">' + escapeHtml(endpoint) + '</span>' : '') +
           (cmd ? '<span class="archive-row-cmd">' + escapeHtml(cmd) + '</span>' : '') +
@@ -1164,6 +892,14 @@ function renderArchiveRows(region, all) {
       if (e.target && e.target.closest && e.target.closest('.archive-row-del')) return;
       activate();
     });
+    var rename = row.querySelector('.archive-row-rename');
+    if (rename) rename.addEventListener('click', function (e) {
+      /* Both, or the row's open handler runs as the click bubbles: renaming a
+         session must not also open its transcript behind the prompt. */
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof renameSessionById === 'function') renameSessionById(s);
+    });
     var del = row.querySelector('.archive-row-del');
     if (del) del.addEventListener('click', function (e) {
       e.preventDefault();
@@ -1207,31 +943,6 @@ function renderArchiveRows(region, all) {
        any of that here too would be a second writer for one state. */
     _archiveBatch.update();
   }
-}
-
-/** A plate with no rows reads as a terminal that printed nothing. The sentence
- *  is the catalog's (one per plate), and the node replaces what would otherwise
- *  be an empty grid — the plate would still be there, saying nothing about why. */
-function sessionPlateEmpty(region) {
-  var el = document.createElement('div');
-  el.className = 'sess-plate-empty';
-  el.textContent = region.dead ? t('plate.archive.empty') : t('plate.sessions.empty');
-  return el;
-}
-
-/** reviewBadgeHtml builds a session card's pending-review badge from the counts
- *  already in hand.
- *
- *  The grid is rebuilt from scratch on every session frame, and submitting a
- *  request emits one of those frames (the manager's list-change broadcast). A
- *  badge painted only by a later pass was therefore wiped by the very frame that
- *  announced the request: measured in a browser, the tab bar showed "1" while
- *  the card stayed empty. Building the badge into the tile is what makes it
- *  survive its own re-render. */
-function reviewBadgeHtml(sid) {
-  var n = (window._approvalCounts || {})[sid] || 0;
-  if (!n) return '<div class="sess-review" hidden></div>';
-  return '<div class="sess-review">' + escapeHtml(tCount('review.badge.one', 'review.badge.other', { count: n })) + '</div>';
 }
 
 /** Convert a live terminal window to read-only when its session becomes DEAD:
@@ -1391,6 +1102,11 @@ function applySessionsSnapshot(sessions) {
       continue;
     }
     if (s.status !== 'running') lockWindowReadonly(w);
+    // The title carries the session's name, and a rename can arrive from anywhere
+    // (this window's own title, a dock tab's menu, an agent over MCP), so the
+    // session frame is what repaints it. The window was opened from a LABEL, which
+    // stops being the name the moment anyone renames the session.
+    if (typeof paintWindowTitleName === 'function') paintWindowTitleName(w, s);
     // Approval mode is part of the session snapshot, so an open window reflects a
     // switch flipped in another tab without needing its own request.
     w._approvalNeed = s.approval_need || 1;

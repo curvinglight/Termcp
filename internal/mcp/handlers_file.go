@@ -13,6 +13,7 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/clock"
 	filesftp "github.com/open-mcp-ai/termcp/internal/sftp"
+	"github.com/open-mcp-ai/termcp/internal/task"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -39,6 +40,37 @@ func (s *Server) handleFileRead(ctx context.Context, request mcpgo.CallToolReque
 	if bad != nil {
 		return bad, nil
 	}
+
+	// A DOWNLOAD TO A LOCAL PATH IS A TRANSFER, AND A TRANSFER IS ASYNC (#158). The
+	// reply cannot carry the bytes — they go to a file — so there is nothing lost by
+	// answering with a receipt, and a caller behind a watchdog gets to keep its turn.
+	if mode == "file" && localPath != "" {
+		taskCtx, cancel := context.WithCancel(context.Background())
+		t := s.tasks.Start(task.Download, sessionID, remotePath, localPath, cancel)
+		go func() {
+			defer sftpCli.Close()
+			if info, statErr := sftpCli.StatFile(remotePath); statErr == nil {
+				t.SetTotal(info.Size)
+			}
+			n, err := sftpCli.ReadToLocalProgress(taskCtx, remotePath, localPath, offset, length, t.Add)
+			if err == nil {
+				t.SetTotal(n)
+			}
+			s.tasks.Finish(t.ID(), err)
+		}()
+		return jsonResult(map[string]any{
+			"ok":          true,
+			"accepted":    true,
+			"task_id":     t.ID(),
+			"status":      string(task.Running),
+			"kind":        string(task.Download),
+			"bytes_total": getFloat64(args, "length", 0),
+			"remote_path": remotePath,
+			"local_path":  localPath,
+			"next":        "get task " + t.ID() + "   (give the call a `timeout` and it waits)",
+		}), nil
+	}
+
 	defer sftpCli.Close()
 	result, err := sftpCli.ReadFile(remotePath, offset, length, mode, localPath)
 	if err != nil {
@@ -72,12 +104,53 @@ func (s *Server) handleFileWrite(ctx context.Context, request mcpgo.CallToolRequ
 	if bad != nil {
 		return bad, nil
 	}
-	defer sftpCli.Close()
-	n, err := sftpCli.WriteFile(remotePath, offset, data, mode, localPath, localOffset, length)
-	if err != nil {
-		return fileErr(err), nil
+
+	// INLINE DATA STAYS SYNCHRONOUS. It is a string the caller already holds, bounded
+	// by the request size, and its whole point is the byte count in the reply —
+	// turning it into a receipt would make every small config edit a two-call dance.
+	if localPath == "" {
+		defer sftpCli.Close()
+		n, err := sftpCli.WriteFile(remotePath, offset, data, mode, localPath, localOffset, length)
+		if err != nil {
+			return fileErr(err), nil
+		}
+		return jsonResult(map[string]any{"ok": true, "bytes_written": n}), nil
 	}
-	return jsonResult(map[string]any{"ok": true, "bytes_written": n}), nil
+
+	// A LOCAL FILE IS A TRANSFER, AND A TRANSFER IS ALWAYS ASYNC (#158). The caller is
+	// usually an agent behind a tool-call watchdog of 30-60s, and moving a large file
+	// over SFTP takes longer than that on a slow link — so a synchronous write is not
+	// "slow", it is a call that gets killed partway, leaving a truncated file on the
+	// far side with no error anywhere. The receipt costs milliseconds.
+	//
+	// The transfer gets its OWN context and its own client handle: the request's
+	// context is cancelled the moment this handler returns, which is now before
+	// the copy is done, and the sftp client must outlive the return as well.
+	taskCtx, cancel := context.WithCancel(context.Background())
+	t := s.tasks.Start(task.Upload, sessionID, remotePath, localPath, cancel)
+	go func() {
+		defer sftpCli.Close()
+		localInfo, statErr := os.Stat(localPath)
+		if statErr == nil {
+			t.SetTotal(localInfo.Size())
+		}
+		n, err := sftpCli.WriteFromLocalProgress(taskCtx, remotePath, offset, localPath, localOffset, length, t.Add)
+		if err == nil {
+			t.SetTotal(n)
+		}
+		s.tasks.Finish(t.ID(), err)
+	}()
+	return jsonResult(map[string]any{
+		"ok":          true,
+		"accepted":    true,
+		"task_id":     t.ID(),
+		"status":      string(task.Running),
+		"kind":        string(task.Upload),
+		"bytes_total": getFloat64(args, "length", 0),
+		"remote_path": remotePath,
+		"local_path":  localPath,
+		"next":        "get task " + t.ID() + "   (give the call a `timeout` and it waits)",
+	}), nil
 }
 
 // handleFileReplace performs an exact, unique, atomic replacement inside a file.
