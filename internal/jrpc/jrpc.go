@@ -388,12 +388,15 @@ func waitKey(want any) string {
 
 // awaitAnswer waits for the frame carrying want, up to ctx.
 //
+// send, when given, is called AFTER the waiter is registered and before the wait — the
+// order a call needs (see wsCall). A send that fails is the call's error.
+//
 // THE ANSWER IS DELIVERED, NOT COMPETED FOR. This registers a one-slot channel under
 // the id and lets the dispatcher hand the frame to it, so a concurrent Take cannot
 // lift it out from underneath: the routing decision was already made by id, in one
 // place. What this used to do was read the shared queue itself and put back what it
 // did not want, which meant an answer could be taken by whoever read first.
-func (c *Channel) awaitAnswer(ctx context.Context, want any) (string, error) {
+func (c *Channel) awaitAnswer(ctx context.Context, want any, send func() error) (string, error) {
 	key := waitKey(want)
 	if key == "" {
 		// No id on the frame we sent, so no answer can be matched to it. That is a
@@ -419,6 +422,11 @@ func (c *Channel) awaitAnswer(ctx context.Context, want any) (string, error) {
 		default:
 		}
 	}()
+	if send != nil {
+		if err := send(); err != nil {
+			return "", err
+		}
+	}
 	select {
 	case rec := <-ch:
 		return rec.Data, nil
@@ -706,12 +714,22 @@ func (c *Channel) Close() error {
 	return nil
 }
 
-// wsCall writes one frame and reads until its answer arrives.
+// wsCall registers the waiter, writes one frame, and reads until its answer arrives.
+//
+// THE ORDER IS THE WHOLE FUNCTION: REGISTER FIRST, THEN WRITE.
+//
+// It used to write and then wait, and the gap between the two is a window in which the
+// peer can answer. The dispatcher decides where a frame goes by looking up `wait[id]`, so
+// an answer arriving inside that window found no waiter and went to the backlog — where
+// nothing would read it — while the call waited for a frame that had already come.
+// Observed as a 10-minute hang of `TestChannelRecordsEveryFrameAtTheWire` on one ubuntu
+// runner: the peer is an in-process websocket server, so "answers faster than the caller
+// can register" is reachable, and a caller whose context carries no deadline waits
+// forever rather than being told anything.
+//
+// Registering first removes the window rather than narrowing it.
 func (c *Channel) wsCall(ctx context.Context, frame map[string]any, id any) (string, error) {
-	if err := c.writeFrame(ctx, frame); err != nil {
-		return "", err
-	}
-	return c.awaitAnswer(ctx, id)
+	return c.awaitAnswer(ctx, id, func() error { return c.writeFrame(ctx, frame) })
 }
 
 // httpCall posts one frame and reads its answer.
