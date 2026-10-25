@@ -38,6 +38,33 @@ type Manager struct {
 	activityMu        sync.Mutex
 	activityListeners []func(shellID string, src InputSource, submit bool)
 
+	// persistMu serialises persistOne, because taking a snapshot and writing it are
+	// ONE operation and the code is not shaped like it.
+	//
+	// persistOne reads the session at the top and writes it at the bottom, with the
+	// shell manifests (an fsync each, ~7ms) in between. Without this lock two persists
+	// race, and the loser is the NEWER state: a persist that started before a session
+	// died can finish after the one that recorded why it died, putting the older
+	// manifest back on disk with the reason gone — which is precisely the fact issue
+	// #176 exists to keep.
+	//
+	// Seen as `TestWhyASessionDiedIsRecordedAndSurvivesARestart` failing on CI with the
+	// reason live in memory and empty on disk, and reproduced locally at -cpu=1. It is
+	// not a test-only race: `get` after a restart is where a user asks why their session
+	// disappeared, and the answer was being overwritten.
+	//
+	// Per manager rather than per session: the store already takes one lock per manifest
+	// write, so the fsync order is unchanged, and a map of per-session locks would be
+	// state to keep correct for no measured gain.
+	persistMu sync.Mutex
+
+	// persistHook, when set, runs inside persistOne between taking the snapshot and
+	// writing it — the window the lock above closes. Nil in production; a test uses it to
+	// hold that window open and prove a second persist cannot enter it, which a
+	// probabilistic race test cannot do (measured: forty forced iterations of the real
+	// interleaving still passed with the lock removed).
+	persistHook func()
+
 	sessions    sync.Map // string → *Session
 	internalSSH *sshserver.Server
 	msgMgr      *message.Manager
@@ -343,11 +370,16 @@ func (m *Manager) persistOne(id string) {
 	if m.store == nil {
 		return
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	s := m.Get(id)
 	if s == nil {
 		return
 	}
 	sess := s.Info()
+	if m.persistHook != nil {
+		m.persistHook()
+	}
 	// A manifest that fails to write is state the caller believes is durable, so it
 	// is logged rather than discarded. This is not hypothetical: on Windows the
 	// rename can be refused while a reader holds the old manifest open, and when

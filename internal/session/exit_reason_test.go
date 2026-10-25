@@ -89,9 +89,12 @@ func TestWhyASessionDiedIsRecordedAndSurvivesARestart(t *testing.T) {
 		if time.Now().After(writeDeadline) {
 			onDisk := "(no manifest)"
 			if rec, err := store.ReadSession(id); err == nil && rec != nil {
-				onDisk = "" + rec.ExitReason + ""
+				onDisk = rec.ExitReason
 			}
-			t.Fatalf("the reason never reached the manifest: live %q, on disk %s", wantReason, onDisk)
+			// A FAILURE HAS TO SAY WHICH FAILURE. The first version of this message printed
+			// the live reason twice (a typo put wantReason in both places), so a red run
+			// could not be told apart from a read that returned the wrong session.
+			t.Fatalf("the reason never reached the manifest: live %q, on disk %q", wantReason, onDisk)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
