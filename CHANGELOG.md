@@ -55,6 +55,8 @@
 
 - **对端的一行日志不再永久堵死一个通道（#182）**。帧扫描取缓冲区里第一个 `{` 或 `[` 并从那解码，而缓冲区里也有对端自己的日志：chrome-devtools-mcp 的 banner 以 `[chrome-devtools-mcp]` 开头，后面的完整回复永远到不了。现在按出现位置逐个尝试候选、取第一个能解出完整值的。
 
+- **会话「为什么结束」不再被并发写盘覆盖**。`persistOne` 在顶部取快照、底部才写，中间夹着 shell manifest 的 fsync（每次约 7ms），所以两次并发 persist 是一次读-改-写竞态，**输的是更新的那份状态**：一条在会话死前开始的 persist 可以后结束，把旧 manifest 写回去，死因就没了——而这正是重启后 `get` 唯一的答案。CI 上表现为 `TestWhyASessionDiedIsRecordedAndSurvivesARestart` 每六十次红一次（内存里有、盘上是空），本地 `-cpu=1` 可复现。现在快照与写入是一次操作。
+
 - **`jrpc` 通道不再有「答案比等待者先到」的窗口**。`wsCall` 先写帧、后注册等待者，而 dispatcher 是按 id 查 `wait[id]` 决定去向的：在这两步之间到达的答案找不到等待者，被放进 backlog，而调用一直等一个**已经来过**的帧。CI 上表现为 `TestChannelRecordsEveryFrameAtTheWire` 挂满 10 分钟（对端是进程内 websocket server，「比调用方注册得更快」是可达的，而调用方的 context 没有 deadline）。现在先注册、后写帧，窗口被消除而不是缩小。
 
 - **`read --frame` 等的是调用方给的窗口（#174）**；**stdio 对端的 `call` 会等它自己那条回复（#175）**——以前写完帧就回 202，同一个动词按对端怎么被启动而行为不同，而调用方看不出自己拿的是哪种。
