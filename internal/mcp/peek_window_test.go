@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,13 +46,24 @@ func TestAFullWindowEndsTheWait(t *testing.T) {
 	//     control sequences: PowerShell's line editor redraws as the command is typed, and
 	//     a window of pure cursor movement renders to nothing while being 200 real bytes.
 	//
-	// The 206 and a range spanning bytes_limit say the thing being tested: the peek stopped
-	// because its own window filled, not because the stream ended.
-	if !strings.Contains(got, "206") {
-		t.Fatalf("a window cut short by its own size is a partial reply:\n%s", got)
+	// A THIRD VERSION ASSERTED 206 AND WAS ALSO WRONG, for a reason worth keeping: this
+	// read starts at the reader cursor, so `start_offset` is where the caller left off and
+	// not a withheld prefix — the reply holds everything the caller had not seen. Its
+	// status is 206 only when the stream grew between the read and the reply, which for a
+	// noisy command is a coin toss. The window filling is a fact about the RANGE: the span
+	// the reply covers is exactly the caller's byte_limit, which cannot happen by accident
+	// and does not depend on what the stream did in the microseconds after the read.
+	if !statusLineIs(got, "206") && !statusLineIs(got, "200") {
+		t.Fatalf("a reply about bytes has to say how it went:\n%s", got)
 	}
-	if !strings.Contains(got, "Content-Range: bytes ") {
+	rng := regexp.MustCompile(`Content-Range: bytes (\d+)-(\d+)/(\d+)`).FindStringSubmatch(got)
+	if rng == nil {
 		t.Fatalf("a partial reply has to say which bytes it covered:\n%s", got)
+	}
+	lo, _ := strconv.Atoi(rng[1])
+	hi, _ := strconv.Atoi(rng[2])
+	if span := hi - lo + 1; span != 200 {
+		t.Fatalf("the window is the caller's 200 bytes and the reply covers %d (%s):\n%s", span, rng[0], got)
 	}
 	// The wait has to end on the WINDOW, not on the clock. 10s is the caller's window; a
 	// full 200 bytes arrives in about a second. The bound is 7s rather than 3s because a

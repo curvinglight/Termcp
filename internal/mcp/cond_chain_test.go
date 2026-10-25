@@ -18,8 +18,13 @@ func TestCondChainGatesOnThePreviousStatement(t *testing.T) {
 	h := openPty(t, s)
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
-	// `&&` after a success runs the next statement.
-	got := termText(t, s, map[string]any{"cmd": "run " + h + " echo ONE && notify done", "timeout": 3})
+	// `&&` after a success runs the next statement. The shell line is a VALUE: the
+	// payload is one reference, so the `&&` can only be the directive chain's.
+	got := termText(t, s, map[string]any{
+		"cmd":     "run " + h + " $1 && notify done",
+		"args":    []any{"echo ONE"},
+		"timeout": 3,
+	})
 	if !strings.Contains(got, "ONE") {
 		t.Fatalf("the first statement did not run:\n%s", got)
 	}
@@ -28,7 +33,11 @@ func TestCondChainGatesOnThePreviousStatement(t *testing.T) {
 	}
 
 	// `||` after a success does NOT run the next statement.
-	got = termText(t, s, map[string]any{"cmd": "run " + h + " echo TWO || notify nope", "timeout": 3})
+	got = termText(t, s, map[string]any{
+		"cmd":     "run " + h + " $1 || notify nope",
+		"args":    []any{"echo TWO"},
+		"timeout": 3,
+	})
 	if !strings.Contains(got, "short_circuited") {
 		t.Errorf("`||` must skip after a success:\n%s", got)
 	}
@@ -44,7 +53,8 @@ func TestCondChainReportsTheSkip(t *testing.T) {
 
 	// A directive that fails: `run` on a handle that does not resolve.
 	got := termText(t, s, map[string]any{
-		"cmd":     "run nosuch:1 x && notify unreachable",
+		"cmd":     "run nosuch:1 $1 && notify unreachable",
+		"args":    []any{"x"},
 		"timeout": 2,
 	})
 	if !strings.Contains(got, "short_circuited") {

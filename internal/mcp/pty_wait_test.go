@@ -19,7 +19,7 @@ func TestAPtyRunEndsWhenTheCommandStopsTalking(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	start := time.Now()
-	got := termText(t, s, map[string]any{"cmd": "run " + h + " echo finished-quietly", "timeout": 30})
+	got := termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo finished-quietly"}, "timeout": 30})
 	elapsed := time.Since(start)
 
 	if !strings.Contains(got, "finished-quietly") {

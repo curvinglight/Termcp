@@ -23,7 +23,7 @@ func TestInputTypesWithoutSubmitting(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	const marker = "typed-not-submitted"
-	if got := termText(t, s, map[string]any{"cmd": "input " + h + " " + marker}); !strings.HasPrefix(got, "TERM/1 2") {
+	if got := termText(t, s, map[string]any{"cmd": "input " + h + " $1", "args": []any{marker}}); !strings.HasPrefix(got, "TERM/1 2") {
 		t.Fatalf("input to a live channel must succeed:\n%s", got)
 	}
 

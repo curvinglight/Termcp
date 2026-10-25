@@ -25,7 +25,11 @@ func TestReadGrepFiltersBeforeTheWindow(t *testing.T) {
 	//   5: [ERROR] out of memory
 	//   6: [INFO] done
 	script := writeScript(t, "printf 'start\n[INFO] booting\n[ERROR] disk full\n[INFO] retry\n[ERROR] out of memory\n[INFO] done\n'")
-	termText(t, s, map[string]any{"cmd": "run " + h + " sh '" + script + "'", "timeout": 2})
+	termText(t, s, map[string]any{
+		"cmd":     "run " + h + " $1",
+		"args":    []any{"sh '" + script + "'"},
+		"timeout": 2,
+	})
 	// A FIXED TIMEOUT IS NOT A SYNCHRONISATION POINT. On a loaded runner the shell
 	// had not finished printing when the two seconds expired, so the grep ran over a
 	// partial transcript and answered 204 for a pattern that was about to appear.
@@ -68,7 +72,7 @@ func TestReadGrepNoMatchAnswers204WithStats(t *testing.T) {
 	h := openPty(t, s)
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
-	termText(t, s, map[string]any{"cmd": "run " + h + " echo ONLY_ONE_LINE", "timeout": 2})
+	termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo ONLY_ONE_LINE"}, "timeout": 2})
 
 	got := termText(t, s, map[string]any{"cmd": "read " + h + " --grep 'NO_SUCH_PATTERN'"})
 	if !strings.HasPrefix(got, "TERM/1 204") {
@@ -107,7 +111,11 @@ func TestReadGrepDoesNotConsumeTheTranscript(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	script := writeScript(t, "printf 'AAA\\nBBB\\nCCC\\n'")
-	termText(t, s, map[string]any{"cmd": "run " + h + " sh '" + script + "'", "timeout": 2})
+	termText(t, s, map[string]any{
+		"cmd":     "run " + h + " $1",
+		"args":    []any{"sh '" + script + "'"},
+		"timeout": 2,
+	})
 	// WAIT FOR THE OUTPUT TO LAND, the same way the other grep tests do. Reading
 	// immediately raced the shell: under -race on a loaded runner the first grep could
 	// arrive before printf had run, and every assertion after it was describing a

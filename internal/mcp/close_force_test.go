@@ -23,7 +23,7 @@ func TestCloseSessionTerminatesEntireSession(t *testing.T) {
 	}
 
 	closeRes := termText(t, s, map[string]any{"cmd": "close " + sessID})
-	if !strings.Contains(closeRes, "204") {
+	if !statusLineIs(closeRes, "204") {
 		t.Fatalf("close must return 204:\n%s", closeRes)
 	}
 

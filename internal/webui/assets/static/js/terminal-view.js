@@ -184,7 +184,7 @@ function createChannelTab(win, sessionId, opt) {
       shellStatusTouch(win, sessionId);
     }
     try {
-      var ro = attachShellTerminalResizeObserverForChannel(win, term, inst, sessionId);
+      var ro = attachShellTerminalResizeObserverForChannel(win, term, inst);
       win._channels[sessionId].fitRo = ro;
       shellTermSyncViewportAfterBufferChange(term, inst, win);
     } catch (eBoot) {}
@@ -710,9 +710,33 @@ function applyApprovalMode(win, on, scopes) {
 }
 
 /** ResizeObserver wrapper that tracks which channel SID to resize. */
-function attachShellTerminalResizeObserverForChannel(win, term, termEl, sessionId) {
+function attachShellTerminalResizeObserverForChannel(win, term, termEl) {
+  // THE OBSERVER MUST REFIT, NOT ONLY TELL THE REMOTE SIDE (issue #165).
+  //
+  // It used to call scheduleShellRemoteResize only: the PTY was told the new geometry
+  // while the LOCAL grid kept its old row count. The xterm element then stayed taller
+  // than the box that contains it, and the scrollbar belongs to that inner viewport —
+  // so it could be scrolled to ITS bottom while the last rows sat outside the visible
+  // area. That is the reported shape exactly: "the scrollbar is at the bottom but the
+  // content is not", with no scroll position that reaches the tail.
+  //
+  // Measured in a real browser before this change: shrinking the window to 300px left
+  // the container at 264px and the xterm at 408px, rows still 26 — a 144px band of
+  // rows that no amount of scrolling could show. Nothing else had to happen: no font
+  // change, no viewport resize, no switching. Any layout change that shrinks the
+  // container does it, and the dock growing (a new session) is one.
+  //
+  // Coalesced through rAF because a drag emits a box per frame and term.resize is
+  // expensive; the flag lives on the TERM, not the window, so two channels resizing in
+  // the same frame do not cancel each other.
   var ro = new ResizeObserver(function() {
-    scheduleShellRemoteResize(win, term, termEl, sessionId);
+    if (term._termcpFitRaf) return;
+    term._termcpFitRaf = requestAnimationFrame(function() {
+      term._termcpFitRaf = 0;
+      // fitShellTerminal reads the container and returns false when it is gone or
+      // zero-sized, so a channel torn down mid-frame is a no-op rather than an error.
+      try { fitShellTerminal(term, termEl, win, true); } catch (e) {}
+    });
   });
   ro.observe(termEl);
   return ro;

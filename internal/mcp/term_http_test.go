@@ -224,7 +224,7 @@ func sourceSeenByHandler(t *testing.T, s *Server) string {
 	// A channel directive takes a handle, and a handle is `<session>:<index>` — the
 	// form `ps` prints. A bare session id is refused at parse time, so this must
 	// not be built from the session id alone.
-	rec := postTerm(t, s, `{"cmd":"run `+sessionID+`:1 echo probe"}`)
+	rec := postTerm(t, s, `{"cmd":"run `+sessionID+`:1 $1","args":["echo probe"]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (a held command line is a slot, not a request failure)", rec.Code)
 	}
@@ -363,8 +363,10 @@ func TestHTTPTermAdmitsThroughTheCapabilityTable(t *testing.T) {
 		t.Errorf("ls over HTTP = %v, want 200 for a listing-only template", got)
 	}
 
-	// `run` writes to the shell, which the template does not grant.
-	rec := postTerm(t, s, `{"cmd":"run `+sid+`:1 echo hi"}`)
+	// `run` writes to the shell, which the template does not grant. The line is a
+	// VALUE (the payload is one variable reference), so the request is well formed
+	// and the refusal has to come from the capability table, not from the parser.
+	rec := postTerm(t, s, `{"cmd":"run `+sid+`:1 $1","args":["echo hi"]}`)
 	slots = termSlots(t, rec)
 	code := slots[0]["code"]
 	if code == float64(200) {
@@ -376,7 +378,7 @@ func TestHTTPTermAdmitsThroughTheCapabilityTable(t *testing.T) {
 
 	// The tool surface must answer the same way for the same command: one
 	// decision, two entrances.
-	toolText := termText(t, s, map[string]any{"cmd": "run " + sid + ":1 echo hi"})
+	toolText := termText(t, s, map[string]any{"cmd": "run " + sid + ":1 $1", "args": []any{"echo hi"}})
 	if !strings.Contains(toolText, "403") {
 		t.Errorf("the tool surface did not refuse the same command, so the two entrances disagree:\n%s", toolText)
 	}

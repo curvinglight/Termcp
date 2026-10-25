@@ -240,9 +240,12 @@ func TestSubstitutionReachesEveryShellContext(t *testing.T) {
 		want string
 	}{
 		{
-			name: "heredoc body",
-			cmd:  "run h:1 cat <<EOF\n$BODY\nEOF\n",
-			sub:  Subst{Named: map[string]string{"BODY": "echo C"}},
+			// THE WHOLE PAYLOAD IS THE REFERENCE, so the value reaches the shell as the
+			// command line — including a here-document, which is now just text inside
+			// that value rather than a region of the caller's line.
+			name: "a here-document travels inside the value",
+			cmd:  "run h:1 $1",
+			sub:  Subst{Pos: []string{"cat <<EOF\necho C\nEOF"}},
 			want: "cat <<EOF\necho C\nEOF",
 		},
 	}
@@ -335,35 +338,37 @@ func TestBraceIndexIsUnambiguous(t *testing.T) {
 		}
 	}
 
-	// $10 is $1 followed by a literal 0, and that is correct rather than convenient:
-	// it is what the shell does, so a caller reading their own cmd reads the same
-	// thing the server does.
-	// $10 is $1 followed by a literal 0, and that is correct rather than convenient: it
-	// is what the shell does, so a caller reading their own cmd reads the same thing the
-	// server does. The case is shown on a flag value because `run h:1 $10` glues a hole
-	// to a word — the mixed shape, refused on purpose.
-	f, err = ParseWithSubst(`write h file /tmp/x --data $10`, Subst{Pos: []string{"ONE"}})
-	if err != nil {
-		t.Fatalf("$10: %v", err)
-	}
-	got10, _ := f.Statements[0].Flag("data")
-	if want := "ONE0"; got10 != want {
-		t.Errorf("--data from $10 = %q, want %q", got10, want)
+	// $10 IS $1 FOLLOWED BY A LITERAL 0 — and that is now an ERROR rather than a silent
+	// reading, because it is one word built from two things: a value and a literal. The
+	// old behaviour ("ONE" + "0" = "ONE0") was the shell's rule applied to a word the
+	// caller wrote in cmd, which is exactly the mixing this grammar refuses. `${10}` is
+	// the unambiguous spelling, and it is the one the loop above proves.
+	if _, err := ParseWithSubst(`write h file /tmp/x --data $10`, Subst{Pos: []string{"ONE"}}); err == nil {
+		t.Error("`$10` glued a value to a literal and was accepted; `${10}` is the spelling for the tenth value")
 	}
 }
 
-// TestNoArgsLeavesShellPositionalAlone pins the namespace rule: `$1` is the shell's
-// own positional parameter until the caller supplies args.
+// TestNoArgsLeavesShellPositionalAlone pins the namespace rule: `$1` inside a VALUE is
+// the shell's own positional parameter, not ours.
 //
-// Without this, every `awk '{print $1}'` a caller sent would become a 400 the moment
-// the args channel existed.
+// This is the case the rule protects: a caller whose command line contains `$1` — an
+// awk program, a shell function — must be able to pass it as a value. The reference in
+// cmd is ours and the ones inside the value are the shell's, and the two never meet
+// because a substituted value is never rescanned.
 func TestNoArgsLeavesShellPositionalAlone(t *testing.T) {
-	f, err := ParseWithSubst(`run h:1 awk '{print $1}'`, Subst{})
+	f, err := ParseWithSubst(`run h:1 $1`, Subst{Pos: []string{`awk '{print $1}'`}})
 	if err != nil {
-		t.Fatalf("a shell positional without args must pass through: %v", err)
+		t.Fatalf("a shell positional inside a value must pass through: %v", err)
 	}
 	if got, want := f.Statements[0].Payload, `awk '{print $1}'`; got != want {
 		t.Errorf("payload = %q, want %q", got, want)
+	}
+	// With no args at all, `$1` is the shell's own parameter — the payload is still one
+	// reference, and nothing here may substitute it.
+	if f, err := ParseWithSubst(`run h:1 $1`, Subst{}); err != nil {
+		t.Fatalf("a bare reference with no table must pass through: %v", err)
+	} else if got := f.Statements[0].Payload; got != "$1" {
+		t.Errorf("payload = %q, want $1 untouched", got)
 	}
 }
 
@@ -467,16 +472,17 @@ func TestTargetFromArgsIsRaw(t *testing.T) {
 	cases := []struct {
 		cmd    string
 		target string
+		args   []string
 		path   string
 	}{
-		{"get $1", "s:1", "get s:1"},
-		{"run $1 echo hi", "s:1", "run s:1 echo hi"},
-		{"close $1", "s:1", "close s:1"},
-		{"read $1 --tail 1", "s:1", "read s:1 --tail 1"},
+		{"get $1", "s:1", []string{"s:1"}, "get s:1"},
+		{"run $1 $2", "s:1", []string{"s:1", "echo hi"}, "run s:1 echo hi"},
+		{"close $1", "s:1", []string{"s:1"}, "close s:1"},
+		{"read $1 --tail 1", "s:1", []string{"s:1"}, "read s:1 --tail 1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.cmd, func(t *testing.T) {
-			f, err := ParseWithSubst(tc.cmd, Subst{Pos: []string{tc.target}})
+			f, err := ParseWithSubst(tc.cmd, Subst{Pos: tc.args})
 			if err != nil {
 				t.Fatalf("ParseWithSubst: %v", err)
 			}

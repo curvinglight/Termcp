@@ -575,7 +575,8 @@ func TestStreamableTransportScopesByNamespaceHeader(t *testing.T) {
 	})
 
 	t.Run("a peer cannot drive the other's session", func(t *testing.T) {
-		res := bob.callTerm(t, "input "+aliceSid+":1 echo pwned")
+		// The shell text is a VALUE: `input` takes exactly one variable reference.
+		res := bob.callTermArgs(t, "input "+aliceSid+":1 $1", []any{"echo pwned"})
 		if !res.IsError {
 			t.Fatal("bob wrote to alice's session")
 		}
@@ -752,6 +753,13 @@ func (c *mcpSession) listSessions(t *testing.T) map[string]bool {
 func (c *mcpSession) callTerm(t *testing.T, cmd string) *mcpgo.CallToolResult {
 	t.Helper()
 	return c.callTool(termToolName, map[string]any{"cmd": cmd})
+}
+
+// callTermArgs is callTerm for a payload that has to arrive as a VALUE: `run` and
+// `input` take exactly one variable reference, so the shell line travels in args.
+func (c *mcpSession) callTermArgs(t *testing.T, cmd string, args []any) *mcpgo.CallToolResult {
+	t.Helper()
+	return c.callTool(termToolName, map[string]any{"cmd": cmd, "args": args})
 }
 
 // The learn-api prompt names the address the client dialed, so a client that

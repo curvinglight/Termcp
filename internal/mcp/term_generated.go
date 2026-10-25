@@ -55,6 +55,19 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 	}
 
 	var b strings.Builder
+	// A FINISHED CHANNEL IS NOT THE DEFAULT VIEW (issue #193).
+	//
+	// `open --argv` per command is an ordinary way to work, and each of those leaves a
+	// channel behind that stays addressable for reading — so a session ends up with one
+	// live channel and thirty-eight dead ones, and `ls --shells` becomes a wall the
+	// caller has to read past to find the one it is using. Measured in the report: 42
+	// rows, 38 of them exited pipes.
+	//
+	// Folding is a VIEW, not reclamation: the bytes are still there and the address still
+	// reads. Which is exactly why it has to be SAID — a listing that quietly drops 38
+	// rows reads as "those channels are gone", and a caller that believes that will not
+	// look for output it still has.
+	hidden := 0
 	for _, sess := range sessions {
 		live := s.sessMgr.Get(sess.ID)
 		if live == nil {
@@ -66,6 +79,7 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 				sess.ID, sess.Status, dash(sess.SSHConfig), ageOf(sess.CreatedAt)))
 			continue
 		}
+		shown := 0
 		for _, sh := range shells {
 			if !boolFlag(stmt, "shells") && len(shells) > 1 && sh.Index > 1 {
 				// Without --shells, one line per session: the primary channel names
@@ -73,10 +87,24 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 				// of them by default would make a fleet's ps unreadable.
 				continue
 			}
+			if sh.Status != api.SessionRunning && !boolFlag(stmt, "all") {
+				hidden++
+				continue
+			}
 			b.WriteString(fmt.Sprintf("%s\t%s\t%s\t%s\t%s\n",
 				handleOf(sess.ID, sh.Index), sh.Status, dash(string(sh.Mode)),
 				dash(sh.Name), ageOf(sh.CreatedAt)))
+			shown++
 		}
+		// A SESSION WHOSE CHANNELS ARE ALL HIDDEN MUST NOT VANISH: its own line is what
+		// keeps it addressable from this listing, and the channels are one flag away.
+		if shown == 0 && hidden > 0 {
+			b.WriteString(fmt.Sprintf("%s\t%s\t%s\t%s\n",
+				sess.ID, sess.Status, dash(sess.SSHConfig), ageOf(sess.CreatedAt)))
+		}
+	}
+	if hidden > 0 {
+		b.WriteString(fmt.Sprintf("(%d finished channel(s) not shown; `ls --all` lists them, and their output is still readable)\n", hidden))
 	}
 	body := b.String()
 	// PEERS ARE NODES ON THE SAME LISTING. `ls <session>` is the only place a caller
@@ -117,8 +145,8 @@ func (s *Server) directivePS(ctx context.Context, stmt directive.Statement, win 
 	// A generated reply is capped by the same window as a byte stream: a listing is
 	// exactly as capable of flooding a context as a log is, and the directives with
 	// no stream to continue are the ones with no other protection.
-	body, code, cut := capGeneratedCounted(body, win)
-	noteTruncated(headers, cut, win)
+	body, code, cut, total := capGeneratedCounted(body, win)
+	noteTruncated(headers, code, cut, total, win)
 	return envelope.Slot{Code: code, Headers: headers, Body: body}
 }
 
@@ -156,14 +184,21 @@ func (s *Server) directiveInfo(ctx context.Context, stmt directive.Statement, wi
 		writeKV(&b, "exit_code", fmt.Sprint(*info.ExitCode))
 	}
 	writeKV(&b, "created", ageOf(info.CreatedAt))
+	// WHY IT IS NOT RUNNING, right after the state it explains. A session that is
+	// `exited` with no reason is the shape issue #176 reported: every surface agreed it
+	// was gone and none said why. Deliberate closes record their reason too, so the line
+	// never has to be guessed at.
+	if info.ExitReason != "" {
+		writeKV(&b, "exit_reason", info.ExitReason)
+	}
 	writeKV(&b, "approval", approvalSummaryText(info))
 	for _, sh := range sess.ListChildShells() {
 		writeKV(&b, "shell", fmt.Sprintf("%s %s %s %s",
 			handleOf(info.ID, sh.Index), sh.Status, dash(string(sh.Mode)), dash(sh.Name)))
 	}
-	body, code, cut := capGeneratedCounted(b.String(), win)
+	body, code, cut, total := capGeneratedCounted(b.String(), win)
 	headers := map[string]string{"Path": stmt.Path}
-	noteTruncated(headers, cut, win)
+	noteTruncated(headers, code, cut, total, win)
 	return envelope.Slot{Code: code, Headers: headers, Body: body}
 }
 
@@ -195,11 +230,16 @@ func (s *Server) channelSlot(stmt directive.Statement, win termArgs, cs *session
 	if info.ExitCode != nil {
 		writeKV(&b, "exit_code", fmt.Sprint(*info.ExitCode))
 	}
-	writeKV(&b, "bytes", fmt.Sprint(cs.BufferLen()))
+	// THE SOURCE'S LENGTH, NOT THE BUFFER'S. `bytes` answers "is there anything new
+	// since I last looked", and the buffer is a CACHE of the log (see
+	// transcript.Source.Len): for a few microseconds per chunk it is behind, and
+	// `get <channel>` reported a smaller number than `read` would deliver. One
+	// address cannot describe a stream two ways.
+	writeKV(&b, "bytes", fmt.Sprint(s.streamLen(cs)))
 	writeKV(&b, "created", ageOf(info.CreatedAt))
-	body, code, cut := capGeneratedCounted(b.String(), win)
+	body, code, cut, total := capGeneratedCounted(b.String(), win)
 	headers := map[string]string{"Path": stmt.Path}
-	noteTruncated(headers, cut, win)
+	noteTruncated(headers, code, cut, total, win)
 	return envelope.Slot{Code: code, Headers: headers, Body: body}
 }
 
@@ -661,6 +701,14 @@ func (s *Server) directiveFile(ctx context.Context, stmt directive.Statement, wi
 	} else if slot, bad := stringFlags(args, stmt, [2]string{"mode", "mode"}); bad {
 		return slot
 	}
+	// --encoding IS THE SAME FLAG THE CHANNEL READ USES, and on a file read it names the
+	// interpretation of the file's bytes. It was declared for `read`, accepted on a file
+	// read, and never passed on — so a caller who named an encoding was handed a
+	// rendering of the bytes as if they were UTF-8, with no way to tell (issue #177: a
+	// PowerShell log is UTF-16LE with a BOM by default).
+	if slot, bad := stringFlags(args, stmt, [2]string{"encoding", "charset"}); bad {
+		return slot
+	}
 	if slot, bad := stringFlags(args, stmt,
 		[2]string{"target", "target"},
 		[2]string{"link-path", "link_path"},
@@ -994,7 +1042,7 @@ func (s *Server) directiveExtension(ctx context.Context, stmt directive.Statemen
 		// The boot manifest: one extension per line, with its state and handle, so
 		// a caller that lost its context gets its toolset back in one call. Capped like
 		// the rest: a host with twenty installed extensions is a reply, not a receipt.
-		return generatedSlot(stmt, win, s.extensionListing(res))
+		return generatedSlot(stmt, win, s.extensionListing(res, boolFlag(stmt, "all")))
 	}
 	doc, _ := toolResultMap(res)
 	return generatedSlot(stmt, win, compactDocument(doc))
@@ -1013,7 +1061,7 @@ func extensionCapability(action string) (string, bool) {
 		return capability.ExtUpdate, true
 	case "delete":
 		return capability.ExtDelete, true
-	case "retry":
+	case "retry", "restart":
 		return capability.ExtRetry, true
 	}
 	return "", false
@@ -1085,8 +1133,36 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 			// names the word is a page of it. A hand-kept map would drift the first time
 			// a verb was added, which is the same reason the flag list is derived.
 			if lines := usageLinesNaming(stmt.Args[0]); lines != "" {
+				// A NODE'S VERBS ARE NOT ALWAYS ITS WHOLE STORY. They are derived from the
+				// usage lines, which is right; but a capability spelled as a flag on an
+				// existing verb has no line to be derived from. `ext` has one — an extension
+				// can be rebuilt — and this page listed five verbs, none of which said so,
+				// which is how an agent ended up with no way to refresh one after a deploy.
+				body := stmt.Args[0] + " is a node, not a verb. These act on it:\n" + lines
+				if note, ok := directive.NodeNote(stmt.Args[0]); ok {
+					body += "\n" + note + "\n"
+				}
 				return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path},
-					Body: stmt.Args[0] + " is a node, not a verb. These act on it:\n" + lines}
+					Body: body}
+			}
+			// AN ARGUMENT IS A WORD IN THIS GRAMMAR TOO.
+			//
+			// The guide names `args`, `vars` and `secrets` in its first screen, so the next
+			// thing a caller types is `help secrets` — which answered "unknown directive:
+			// secrets" while the page already existed, in the argument table that the tool
+			// schema and the generated docs are both rendered from. Deriving this page from
+			// that table is the same rule the flag list follows: a hand-kept copy would
+			// drift the first time an argument was added, and the one that matters most is
+			// the one a caller reads BEFORE typing a credential.
+			if decl, ok := termArgDeclFor(stmt.Args[0]); ok {
+				body := decl.Name + " is an argument of the `term` tool, not a directive.\n\n" + decl.Desc + "\n"
+				if decl.DocNote != "" {
+					body += "\n" + decl.DocNote + "\n"
+				}
+				capped, code, cut, total := capGeneratedCounted(body, win)
+				headers := map[string]string{"Path": stmt.Path}
+				noteTruncated(headers, code, cut, total, win)
+				return envelope.Slot{Code: code, Headers: headers, Body: capped}
 			}
 			// 400, NOT 404 — AND THE SAME 400 THE BARE WORD GETS.
 			//
@@ -1107,15 +1183,40 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 		if flags := flagList(op); flags != "" {
 			body += "\n" + flags + "\n"
 		}
-		if op.Detail != "" {
+		// THE PAGE IS OPT-IN. `help read` was 10683 bytes with no smaller question to
+		// ask, so a caller who wanted to know what `--grep` takes paid for the essay —
+		// and the verbs with the longest pages are the ones with the most flags to ask
+		// about. The summary answers "which flag does what" and names the page,
+		// including its size, so spending it is a decision rather than a discovery.
+		if table := flagTable(op); table != "" && !boolFlag(stmt, "all") {
+			// The page is what the template, the flag list and the detail render to —
+			// measured from the body BEFORE the table is appended, or the summary
+			// quotes a price that includes itself.
+			//
+			// BOTH "+ 1"s ARE THE NEWLINES: the page is the template, a newline, the detail
+			// and a final newline, and dropping either one quotes a price one byte off the
+			// bill. The test only catches this when the reply under test is WHOLE — under the
+			// default lines_limit it is cut, and then the quoted size and the delivered
+			// body differ by the cut, which looks like the same off-by-one and is not.
+			pageSize := len(body) + 1 + len(op.Detail) + 1
+			body += "\n" + table
+			if example, ok := directive.SummaryExample(op.Name); ok {
+				body += "\n" + example + "\n"
+			}
+			// The number is the size `--all` will actually return, not the length of
+			// op.Detail: the page is the template, the flag list and the detail, and a
+			// caller deciding whether to spend a window is being quoted a price that has
+			// to match the bill. The test asserts exactly this.
+			body += fmt.Sprintf("\nThe full page is %d bytes: `help %s --all`.\n", pageSize, op.Name)
+		} else if op.Detail != "" {
 			// The detail is a page, so it follows the one-line template instead of
 			// replacing it: the template is what a caller scans, the page is what it
 			// reads once it has decided to produce the thing.
 			body += "\n" + op.Detail + "\n"
 		}
-		capped, code, cut := capGeneratedCounted(body, win)
+		capped, code, cut, total := capGeneratedCounted(body, win)
 		headers := map[string]string{"Path": stmt.Path}
-		noteTruncated(headers, cut, win)
+		noteTruncated(headers, code, cut, total, win)
 		return envelope.Slot{Code: code, Headers: headers, Body: capped}
 	}
 	var b strings.Builder
@@ -1123,9 +1224,9 @@ func (s *Server) directiveHelp(stmt directive.Statement, win termArgs) envelope.
 		b.WriteString(op.Usage)
 		b.WriteByte('\n')
 	}
-	capped, code, cut := capGeneratedCounted(b.String(), win)
+	capped, code, cut, total := capGeneratedCounted(b.String(), win)
 	headers := map[string]string{"Path": stmt.Path}
-	noteTruncated(headers, cut, win)
+	noteTruncated(headers, code, cut, total, win)
 	return envelope.Slot{Code: code, Headers: headers, Body: capped}
 }
 
@@ -1154,6 +1255,13 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 	// submitting a job reads an eaten command as a successful one.
 	b.WriteString("                               into the TERMINAL: whoever owns the input reads it\n")
 	b.WriteString("                               (a program waiting for an answer TAKES your line).\n")
+	// THE INTERFACE IS IMPRECISE, AND THAT IS THE INTERFACE. A caller that wants a
+	// precise state (did it run? is something in the foreground?) is asking the terminal
+	// for something a person at the same screen never had either — they read the screen.
+	// Saying so here costs two lines and prevents the whole class of "the reply does not
+	// tell me" reports about a pty.
+	b.WriteString("                               A terminal is not precise: the bytes in the reply\n")
+	b.WriteString("                               ARE the state — read them as you would a screen.\n")
 	b.WriteString("                               `help run` has what that means for the reply.\n")
 	b.WriteString("  args: [\"make && test\"]\n")
 	b.WriteString("  input/key/read are the same three steps taken separately, for a TUI or a\n")
@@ -1162,8 +1270,14 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 	b.WriteString("cmd = the DSL.  sh = a shell command.\n")
 	b.WriteString("cmd holds directives only. sh never appears in cmd — it enters as a value through\n")
 	b.WriteString("args ($1, $2) or vars ($NAME). cmd supports &&, ||, ;, and &.\n")
+	// A CREDENTIAL HAS TO HAVE SOMEWHERE TO GO THAT IS NOT THE LOG, and the caller has to
+	// know it exists before it types the password into args. One line, where the two
+	// other value channels are named.
+	b.WriteString("A value that must not be written to the server log goes in secrets ($NAME too);\n")
+	b.WriteString("a password belongs there, never typed into cmd or args. The remote shell still\n")
+	b.WriteString("echoes what it runs — that is the channel's transcript.\n")
 	b.WriteString("  run a1f3:1 $1   args: [\"make && test\"]   one sh line, operators live\n")
-	b.WriteString("  run a1f3:1 make && notify done           two cmd directives\n\n")
+	b.WriteString("  run a1f3:1 $1 && notify done             two cmd directives\n\n")
 
 	// THE TREE IS THE GRAMMAR. Every statement is a verb plus the address of the
 	// node it works on, so learning the tree teaches the whole surface: a caller who
@@ -1229,9 +1343,9 @@ func (s *Server) termGuide(ctx context.Context, win termArgs) termReply {
 			b.WriteString("  " + line + "\n")
 		}
 	}
-	body, code, cut := capGeneratedCounted(b.String(), win)
+	body, code, cut, total := capGeneratedCounted(b.String(), win)
 	headers := map[string]string{}
-	noteTruncated(headers, cut, win)
+	noteTruncated(headers, code, cut, total, win)
 	return termReply{win: win, slots: []envelope.Slot{{Code: code, Headers: headers, Body: body}}}
 }
 
@@ -1437,12 +1551,27 @@ func listFromDoc(res *mcpgo.CallToolResult, listKey, field string) string {
 // `<session>:<index>` — the same spelling `ps` prints and every later command
 // pastes — so a caller that copies this row can act on it directly instead of
 // calling `get ext` to translate.
-func (s *Server) extensionListing(res *mcpgo.CallToolResult) string {
+func (s *Server) extensionListing(res *mcpgo.CallToolResult, all bool) string {
 	doc, ok := toolResultMap(res)
 	if !ok {
 		return toolResultText(res)
 	}
 	items, _ := doc["extensions"].([]any)
+	// THE LIST CAPS ITSELF, AND NAMES WHAT IT WITHHELD (issue #185).
+	//
+	// The byte window would cut forty rows mid-line and report it in a header about
+	// bytes: "Truncated: 900 bytes withheld" does not tell a caller whether it is
+	// missing one extension or thirty, and the one it needs may be in the part it did
+	// not see. A count plus a command is something it can act on; "and more" is a wall.
+	//
+	// This is a VIEW, not a limit on what can be reached: `ls ext --all` lists every
+	// one, and an extension that is not shown is still addressable by name.
+	const listed = 10
+	hidden := 0
+	if !all && len(items) > listed {
+		hidden = len(items) - listed
+		items = items[:listed]
+	}
 	var b strings.Builder
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
@@ -1466,6 +1595,9 @@ func (s *Server) extensionListing(res *mcpgo.CallToolResult) string {
 	}
 	if b.Len() == 0 {
 		return "(no extensions installed)\n"
+	}
+	if hidden > 0 {
+		b.WriteString(fmt.Sprintf("(%d more not shown; `ls ext --all` lists every extension)\n", hidden))
 	}
 	return b.String()
 }
@@ -1498,15 +1630,22 @@ func (s *Server) addressOf(sessionID, shellID string) string {
 // generatedSlot renders a generated body through the caller's window: the same
 // three axes that bound a stream bound a listing or a document.
 func generatedSlot(stmt directive.Statement, win termArgs, body string) envelope.Slot {
-	capped, code, cut := capGeneratedCounted(body, win)
+	capped, code, cut, total := capGeneratedCounted(body, win)
 	headers := map[string]string{"Path": stmt.Path}
-	noteTruncated(headers, cut, win)
+	noteTruncated(headers, code, cut, total, win)
 	return envelope.Slot{Code: code, Headers: headers, Body: capped}
 }
 
-// noteTruncated adds the header a cut generated reply carries, and nothing when
-// nothing was cut: a header that is always present is a header nobody reads.
-func noteTruncated(headers map[string]string, cut int, win termArgs) {
+func noteTruncated(headers map[string]string, code, cut, total int, win termArgs) {
+	if code != 200 && total > 0 {
+		// The same Content-Range a streamed read uses, saying only how long the reply
+		// would have been. A generated reply has no cursor, so `bytes */N` is the whole
+		// of what it can say — but that N is what lets a caller price the page instead
+		// of discovering the size by paying it. The documented cheap form
+		// (`bytes_limit: 0`) used to answer with an empty 204 carrying no size at all,
+		// while the same call on a channel answered `bytes */2593`.
+		headers["Content-Range"] = envelope.UnsatisfiedRange(int64(total))
+	}
 	if cut <= 0 {
 		return
 	}
@@ -1515,7 +1654,7 @@ func noteTruncated(headers map[string]string, cut int, win termArgs) {
 }
 
 func capGenerated(body string, win termArgs) (string, int) {
-	capped, code, _ := capGeneratedCounted(body, win)
+	capped, code, _, _ := capGeneratedCounted(body, win)
 	return capped, code
 }
 
@@ -1532,14 +1671,17 @@ func capGenerated(body string, win termArgs) (string, int) {
 // body, and reporting a count there would suggest a partial answer that does not exist.
 // foldOrTruncate already appends its own notice to a truncated body; this number is for
 // the reply's headers, which is where a caller looks before reading the body at all.
-func capGeneratedCounted(body string, win termArgs) (string, int, int) {
+func capGeneratedCounted(body string, win termArgs) (capped string, code, cut, total int) {
+	total = len(body)
 	if win.BytesLimit == 0 {
 		// The schema's zero-byte window: streamed replies hand back a handle and
 		// consume nothing; a generated reply has no stream, so it is simply empty.
-		return "", 204, 0
+		// The total still travels, because "how big is this page" is the one fact a
+		// caller needs before deciding to spend a window on it.
+		return "", 204, 0, total
 	}
-	code := 200
-	cut := 0
+	code = 200
+	cut = 0
 	if win.BytesLimit > 0 && len(body) > win.BytesLimit {
 		before := len(body)
 		body = foldOrTruncate(body, win.BytesLimit, win.OnBytesOverflow)
@@ -1558,7 +1700,7 @@ func capGeneratedCounted(body string, win termArgs) (string, int, int) {
 			}
 		}
 	}
-	return body, code, cut
+	return body, code, cut, total
 }
 
 // setFlagString copies a string flag into a handler argument.
@@ -1773,12 +1915,15 @@ func flagList(op directive.Op) string {
 	if len(op.Flags) == 0 {
 		return ""
 	}
+	// The names, not the declarations: the domain annotation is how the table records
+	// what a flag accepts, and `--cursor:number` is not a flag a caller can pass.
+	names := op.FlagNames()
 	valueless := make(map[string]bool, len(op.Valueless))
 	for _, v := range op.Valueless {
 		valueless[v] = true
 	}
-	w := make([]string, 0, len(op.Flags))
-	for _, f := range op.Flags {
+	w := make([]string, 0, len(names))
+	for _, f := range names {
 		if valueless[f] {
 			w = append(w, "--"+f)
 			continue
@@ -1787,6 +1932,51 @@ func flagList(op directive.Op) string {
 	}
 	sort.Strings(w)
 	return "Flags: " + strings.Join(w, "  ")
+}
+
+// flagTable renders one line per declared flag: what it takes, and what happens if
+// you get it wrong.
+//
+// It walks op.Flags rather than the summary map, for the reason flagList is derived
+// too: a hand-kept list drifts the moment a flag is added, and the drift is silent —
+// the flag simply stops being mentioned. Walking the declaration makes the table
+// complete by construction.
+//
+// A verb with no summaries renders nothing, which is how it keeps its full page: the
+// surface migrates one verb at a time, and a verb that has not migrated behaves
+// exactly as it did before this existed.
+func flagTable(op directive.Op) string {
+	if !directive.HasSummaries(op.Name) {
+		return ""
+	}
+	valueless := make(map[string]bool, len(op.Valueless))
+	for _, v := range op.Valueless {
+		valueless[v] = true
+	}
+	spellingOf := func(f string) string {
+		if valueless[f] {
+			return "--" + f
+		}
+		return "--" + f + " <value>"
+	}
+	// The names, not the declarations: the summary map is keyed by the name, so the raw
+	// entries would render a column of `--cursor:number` with nothing beside it.
+	names := op.FlagNames()
+	// The column is measured, not guessed: a fixed width misaligns the moment a flag
+	// spelling outgrows it, which is how `--from-line <value>` pushed its line out.
+	width := 0
+	for _, f := range names {
+		if n := len(spellingOf(f)); n > width {
+			width = n
+		}
+	}
+	w := make([]string, 0, len(names))
+	for _, f := range names {
+		line, _ := directive.FlagSummary(op.Name, f)
+		w = append(w, fmt.Sprintf("  %-*s  %s", width, spellingOf(f), line))
+	}
+	sort.Strings(w)
+	return strings.Join(w, "\n") + "\n"
 }
 
 // peerLines renders the open peers of the sessions in a listing.
@@ -1831,4 +2021,24 @@ func peerLines(sessions []api.Session) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// streamLen is one channel's stream length, asked of the record rather than of the
+// cache in front of it.
+//
+// It falls back to the buffer when there is no log to ask (a session with persistence
+// off), which is the same answer the cache gives and the only one available there.
+func (s *Server) streamLen(cs *session.ChildShell) int64 {
+	n := cs.BufferLen()
+	if s.msgMgr == nil {
+		return n
+	}
+	sessID := cs.ParentSessionID()
+	if sessID == "" {
+		return n
+	}
+	if m, err := s.msgMgr.OutputSize(sessID, cs.ID); err == nil && m > n {
+		return m
+	}
+	return n
 }

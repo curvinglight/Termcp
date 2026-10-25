@@ -100,3 +100,17 @@ func TestManager_CreateFailureLogged(t *testing.T) {
 		t.Fatalf("error must not leak credentials, got %q", err)
 	}
 }
+
+// findQuietly is find without the failure: a poll loop asks repeatedly, and only the
+// loop's own deadline is a failure.
+func (c *createLogCapture) findQuietly(level slog.Level, msg string) *slog.Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.records {
+		r := c.records[i]
+		if r.Level >= level && r.Message == msg {
+			return &r
+		}
+	}
+	return nil
+}

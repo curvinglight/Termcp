@@ -26,29 +26,32 @@ package mcp
 // directions: the hard boundaries must stay, and the directive table must not
 // migrate back into the text.
 
-const mcpServerInstructions = `termcp — a shell-like DSL controlling hosts over SSH. Local ("internal", if enabled)
-and remote are identical.
+const mcpServerInstructions = `termcp — a shell-like DSL over SSH; local ("internal") = remote.
 
-cmd = the DSL. sh = a shell command. cmd holds directives only; sh enters as a VALUE
+cmd = the DSL; sh = a shell command. cmd holds directives only; sh enters as a VALUE
 through args ($1, $2) or vars ($NAME), never as syntax. cmd supports && || ; &
   run a1f3:1 $1   args: ["make && test"]   one sh line
-  run a1f3:1 make && notify done           two cmd directives
+  run a1f3:1 $1 && notify done             two cmd directives
 
-The tree: host -> session -> {<index> = channel, file, forward, peer}. connect <host>
-makes a session, open <session> adds a child, every other verb works on one node.
-ls prints every node with its address; copy one, never spell it.
+ONE WORD, ONE LANGUAGE: no shell concatenation. /tmp/$1 and a$1 are REFUSED, not
+guessed — pass the whole thing as the value:
+  write a1f3 file /tmp/$1   REFUSED       write a1f3 file $1   args: ["/tmp/x"]
+
+The tree: host -> session -> {<index> = channel, file, forward, peer}. connect <host>,
+open <session> [child]; every other verb works on one node. ls prints every address —
+copy one, never spell it.
 
 TWO CENTRES
   ls ext  CAPABILITY: resident, capability-trimmed extensions (mcp servers, skills,
           prompts). Their notes are the manual. LOOK FIRST.
-  ls      STATE. learn_mode:true expands every verb it printed an address for.
+  ls      STATE. learn_mode:true expands every address it printed.
 
 ACTIONS
   connect <host>  open <session> [--argv cmd]  run <ch> <line>
   input (no Enter)  key (ctrl+c/esc)  read (new bytes)  write/get <ch> file <path>
   open <session> mcp|cdp|jrpc <url> reaches the peer through that session's network
 
-help lists all 19 verbs; learn_mode:true attaches any reply's usage line.
+help lists every verb.
 
 HARD BOUNDARY
   notify FIRST (--level warn|error --sticky --on <session>)
@@ -56,7 +59,7 @@ HARD BOUNDARY
   Never guess, paste, echo or store a secret; never bypass sudo/auth/approval (sudo -n,
   NOPASSWD, setuid, sudoers, reword, encode, retry loops).
   Human at a prompt: notify, then WAIT. A long command's reply carries what arrived;
-  read a slow task in pieces rather than polling.
+  read a slow task in pieces, don't poll.
 
 REVIEW — review_pending=true means HELD: nothing ran, no id to poll. Do NOT resubmit or
 retry; notify, then wait.

@@ -143,15 +143,23 @@ func (r Restriction) AllowsPath(p string) bool {
 // the contract an extension's author and an agent both read, and a refactor that
 // silently reworded a refusal would make two otherwise identical deployments
 // disagree in their logs.
+// The wording names BOTH surfaces' spelling, because a refusal is read on whichever
+// one produced it. It used to name only `extension(action=get)`, which is the MCP
+// tool: a caller driving the DSL read that advice, ran it, and got "unknown
+// directive" — a second error from following the first one's instructions (issue
+// #172). The DSL's spelling comes first because the DSL is the surface this project
+// points a caller at, and the tool name is what an MCP client has instead.
 func ForbiddenTool(toolName string) string {
-	return "tool " + toolName + " is not permitted on this session: it is an extension session whose capability list does not include it. Use extension(action=get) to see what this session was created to allow."
+	return "tool " + toolName + " is not permitted on this session: it is an extension session whose capability list does not include it. " +
+		"Use `get ext <name>` (`extension` with `action=get` on the MCP tool surface) to see what this session was created to allow."
 }
 
 // ForbiddenPath renders the refusal for a path argument outside the whitelist.
 // arg is the argument that carried the path, so the caller learns which of a
 // file tool's several paths was the offending one.
 func ForbiddenPath(arg, path string) string {
-	return "path argument " + arg + " is outside the directories this extension session may reach: " + path + ". Use extension(action=get) to see the allowed paths."
+	return "path argument " + arg + " is outside the directories this extension session may reach: " + path +
+		". Use `get ext <name>` (`extension` with `action=get` on the MCP tool surface) to see the allowed paths."
 }
 
 // ruleKind selects the matcher a pathPattern compiled into.

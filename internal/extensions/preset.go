@@ -11,18 +11,26 @@ import (
 // an extension remains one shape — a trimmed session — so a kind only supplies
 // the conventional values for that shape rather than behavior of its own.
 //
-// An unknown kind yields an empty custom template, so a caller that passes an
-// unvalidated string gets something valid rather than a half-filled extension.
+// AN MCP PRESET HAS NO COMMAND, ON PURPOSE. It used to carry `npx -y
+// example-mcp-server`, and that default was wrong in both directions. A create
+// that named its own program kept the args (`--command cat` ran `cat -y
+// example-mcp-server` and died on an option it never asked for), and a create
+// that named nothing produced an extension that looked configured and could
+// never work. An MCP server IS a program plus its argv — there is nothing
+// conventional to guess, because `npx -y <package>` is one way to start one and
+// `python server.py` is another.
+//
+// So the caller fills it in, and leaving it out fails at create time with
+// "mode=pipe requires a command", which is a better answer than a template that
+// validates and cannot run.
 func Preset(kind string) Extension {
 	switch strings.TrimSpace(kind) {
 	case KindMCP:
 		return Extension{
-			Kind:    KindMCP,
-			Mode:    "pipe",
-			Allow:   append([]string(nil), mcpAllow...),
-			Notes:   mcpNotes,
-			Command: "npx",
-			Args:    []string{"-y", "example-mcp-server"},
+			Kind:  KindMCP,
+			Mode:  "pipe",
+			Allow: append([]string(nil), mcpAllow...),
+			Notes: mcpNotes,
 		}
 	case KindSkill:
 		return Extension{
@@ -37,6 +45,8 @@ func Preset(kind string) Extension {
 			Mode: "pty",
 		}
 	default:
+		// An unknown kind yields an empty custom template, so a caller that passes an
+		// unvalidated string gets something valid rather than a half-filled extension.
 		return Extension{Kind: KindCustom}
 	}
 }

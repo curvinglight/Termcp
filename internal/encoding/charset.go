@@ -11,6 +11,7 @@ import (
 	"golang.org/x/text/encoding/korean"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/encoding/unicode"
 )
 
 // The charsets a session's output can be in.
@@ -47,6 +48,23 @@ var charsets = map[string]encoding.Encoding{
 	"cp1252":       charmap.Windows1252,
 	"latin-1":      charmap.ISO8859_1,
 	"iso-8859-1":   charmap.ISO8859_1,
+
+	// UTF-16 IS WHAT WINDOWS WRITES BY DEFAULT, which is why it is here and not in a
+	// footnote (issue #177): PowerShell 5.1's `>` and `Out-File` with no -Encoding write
+	// UTF-16LE with a BOM, so "redirect a long command to a file and poll it" — the
+	// pattern this tool recommends for work that outlives a session — produced a file
+	// this build could not read. The reply said `mode: text` and handed back `\xff\xfe`
+	// soup: true, and useless.
+	//
+	// `utf-16` (no suffix) is the BOM-sniffing form and the one to prefer: the caller
+	// usually does not know how the file was written, and the BOM does. It defaults to
+	// little-endian without one, which is what a Windows tool writes.
+	"utf-16":   unicode.UTF16(unicode.LittleEndian, unicode.UseBOM),
+	"utf16":    unicode.UTF16(unicode.LittleEndian, unicode.UseBOM),
+	"utf-16le": unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM),
+	"utf16le":  unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM),
+	"utf-16be": unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM),
+	"utf16be":  unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM),
 }
 
 // KnownCharset reports whether name is a charset this build can decode, and what it
@@ -103,6 +121,19 @@ func Decode(name string, data []byte) ([]byte, error) {
 // text in a charset this build knows, and the caller is told nothing rather than
 // told a guess.
 func Sniff(data []byte) string {
+	// A UTF-16 BYTE ORDER MARK IS PROOF, NOT A GUESS, so it is answered before the
+	// round-trip loop below. UTF-16 decoding is permissive — almost any even-length byte
+	// string "decodes" — so a round trip proves nothing there, while the two bytes the
+	// writer itself chose are unambiguous. This is the case issue #177 is about: the
+	// caller cannot see how the file was written, and the file says.
+	if len(data) >= 2 {
+		switch {
+		case data[0] == 0xFF && data[1] == 0xFE:
+			return "utf-16le"
+		case data[0] == 0xFE && data[1] == 0xFF:
+			return "utf-16be"
+		}
+	}
 	for _, name := range []string{"gbk", "gb18030", "big5", "shift_jis", "euc-kr"} {
 		enc := charsets[name]
 		if enc == nil {
@@ -131,7 +162,7 @@ func (e *UnknownCharsetError) Error() string {
 	if e.Detail != "" {
 		return e.Detail
 	}
-	return "unknown charset " + e.Name + "; use utf-8, gbk (cp936), gb18030, big5, shift_jis or euc-kr"
+	return "unknown charset " + e.Name + "; use utf-8, gbk (cp936), gb18030, big5, shift_jis, euc-kr or utf-16 (utf-16le / utf-16be)"
 }
 
 func normaliseCharset(name string) string {

@@ -103,8 +103,13 @@ func normalizeReadRange(totalSize, offset, length, limit int64) (int64, int64) {
 	return offset, length
 }
 
-// ReadFile reads a file (or segment) from the remote.
-func (s *Client) ReadFile(remotePath string, offset, length int64, mode string, localPath string) (*FileResult, error) {
+// ReadFile reads a segment of a remote file and renders it for a reply.
+//
+// charset is the caller's --encoding: the bytes are decoded from it to UTF-8 BEFORE
+// the text rendering, because rendering first is what turned a PowerShell log into
+// `\xff\xfeP\x00S\x00...` — true, and unreadable (issue #177). Empty means UTF-8,
+// which is what this file read assumed everywhere until the flag existed.
+func (s *Client) ReadFile(remotePath string, offset, length int64, mode string, localPath, charset string) (*FileResult, error) {
 	f, err := s.client.Open(remotePath)
 	if err != nil {
 		return nil, fmt.Errorf("open remote file: %w", err)
@@ -185,6 +190,17 @@ func (s *Client) ReadFile(remotePath string, offset, length int64, mode string, 
 		result.Data = &body
 	default:
 		return nil, fmt.Errorf("unknown mode %q (use text, hex, or file)", mode)
+	}
+
+	// THE CHARSET DECODES; IT DOES NOT FILTER. `hex` is the byte-exact door and stays
+	// untouched by --encoding, because a caller asking for hex asked for the bytes.
+	if charset != "" && mode != "hex" {
+		decoded, err := encoding.Decode(charset, segment)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", remotePath, err)
+		}
+		body := encoding.EncodeText(decoded)
+		result.Data = &body
 	}
 
 	return result, nil

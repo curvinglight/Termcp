@@ -53,3 +53,31 @@ func jsonValid(s string) bool {
 	var v any
 	return json.Unmarshal([]byte(s), &v) == nil
 }
+
+// The seam between two pages of one frame is a byte count this codebase picks, so
+// it has to land on a boundary. These are the shapes that decide where.
+func TestTrailingEscapeStart(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{"a whole escape", `a\u4e2d`, -1},
+		{"three hex digits", `a\u4e2`, 1},
+		{"one hex digit", `a\u4`, 1},
+		{"the u alone", `a\u`, 1},
+		{"a lone backslash", `a\`, 1},
+		{"nothing cut", `plain ascii`, -1},
+		{"no backslash at all", `{"id":5}`, -1},
+		{"an escaped backslash is content", `a\\u4e2`, -1},
+		{"a cut inside an escaped run", `a\\\u4`, 3},
+		{"a complete escape after a cut one", `\u4e2d\u4e`, 6},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := TrailingEscapeStart(tc.in); got != tc.want {
+				t.Errorf("TrailingEscapeStart(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

@@ -23,7 +23,9 @@ func TestFileErrClassifiesFailures(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res := fileErr(tc.err)
+			// A path is passed because the caller's own path is what the wire-spelling
+			// hint is derived from; this test is about the CODE, so a neutral one.
+			res := fileErr(tc.err, "/tmp/x")
 			if !res.IsError {
 				t.Fatal("fileErr must return an error result")
 			}

@@ -3,6 +3,7 @@ package mcp
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/session"
 )
@@ -42,6 +43,31 @@ func TestTheReplySaysWhenAPersonTypedHere(t *testing.T) {
 	}
 	if err := cs.SendTerminalBytesFrom([]byte("echo typed-by-a-person"), true, session.InputFromAPI); err != nil {
 		t.Fatalf("the person's keystrokes were refused: %v", err)
+	}
+
+	// WAIT FOR THE BYTES TO BE IN THE LOG, NOT FOR A DURATION.
+	//
+	// The person's line reaches the channel's log asynchronously, and a read that runs
+	// too early sees a window that ENDS BEFORE it: the probe for this flake showed
+	// `Content-Range: bytes 0-176/177` while the input span sat at 177, so the reply had
+	// nothing to report and was right not to. The test read that as a product failure —
+	// it failed once in a full shuffled run and never in twelve repeats, which is what a
+	// race looks like.
+	//
+	// The wait is a POSITIONAL read: `--cursor 0` names its window, so it consumes
+	// nothing, and repeating it cannot skip past the bytes under test the way a second
+	// plain read would.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		seen := termText(t, s, map[string]any{"cmd": "read " + h + " --cursor 0", "timeout": 2})
+		if strings.Contains(seen, "typed-by-a-person") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the person's line never reached the channel's log, so the header below "+
+				"cannot be about it:\n%s", seen)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	got := termText(t, s, map[string]any{"cmd": "read " + h, "timeout": 3})

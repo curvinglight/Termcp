@@ -97,7 +97,16 @@ type termArgs struct {
 	// ordinary CDP evaluate) cannot tell "the caller asked for 2 seconds" from "nobody
 	// asked". It read the second as the first, so the 15s default was dead code and every
 	// peer call through the term door was bounded by 2 seconds instead.
-	TimeoutSet      bool
+	TimeoutSet bool
+	// BytesLimitSet says the caller NAMED a byte limit, for the same reason TimeoutSet
+	// exists: `bytes_limit` has a default, so the number in this struct is never zero
+	// and "the caller asked for 200 bytes" is indistinguishable from "nobody asked".
+	//
+	// A pipeline is where that difference decides behaviour: `read ... | write ...`
+	// copies the WHOLE span by default, and only truncates to `bytes_limit` when the
+	// caller actually named one. Reading the default as a request would silently cut
+	// every copy to 200 bytes and report success.
+	BytesLimitSet   bool
 	BytesLimit      int
 	LinesLimit      int
 	TotalBytesLimit int
@@ -126,6 +135,23 @@ type termArgs struct {
 	// lookup would give. A caller that read `env` as "set FOO=bar for the child"
 	// would be wrong in all three places.
 	Vars map[string]string
+
+	// Secrets holds named values that expand exactly like Vars and are NOT written to
+	// the server log.
+	//
+	// IT IS A RECORDING DECISION, NOT A SUBSTITUTION ONE. The two tables are merged
+	// before cmd is parsed, so `$NAME` resolves the same whichever one named it, and a
+	// name in both is refused. What differs is the log: Vars is written verbatim — it is
+	// what makes the log a faithful record of the call — and Secrets contributes only
+	// its NAMES. That is the whole mechanism, and it is deliberately not pattern
+	// matching: a redactor that knows `-p` and misses `--password` reports a safety it
+	// does not have, and it would silently rewrite legitimate text on the way in. The
+	// caller says what must not be written down, by where it puts the value.
+	//
+	// It protects the SERVER's record, and nothing else. A secret expanded into a
+	// command line is still echoed back by the remote shell, and that echo belongs to
+	// the channel's own transcript: the terminal cannot be asked to hide what it printed.
+	Secrets map[string]string
 
 	// Args holds positional values substituted into cmd as $1, $2, … (1-based).
 	//
@@ -523,7 +549,7 @@ func (s *Server) parseErrorSlot(err error) envelope.Slot {
 		// NO `&&` SUGGESTION. That advice is now wrong twice over: `&&` separates
 		// DIRECTIVES, so `run h:1 pwd && whoami` reads `whoami` as a directive name
 		// and fails the same way. A shell line goes through args, full stop.
-		body += fmt.Sprintf("\nHINT: %q follows a `%s`, whose payload is ONE shell line. `;` and `&&` in\n"+
+		body += fmt.Sprintf("\nHINT: %q follows a `%s`, whose payload is ONE VARIABLE REFERENCE. `;` and `&&` in\n"+
 			"cmd are termcp syntax — `;` separates statements and `&&` gates the next one — so a\n"+
 			"shell command line with its own operators belongs in args:\n"+
 			"  cmd: \"%s <channel> $1\"   args: [\"pwd; whoami\"]   or   args: [\"make && echo ok\"]",
@@ -750,7 +776,12 @@ func (s *Server) callTool(ctx context.Context, tool string, args map[string]any)
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = tool
 	req.Params.Arguments = args
-	res, err := withLogging(tool, h, s)(ctx, req)
+	// THE PAYLOAD OF AN INNER CALL IS NOT LOGGED. It is a copy of the line the outer
+	// `term` call already recorded in full, and one of those copies can hold a value the
+	// caller declared secret — which is exactly how the secret got into the log the first
+	// time: the outer call logged `secrets=PW (values not logged)` and the shell_input it
+	// made wrote the expanded line under `text`.
+	res, err := withLogging(tool, h, s)(withInnerCall(ctx), req)
 	if err != nil {
 		return nil, &toolFailure{code: CodeOperationFailed, msg: err.Error()}
 	}

@@ -24,8 +24,8 @@ func TestWriteToFinishedPipeSaysWhatHappened(t *testing.T) {
 	// first and the program happily read it.
 	waitForShellToExit(t, s, shellIDFromHandle(t, s, h))
 
-	for _, cmd := range []string{"run " + h + " extra", "input " + h + " extra"} {
-		got := termText(t, s, map[string]any{"cmd": cmd, "timeout": 2})
+	for _, cmd := range []string{"run " + h + " $1", "input " + h + " $1"} {
+		got := termText(t, s, map[string]any{"cmd": cmd, "args": []any{"extra"}, "timeout": 2})
 		// 409, NOT 5xx: the channel's process is over, which is a state of the thing
 		// being addressed, not a fault of the server. A 5xx sent a caller to retry a
 		// write that can never land (issue #144).
@@ -54,8 +54,8 @@ func TestDeadPtyIsNotToldToReadItsExitCode(t *testing.T) {
 	h := openPty(t, s)
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
-	termText(t, s, map[string]any{"cmd": "run " + h + " exit", "timeout": 2})
-	got := termText(t, s, map[string]any{"cmd": "run " + h + " echo after", "timeout": 2})
+	termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"exit"}, "timeout": 2})
+	got := termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo after"}, "timeout": 2})
 	if strings.HasPrefix(got, "TERM/1 2") {
 		t.Skip("this shell survived `exit`; nothing to assert")
 	}
@@ -80,7 +80,7 @@ func TestFinishedPipeRefusesTheWriteNotTheRead(t *testing.T) {
 	waitForShellToExit(t, s, shellIDFromHandle(t, s, h))
 
 	// The write is refused with a readable reason...
-	got := termText(t, s, map[string]any{"cmd": "run " + h + " x", "timeout": 2})
+	got := termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"x"}, "timeout": 2})
 	if !strings.Contains(got, "process has exited") || strings.Contains(got, "EOF") {
 		t.Errorf("expected a named refusal rather than a bare EOF:\n%s", got)
 	}

@@ -776,9 +776,13 @@ func (s *Server) frameReply(ctx context.Context, stmt directive.Statement, h *jr
 	const inlineLimit = 4096
 	if body := encoding.UnescapeJSON(reply); len(body) > inlineLimit {
 		if rec, ok := h.ch.LastAnswer(); ok {
+			// Bytes and Decoded-Bytes mean the same thing here as they do in `read --at`:
+			// the frame in the log, and the same frame as text. A receipt that measured
+			// the text and a pager that measured the log was one header with two meanings.
 			return envelope.Slot{Code: 200, Headers: map[string]string{
-				"Path": stmt.Path, "Frame": fmt.Sprint(rec.N), "Bytes": fmt.Sprint(len(body)),
-			}, Body: receiptBody(rec.N, body, stmt, h)}
+				"Path": stmt.Path, "Frame": fmt.Sprint(rec.N),
+				"Bytes": fmt.Sprint(len(rec.Data)), "Decoded-Bytes": fmt.Sprint(len(body)),
+			}, Body: receiptBody(rec.N, body, len(rec.Data), stmt, h)}
 		}
 	}
 	// A PEER THAT ANSWERED WITH AN ERROR DID NOT SUCCEED. A 200 whose body happens to
@@ -928,7 +932,7 @@ func frameBelongsTo(data, sessionID string) bool {
 // line or two and making the caller page just to find out what they are holding is a
 // round trip for nothing. The head is cut from the same bytes the pager serves, so it
 // is exactly the start of what `--offset 0` returns.
-func receiptBody(n int64, body string, stmt directive.Statement, h *jrpcHandle) string {
+func receiptBody(n int64, body string, logBytes int, stmt directive.Statement, h *jrpcHandle) string {
 	const preview = 512
 	head := body
 	if len(head) > preview {
@@ -941,10 +945,20 @@ func receiptBody(n int64, body string, stmt directive.Statement, h *jrpcHandle) 
 	}
 	addr := stmt.Target + " " + h.kind + ":" + h.index
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("frame %d is %s, too big to inline.\n", n, humanBytes(int64(len(body)))))
+	// TWO SIZES, AND THE SENTENCE NAMES THE ONE IT MEANS. `body` is the text the caller
+	// would have been handed; logBytes is the same frame as the log stores it, which is
+	// the coordinate system --offset counts in. They differ only where the peer escaped
+	// non-ASCII, and saying so is what makes the two numbers in the headers add up.
+	b.WriteString(fmt.Sprintf("frame %d is %s of text, too big to inline.\n", n, humanBytes(int64(len(body)))))
+	if logBytes != len(body) {
+		b.WriteString("It is " + humanBytes(int64(logBytes)) + " in the log, and --offset counts those bytes.\n")
+	}
 	b.WriteString("The frame is in the log; page it a slice at a time:\n\n")
 	b.WriteString("  read " + addr + " --at " + fmt.Sprint(n) + " --offset 0\n")
 	b.WriteString("  read " + addr + " --at " + fmt.Sprint(n) + " --offset " + fmt.Sprint(preview) + "\n\n")
+	b.WriteString("Pages are rendered as text: JSON string escapes are decoded, so a title the peer\n")
+	b.WriteString("sent as \\u817e\\u8baf\\u4e91 reads as 腾讯云. Add --raw for the bytes as they\n")
+	b.WriteString("arrived, which is what to compare when a reply looks wrong.\n\n")
 	b.WriteString("\nfirst " + fmt.Sprint(len(head)) + " bytes:\n" + head)
 	return b.String()
 }
@@ -980,11 +994,58 @@ func (s *Server) pageFrame(stmt directive.Statement, h *jrpcHandle, n int64, off
 		end--
 		slice = string(body[offset:end])
 	}
+	// A WINDOW MUST NOT END INSIDE A \uXXXX ESCAPE EITHER. Next-Offset is a byte
+	// count this code chooses, and a count that lands between the \u and its hex
+	// digits hands the next page the leftovers: the seam reads "17e讯云" instead of
+	// "腾讯云". Same reasoning as the UTF-8 boundary above — the page seam is this
+	// function's decision, so it is this function's job to land it on a boundary.
+	//
+	// i > 0 AND NOT i >= 0, because an escape starting at the window's FIRST byte
+	// cannot be backed off: the page would come back empty with Next-Offset equal to
+	// the offset just asked for, and a caller walking Next-Offset would loop forever
+	// making no progress. The caller chose that offset; a short page that advances is
+	// better than a page that does not.
+	if i := encoding.TrailingEscapeStart(slice); i > 0 {
+		end -= len(slice) - i
+		slice = slice[:i]
+	}
+	// A PAGE GETS THE SAME TREATMENT AS AN INLINE REPLY. frameReply already runs
+	// every frame through encoding.UnescapeJSON before answering with it — the peer
+	// escapes non-ASCII (Chrome sends a Chinese title as \u817e\u8baf\u4e91) and a
+	// reader wants the characters. Paging used to skip that step, which made a big
+	// answer strictly worse than a small one: over the inline limit the only way to
+	// read a frame is --at, and --at was the one door that served the escapes.
+	//
+	// --raw KEEPS THE BYTES AS THEY ARRIVED. It used to be accepted on this path and
+	// then never read, which is worse than refusing it: a caller asked for the peer's
+	// own bytes, was handed a re-encoding, and had no way to tell.
+	//
+	// THE OFFSETS STAY BYTE OFFSETS OF THE STORED FRAME, not of the rendering, so
+	// Next-Offset keeps working page after page.
+	raw := boolFlag(stmt, "raw")
+	if !raw {
+		slice = encoding.UnescapeJSON(slice)
+	}
+	// BOTH SIZES, BOTH ABOUT THE WHOLE FRAME. Bytes is the frame as the log stores it,
+	// which is what Offset and Next-Offset count; Decoded-Bytes is the same frame as
+	// text, which is what a caller is reading. Equal where the peer escaped nothing.
 	headers := map[string]string{
-		"Path":   stmt.Path,
-		"Frame":  fmt.Sprint(n),
-		"Bytes":  fmt.Sprint(len(body)),
-		"Offset": fmt.Sprintf("%d-%d", offset, end),
+		"Path":          stmt.Path,
+		"Frame":         fmt.Sprint(n),
+		"Bytes":         fmt.Sprint(len(body)),
+		"Decoded-Bytes": fmt.Sprint(len(encoding.UnescapeJSON(rec.Data))),
+		"Offset":        fmt.Sprintf("%d-%d", offset, end),
+	}
+	// SAY WHICH ONE THE CALLER IS LOOKING AT. The two renderings differ only for
+	// non-ASCII text, so a reader that did not ask has no way to notice the bytes were
+	// unescaped — and a reader that DID ask needs to know it got them. Served is not
+	// named "Decoded" because the sizes above are named after decoding too, and one
+	// header meaning "this page's rendering" while another means "the frame's text
+	// length" is the kind of near-collision that costs a reader a second look.
+	if raw {
+		headers["Served"] = "raw"
+	} else {
+		headers["Served"] = "decoded"
 	}
 	if end < len(body) {
 		headers["Next-Offset"] = fmt.Sprint(end)

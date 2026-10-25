@@ -104,18 +104,55 @@ func TestNoColumnOutgrowsTheViewport(t *testing.T) {
     for (var i = 0; i < 80; i++) rows.push({ name: 'ext-' + i, enabled: false, status: 'disabled', kind: 'mcp', target: 'internal' });
     if (typeof renderExtensionGrid === 'function') renderExtensionGrid(rows);
 
-    var seen = [];
-    var n = 0;
-    var tick = setInterval(function () {
-      // Re-render every tick: a socket frame does the same thing, and a layout that
-      // only settles when nothing touches it is not settled.
-      if (typeof renderExtensionGrid === 'function') renderExtensionGrid(rows);
-      seen.push(sample());
-      if (++n >= 24) {
-        clearInterval(tick);
-        document.title = 'RESULT::' + JSON.stringify(seen);
-      }
-    }, 40);
+    // WAIT FOR THE ENVIRONMENT TO SETTLE BEFORE THE RECORDED WINDOW STARTS.
+    //
+    // The assertion below is that the heights are CONSTANT across the samples, which is
+    // the right question — a layout that only holds still when nothing touches it is not
+    // held still. But it used to start recording 1200ms after load, and on a loaded CI
+    // runner the first sample could still land before the page had settled: the Windows
+    // leg failed with "the frame height changed between samples (772 at 0, 716 at the
+    // last one)", where the outlier was sample 0 and the same commit passed on a re-run
+    // and locally. That is the environment arriving late, not a layout oscillating.
+    //
+    // So the recording waits for four consecutive samples to agree, after the fonts are
+    // in. IT IS NOT A WEAKER TEST: the gate has a deadline, and on timeout it records
+    // anyway — a layout that never settles fails the assertion below with its numbers,
+    // which is exactly the case this test exists for.
+    function heightsAgree(a, b) {
+      return a.frameH === b.frameH && a.plateH === b.plateH && a.panelH === b.panelH;
+    }
+    function record() {
+      var seen = [];
+      var n = 0;
+      var tick = setInterval(function () {
+        // Re-render every tick: a socket frame does the same thing, and a layout that
+        // only settles when nothing touches it is not settled.
+        if (typeof renderExtensionGrid === 'function') renderExtensionGrid(rows);
+        seen.push(sample());
+        if (++n >= 24) {
+          clearInterval(tick);
+          document.title = 'RESULT::' + JSON.stringify(seen);
+        }
+      }, 40);
+    }
+    function startWhenSettled() {
+      var warm = [];
+      var deadline = Date.now() + 4000;
+      var t = setInterval(function () {
+        if (typeof renderExtensionGrid === 'function') renderExtensionGrid(rows);
+        warm.push(sample());
+        var n = warm.length;
+        if ((n >= 4 && heightsAgree(warm[n - 1], warm[n - 4])) || Date.now() > deadline) {
+          clearInterval(t);
+          record();
+        }
+      }, 40);
+    }
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(startWhenSettled);
+    } else {
+      startWhenSettled();
+    }
   }, 1200);
 })();
 `

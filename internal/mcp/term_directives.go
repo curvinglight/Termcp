@@ -301,6 +301,17 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 
 	// --- read: a channel's new bytes, a file's content, or a peer's frames ---
 	case "read":
+		// A PIPELINE IS ONE STATEMENT WITH TWO ENDS, and it is answered by the copy
+		// before any of the single-ended read paths below can claim it.
+		if stmt.Pipe != nil {
+			return s.pipeCopy(ctx, stmt, win)
+		}
+		// The right half of a pipeline is only reachable through its left half, so
+		// reaching it here means something routed it alone. Refuse rather than run a
+		// write against a target nobody named.
+		if stmt.Piped {
+			return []envelope.Slot{badRequest(stmt, "this is the right half of a `|`; it runs as part of the pipeline")}
+		}
 		if stmt.Kind == "file" {
 			return []envelope.Slot{s.directiveFile(ctx, withFlags(stmt, map[string]string{
 				"action":      "read",
@@ -473,6 +484,22 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 			if act == "edit" {
 				act = "update"
 			}
+			// --restart REBUILDS THE SESSION, and it is the one thing on this node that is
+			// not a configuration change. An edit already rebuilds when it changes the
+			// session template — the reconciler compares a fingerprint — but not when the
+			// template reads the same and only the FILE it names has changed, which is
+			// exactly a git pull. Then the process is still running the old script, and the
+			// DSL is the only entrance an agent gets, so without this it had no way to say
+			// "rebuild it": the reconciler's action was reachable from the MCP tool and the
+			// admin API, but not from the language the agent actually speaks.
+			if boolFlag(stmt, "restart") {
+				if other := firstFlagOtherThan(stmt, "restart"); other != "" {
+					return []envelope.Slot{badRequest(stmt,
+						"--restart rebuilds the session and changes no configuration, so it cannot be combined with --"+
+							other+"; send the edit and the rebuild as two calls")}
+				}
+				act = "retry"
+			}
 			return []envelope.Slot{s.directiveExtension(ctx, withFlags(stmt, map[string]string{
 				"action": act, "name": stmt.Key,
 			}), win)}
@@ -504,6 +531,27 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 // The copy is shallow except for the flag map: a statement is shared between the
 // statements of one cmd, and mutating the caller's map would make `a; b` where a is
 // translated leak its flags into b.
+// firstFlagOtherThan names a flag the caller set besides the one given.
+//
+// It exists so a call that asks for two things can be refused BY NAME. The
+// alternative - doing one of them and reporting success - is the failure mode this
+// codebase has been bitten by more than once: the caller believes it did both, and
+// the half that was dropped is the one it cannot see.
+func firstFlagOtherThan(stmt directive.Statement, except string) string {
+	names := make([]string, 0, len(stmt.Flags))
+	for name := range stmt.Flags {
+		if name != except {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	// Map order is random and the message is read by a person: sort it.
+	sort.Strings(names)
+	return names[0]
+}
+
 func withFlags(stmt directive.Statement, set map[string]string) directive.Statement {
 	flags := make(map[string]*string, len(stmt.Flags)+len(set))
 	for k, v := range stmt.Flags {
@@ -670,6 +718,24 @@ func (s *Server) runOne(ctx context.Context, stmt directive.Statement, win termA
 		return s.slotFromFailure(ctx, stmt, pipeClosedHint(stmt.Target, s.probeShell(stmt.Target), s))
 	}
 
+	// THE WINDOW IS CHECKED BEFORE ANYTHING IS TYPED, because a 400 must not be a lie.
+	//
+	// The window is validated where it is read — inside shell_output — and that read
+	// happens after this function has typed the line and pressed Enter. So a refusal
+	// about the window arrives after the command has already run (issue #179), and a 4xx
+	// reads as "nothing happened": the caller retries, and the command runs twice. On a
+	// mutating command the retry is the damage.
+	//
+	// The rule that made this reachable was the upper bound on `timeout`, which only
+	// the read validator had (issue #168): every other window number is checked at the
+	// entrance, before dispatch, so the tool could not show the lie. Removing that bound
+	// removes the trigger; this check removes the CLASS, because the next rule added to
+	// the read validator would otherwise arrive after the effect again. The same
+	// validator is called with the same numbers, just earlier — one rule, two callers.
+	if f := s.checkWindow(stmt, win); f != nil {
+		return s.slotFromFailure(ctx, stmt, f)
+	}
+
 	if _, fail := s.callTool(ctx, "shell_input", argsOf("shell_id", stmt.Target, "text", stmt.Payload)); fail != nil {
 		return s.slotFromFailure(ctx, stmt, pipeClosedHint(stmt.Target, fail, s))
 	}
@@ -687,7 +753,80 @@ func (s *Server) runOne(ctx context.Context, stmt directive.Statement, win termA
 		}
 	}
 
-	return s.readSlotAfter(ctx, stmt, win, start)
+	// --grep CHANGES WHAT THE WINDOW COUNTS, so it takes the same path `read` does
+	// (matches rather than raw lines) — scoped to this command, which is the region the
+	// caller just created (issue #187).
+	//
+	// IT WAITS FIRST, THE SAME WAY THE PLAIN PATH DOES. A search over bytes that have not
+	// arrived is not a search: it scanned nothing and answered "no line matched … in the 0
+	// lines scanned", which is true and useless — found by driving it, not by a test. The
+	// wait is the same one the read half uses, so the two halves of a `run` cannot
+	// disagree about when the command's output is there.
+	if _, ok := stmt.Flag("grep"); ok {
+		waited := s.awaitRunOutput(ctx, stmt, win, start)
+		slot := s.readGrepFrom(ctx, stmt, win, start, readTimeout(remaining(win, waited)))
+		if slot.Code < 400 {
+			if slot.Headers == nil {
+				slot.Headers = map[string]string{}
+			}
+			// A searched run is still a run: the caller needs the offset its input landed
+			// at as much here as anywhere (issue #194).
+			slot.Headers["Input-At"] = strconv.FormatInt(start, 10)
+		}
+		return slot
+	}
+	slot := s.readSlotAfter(ctx, stmt, win, start)
+	return tailSlot(slot, stmt)
+}
+
+// tailSlot keeps the last N lines of a reply, and says that it did.
+//
+// NOT THE TRANSCRIPT'S OWN TAIL SELECTOR. That one reads from the end of the whole
+// buffer and IGNORES an offset when both are given (window.go switches on TailLines
+// before Offset), so `run --tail 20` would hand back the previous command's last lines
+// as part of this command's output — the exact confusion issue #194 is about. The
+// window is read from this command's input first, and the tail is taken from it.
+//
+// The trim is a FACT, not a silent loss: the reply names how many lines it kept and how
+// many the window held, and Content-Range still describes the stream span the window
+// came from (so `read --cursor` continues from where this reply's bytes ended).
+func tailSlot(slot envelope.Slot, stmt directive.Statement) envelope.Slot {
+	v, ok := stmt.Flag("tail")
+	if !ok || v == "" || slot.Code >= 400 || slot.Body == "" {
+		return slot
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return slot
+	}
+	lines := strings.Split(strings.TrimRight(slot.Body, "\n"), "\n")
+	if len(lines) <= n {
+		return slot
+	}
+	if slot.Headers == nil {
+		slot.Headers = map[string]string{}
+	}
+	slot.Headers["Trimmed"] = fmt.Sprintf("the last %d of %d lines of this command's output; read the rest with `read`", n, len(lines))
+	slot.Body = strings.Join(lines[len(lines)-n:], "\n")
+	return slot
+}
+
+// checkWindow validates the read window a command will be read with, before the
+// command runs.
+//
+// It builds the argument map readSlot would build and hands it to the same parser,
+// so the two cannot drift. `timeout` here is the caller's whole window rather than
+// what is left of it: the remainder is always smaller, so a window that passes here
+// cannot be refused later, and one refused here would have been refused there.
+func (s *Server) checkWindow(stmt directive.Statement, win termArgs) *toolFailure {
+	args := argsOf("shell_id", stmt.Target)
+	args["max_bytes"] = float64(win.BytesLimit)
+	args["max_lines"] = float64(win.LinesLimit)
+	args["timeout"] = win.TimeoutSeconds
+	if _, bad := parseReadParams(args); bad != nil {
+		return failureFromResult(bad)
+	}
+	return nil
 }
 
 // pipeClosedHint turns a bare write failure into something a caller can act on.
@@ -866,6 +1005,28 @@ func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement,
 	return s.readSlot(ctx, stmt, win, args, 0)
 }
 
+// awaitRunOutput waits for the command a `run` just typed, using the same signals the
+// read half uses, and returns how long it waited.
+//
+// ONE PLACE DECIDES WHEN A COMMAND'S OUTPUT IS THERE, because two places deciding it
+// separately is how the plain half and the searched half of one verb end up disagreeing:
+// `run --grep` read with a zero window while `run` read with the caller's, so a search
+// over bytes that had not arrived answered "no line matched … in the 0 lines scanned".
+//
+// A LIVE PIPE HAS NO SIGNAL AT ALL — no exit to wait for and no pty to go quiet — so this
+// returns immediately and the caller's window is spent by the read that follows, which
+// blocks for it. That is the division the plain path makes, and it is why the return is a
+// duration rather than a bool: what is LEFT of the window is what the read may spend.
+func (s *Server) awaitRunOutput(ctx context.Context, stmt directive.Statement, win termArgs, start int64) time.Duration {
+	began := time.Now()
+	if s.completionWait(stmt.Target) {
+		s.awaitExit(ctx, stmt.Target, win)
+	} else if s.ptyRunning(stmt.Target) {
+		s.awaitWindow(ctx, stmt.Target, win, start)
+	}
+	return time.Since(began)
+}
+
 // readSlotAfter reads the window a command produced, starting where it was
 // submitted.
 //
@@ -881,13 +1042,29 @@ func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement,
 // `timeout` bounds both and defaults to two seconds.
 func (s *Server) readSlotAfter(ctx context.Context, stmt directive.Statement, win termArgs, start int64) envelope.Slot {
 	args := argsOf("shell_id", stmt.Target, "offset", float64(start))
+	// WHERE THIS COMMAND'S OUTPUT BEGINS (issue #194).
+	//
+	// The reply is a SAMPLE of the channel's stream, and the one number that turns the
+	// sample into something a caller can act on is the offset the input landed at: it is
+	// what `read --offset <n>` takes to get the rest, and it is what tells an empty reply
+	// apart from a caller whose cursor is already past the output. The number was already
+	// computed — it is the offset this window was scoped to — it just was not said.
+	//
+	// It is the offset BEFORE the input, not the marker's: the window starts where the
+	// command's bytes begin, so re-reading from Input-At gives back this same window
+	// (marker included) rather than skipping the echo.
+	inputAt := strconv.FormatInt(start, 10)
 	// A byte limit of 0 means "hand back the channel, consume nothing": the
 	// directive must not even read, or a JSON-RPC frame destined for `mcp recv`
 	// would be eaten by the envelope.
 	if win.BytesLimit == 0 {
 		return envelope.Slot{
-			Code:    204,
-			Headers: map[string]string{"Path": stmt.Path, "Content-Range": envelope.UnsatisfiedRange(start)},
+			Code: 204,
+			Headers: map[string]string{
+				"Path":          stmt.Path,
+				"Content-Range": envelope.UnsatisfiedRange(start),
+				"Input-At":      inputAt,
+			},
 		}
 	}
 	waitStarted := time.Now()
@@ -897,12 +1074,41 @@ func (s *Server) readSlotAfter(ctx context.Context, stmt directive.Statement, wi
 	// and without it the caller cannot tell a finished command from a window that ended
 	// (issue #161, P1-3).
 	windowExpired := false
+	waitedOnAPty := false
 	if wait := s.completionWait(stmt.Target); wait {
 		s.awaitExit(ctx, stmt.Target, win)
 	} else if s.ptyRunning(stmt.Target) {
+		waitedOnAPty = true
 		windowExpired = s.awaitWindow(ctx, stmt.Target, win, start)
 	}
 	slot := s.readSlot(ctx, stmt, win, args, time.Since(waitStarted))
+	if slot.Code < 400 {
+		if slot.Headers == nil {
+			slot.Headers = map[string]string{}
+		}
+		slot.Headers["Input-At"] = inputAt
+	}
+	if waitedOnAPty && !windowExpired && slot.Code < 400 {
+		// HOW THE WAIT ENDED IS A FACT, AND IT WAS THE ONE THING NOT SAID.
+		//
+		// A pty has no completion signal, so this wait ends one of two ways: the window
+		// runs out, or the stream goes quiet (ptyQuiet with no new byte). The second is
+		// the ordinary case — it is how a finished command looks — and it said NOTHING,
+		// so a command that merely went silent while it worked was indistinguishable from
+		// one that had finished. Three callers reading the same reply hit it the same way:
+		// "the output looks truncated, and nothing tells me whether it is".
+		//
+		// `Still-Running` is deliberately NOT reused: it means "the window expired while
+		// bytes were still arriving", which is evidence. A quiet stream is not evidence of
+		// anything — the command may have finished, or be sleeping — and a header that
+		// claimed either would be the kind of guess this server refuses to make about a
+		// pty. So it names the evidence instead, and `read` is how the caller finds out
+		// more.
+		if slot.Headers == nil {
+			slot.Headers = map[string]string{}
+		}
+		slot.Headers["Completion"] = "quiet"
+	}
 	if windowExpired && slot.Code < 400 && s.ptyRunning(stmt.Target) && slot.Headers["Still-Running"] == "" {
 		// Same header the pipe path uses, same meaning: the command was accepted and has
 		// not finished. It is set only when the window expired, so it does not become the
@@ -1377,6 +1583,21 @@ func (s *Server) windowSlot(stmt directive.Statement, win termArgs, doc map[stri
 		headers["Status"] = status
 		if exit != nil {
 			headers["Exit-Code"] = fmt.Sprint(*exit)
+			// 126 AND 127 ARE TWO ANSWERS, AND THE SHELL'S OWN WORDS DO NOT TELL THEM
+			// APART (issue #191). "permission denied" covers both "this file has no
+			// execute bit" and "this filesystem is mounted noexec", and the caller who
+			// reads it starts chmod-ing a file that is already 755. "command not
+			// found" is a PATH answer. Neither is a fact about the terminal, so it is
+			// stated rather than guessed at: the two causes are named, and the mode is
+			// one command away (`--op stat` reports it).
+			if *exit == 126 {
+				headers["Hint"] = "exit 126: the program exists but could not be executed. Check its mode " +
+					"(`get <session> file <path> --op stat` reports mode/uid/gid); a filesystem mounted noexec " +
+					"refuses execution even at 755, which `mount` on the remote will show."
+			} else if *exit == 127 {
+				headers["Hint"] = "exit 127: the shell could not find that program — check the name and the " +
+					"remote PATH, not the file's permissions."
+			}
 			// WHO ASKED DECIDES WHETHER A NON-ZERO EXIT IS THIS REPLY'S FAILURE.
 			//
 			// `run` reports the command it just sent, so a non-zero exit is news
@@ -1878,7 +2099,7 @@ func (s *Server) peerChannel(ctx context.Context, stmt directive.Statement, win 
 		found, ok := jrpcChannels[stmt.Target]
 		jrpcChannelsMu.Unlock()
 		if !ok {
-			return []envelope.Slot{s.mcpStdio(ctx, stmt, sub, stmt.Target, []string{frame})}
+			return []envelope.Slot{s.mcpStdio(ctx, stmt, sub, stmt.Target, []string{frame}, win)}
 		}
 		h = found
 	}
@@ -2020,9 +2241,46 @@ func (s *Server) directiveLS(ctx context.Context, stmt directive.Statement, win 
 		return []envelope.Slot{badRequest(stmt, "`ls "+sid+"` lists every channel; for one of them "+
 			"use `get "+sid+":"+strconv.Itoa(idx)+"`.")}
 	}
+	// A TARGET NAMES A COLLECTION, SO A TARGET THAT NAMES NOTHING MUST SAY SO.
+	//
+	// `ls nosuchthing` (and `ls <a session that was rm'd>`) fell through to the same
+	// filtered listing a real session gets, the filter matched nothing, and the reply was
+	// the GLOBAL sentence "(nothing is running)" plus the hint about `ls host`. That
+	// sentence is about a different collection and answers a different question: a caller
+	// asking "what is on this link" was told the machine has no sessions at all. Same
+	// shape as #148 one branch up — a stale or mistyped target read as a fact about the
+	// world (found by dogfooding).
+	//
+	// THE PREDICATE IS THE LISTING'S OWN. `ls <target>` narrows to a session by id OR by
+	// profile name — `ls internal` is how a caller lists the session on the internal
+	// profile — so a check that only knew about ids refused a spelling that had been
+	// working, and the browser test caught it. A target that names neither is the one
+	// case where the empty listing is a lie about the collection.
+	if !s.lsTargetNames(stmt.Target) {
+		return []envelope.Slot{s.slotFromFailure(ctx, stmt, &toolFailure{
+			code: CodeSessionNotFound,
+			msg: fmt.Sprintf("no session %q, so there is nothing to list for it. `ls` lists every live "+
+				"link, `ls --all` includes the ones that have exited.", stmt.Target),
+		})}
+	}
 	return []envelope.Slot{s.directivePS(ctx, withFlags(stmt, map[string]string{
 		"shells": "true", "only-session": stmt.Target, "all": "true",
 	}), win)}
+}
+
+// lsTargetNames reports whether a target names a session the listing can show: its id,
+// or the profile it was opened on.
+//
+// Both spellings are what directivePS's own filter accepts, and keeping the two in step
+// is the point — a check that answered a narrower question than the filter would refuse
+// targets the filter handles.
+func (s *Server) lsTargetNames(target string) bool {
+	for _, sess := range s.sessMgr.ListAll() {
+		if sess.ID == target || sess.SSHConfig == target {
+			return true
+		}
+	}
+	return false
 }
 
 // wantPTY decides whether a new channel gets a terminal.

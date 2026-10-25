@@ -65,6 +65,20 @@ type Server struct {
 	// report 204 and then skip the frames behind it on the next call — silently.
 	recvCursorMu sync.Mutex
 	recvCursors  map[string]int64
+	// recvReaders holds one mutex per handle, held for the WHOLE read (#183).
+	//
+	// The cursor above is a read POSITION, and a position does not say who is
+	// reading it. Two concurrent recvs on one handle therefore both start at the
+	// same offset, both find the same frame, and both return it — measured, 3 runs
+	// out of 3. The cursor never moves backwards, so nothing is lost; the contract
+	// degrades from exactly-once to at-least-once, and duplicate delivery is what
+	// JSON-RPC id pairing cannot survive: two `id:3` and no `id:4` leaves the client
+	// waiting for an answer another reader already consumed.
+	//
+	// Per HANDLE rather than one global mutex, because a recv can wait out the
+	// caller's whole window: a global lock would park every unrelated channel behind
+	// it for fifteen seconds.
+	recvReaders map[string]*sync.Mutex
 
 	// closedReads is where each CLOSED channel's plain `read` has read up to.
 	//

@@ -129,7 +129,7 @@ func TestCdpOneShotAttachesAndDetaches(t *testing.T) {
 	// NO INDEX: the target alone is the one-shot form. With an index the target is
 	// expected to be attached already, which is a different command.
 	out := termText(t, s, map[string]any{"cmd": `call internal cdp@T1 {"method":"Page.reload"}`})
-	if !strings.Contains(out, "200") {
+	if !statusLineIs(out, "200") {
 		t.Fatalf("the one-shot form failed: %s", out)
 	}
 	waitFor(t, "the frame to reach the browser", func() bool {
@@ -161,7 +161,7 @@ func TestCdpSendReturnsBeforeTheAnswer(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	out := termText(t, s, map[string]any{"cmd": `call ` + h + ` --send {"method":"Browser.close"}`})
-	if !strings.Contains(out, "202") {
+	if !statusLineIs(out, "202") {
 		t.Fatalf("--send did not answer 202:\n%s", out)
 	}
 	waitFor(t, "the sent frame to arrive", func() bool {

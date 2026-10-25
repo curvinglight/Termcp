@@ -339,7 +339,12 @@ func (s *Server) handleGetSSHConfig(ctx context.Context, request mcpgo.CallToolR
 	ent, err := s.sshConfigs.Load(name)
 	if err != nil {
 		if errors.Is(err, sshconfig.ErrNotFound) {
-			return toolError(CodeSessionNotFound, "%s", "ssh config \""+name+"\" not found"), nil
+			// THE CODE NAMES THE THING THAT IS MISSING. It was session_not_found, which
+			// sent a caller looking for a session: the answer to `get host prod` said
+			// "ssh config not found" in the body and "no such session" in the header, and
+			// the two disagree about which collection was searched. ssh_config_not_found
+			// already existed and is what sshConfigErrCode answers for the same store.
+			return toolError(CodeSSHConfigNotFound, "%s", "ssh config \""+name+"\" not found"), nil
 		}
 		return toolError(CodeOperationFailed, "%s", err.Error()), nil
 	}

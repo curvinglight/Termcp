@@ -38,19 +38,25 @@ func TestAmpersandRunsStatementsConcurrently(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h2})
 
 	const window = 2.0
-	run := func(cmd string) (string, time.Duration) {
+	// THE SHELL LINE RIDES IN args: `run` takes exactly one variable reference, and
+	// the value is what the terminal reads.
+	run := func(cmd string, args ...any) (string, time.Duration) {
 		t.Helper()
+		call := map[string]any{"cmd": cmd, "timeout": window}
+		if len(args) > 0 {
+			call["args"] = args
+		}
 		start := time.Now()
-		text := termText(t, s, map[string]any{"cmd": cmd, "timeout": window})
+		text := termText(t, s, call)
 		return text, time.Since(start)
 	}
 
-	_, one := run("run " + h1 + " echo ONE")
-	seq, two := run("run " + h1 + " echo ONE; run " + h2 + " echo TWO")
+	_, one := run("run "+h1+" $1", "echo ONE")
+	seq, two := run("run "+h1+" $1; run "+h2+" $2", "echo ONE", "echo TWO")
 	if n := strings.Count(seq, "TERM/1 "); n != 2 {
 		t.Fatalf("the sequential baseline must produce 2 slots, got %d", n)
 	}
-	par, parallel := run("run " + h1 + " echo ONE & run " + h2 + " echo TWO")
+	par, parallel := run("run "+h1+" $1 & run "+h2+" $2", "echo ONE", "echo TWO")
 	if n := strings.Count(par, "TERM/1 "); n != 2 {
 		t.Fatalf("the parallel batch must still produce one slot per statement, got %d:\n%s", n, par)
 	}
@@ -80,7 +86,8 @@ func TestParallelSlotsKeepCommandOrder(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h2})
 
 	out := termText(t, s, map[string]any{
-		"cmd":     "run " + h1 + " echo FIRST & run " + h2 + " echo SECOND",
+		"cmd":     "run " + h1 + " $1 & run " + h2 + " $2",
+		"args":    []any{"echo FIRST", "echo SECOND"},
 		"timeout": float64(2),
 	})
 	i1 := strings.Index(out, "FIRST")
@@ -101,7 +108,8 @@ func TestSemicolonStillSeparatesSequentially(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	out := termText(t, s, map[string]any{
-		"cmd":     "run " + h + " echo ONE; run " + h + " echo TWO",
+		"cmd":     "run " + h + " $1; run " + h + " $2",
+		"args":    []any{"echo ONE", "echo TWO"},
 		"timeout": float64(2),
 	})
 	if n := strings.Count(out, "TERM/1 "); n != 2 {

@@ -37,7 +37,8 @@ func TestReadOnExitedPipeReturns200Not500(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + hPty})
 
 	multi := termText(t, s, map[string]any{
-		"cmd":     "run " + hPty + " echo ALIVE; read " + h,
+		"cmd":     "run " + hPty + " $1; read " + h,
+		"args":    []any{"echo ALIVE"},
 		"timeout": 2,
 	})
 	if strings.Contains(multi, "500 Internal") {

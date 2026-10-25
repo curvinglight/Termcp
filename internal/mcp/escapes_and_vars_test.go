@@ -15,33 +15,38 @@ import (
 // LAYER that reads it, not from the request it arrived in. A path may contain a
 // carriage return; a terminal acts on one.
 //
-// So the check reads parsed statements, and only the regions the parser marked as
-// shell syntax — the payload and the `--argv` word list. The override is gone with
-// the question: a keystroke is a directive (`key <channel> ctrl-c`), and there is
-// no legitimate control byte in a shell line to make an exception for.
+// So the check reads parsed statements, and only the regions that reach a shell —
+// the `--argv` word list, and the payload a value is substituted into. A run/input
+// payload is ONE VARIABLE REFERENCE, so the shell line itself always travels as a
+// value: every case below writes the byte into args and asserts the same refusal.
+// The override is gone with the question: a keystroke is a directive (`key
+// <channel> ctrl-c`), and there is no legitimate control byte in a shell line to
+// make an exception for.
 func TestRawControlBytesAreRefusedOnlyInAShellLine(t *testing.T) {
 	s := newTestServer(t)
 
-	// The bytes a terminal acts on, each one refused in a payload.
+	// The bytes a terminal acts on, each one refused once it lands in the payload's
+	// value. The command is the same in every case; only the shell line changes.
+	const cmd = "run a:1 $1"
 	cases := []struct {
 		name string
-		cmd  string
+		sh   string
 		want string
 	}{
-		{"bare CR", "run a:1 echo a\rb", "carriage return"},
-		{"bare Ctrl-C", "run a:1 echo a\x03b", "Ctrl-C"},
-		{"bare Ctrl-D", "run a:1 echo a\x04b", "Ctrl-D"},
-		{"bare Ctrl-Z", "run a:1 echo a\x1ab", "Ctrl-Z"},
-		{"bare NUL", "run a:1 echo a\x00b", "NUL"},
-		{"bare ESC", "run a:1 echo a\x1bb", "ESC"},
+		{"bare CR", "echo a\rb", "carriage return"},
+		{"bare Ctrl-C", "echo a\x03b", "Ctrl-C"},
+		{"bare Ctrl-D", "echo a\x04b", "Ctrl-D"},
+		{"bare Ctrl-Z", "echo a\x1ab", "Ctrl-Z"},
+		{"bare NUL", "echo a\x00b", "NUL"},
+		{"bare ESC", "echo a\x1bb", "ESC"},
 		// Quoting never made a byte safe: the terminal reads the line before any
 		// shell parses quotes, so a quoted control byte is exactly as dangerous.
-		{"quoted CR", "run a:1 echo 'a\rb'", "carriage return"},
-		{"double-quoted CR", "run a:1 echo \"a\rb\"", "carriage return"},
+		{"quoted CR", "echo 'a\rb'", "carriage return"},
+		{"double-quoted CR", "echo \"a\rb\"", "carriage return"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := termText(t, s, map[string]any{"cmd": tc.cmd})
+			got := termText(t, s, map[string]any{"cmd": cmd, "args": []any{tc.sh}})
 			if !strings.HasPrefix(got, "TERM/1 4") {
 				t.Fatalf("a control byte in a shell line must be refused with 400:\n%s", got)
 			}
@@ -60,7 +65,7 @@ func TestRawControlBytesAreRefusedOnlyInAShellLine(t *testing.T) {
 	}
 
 	// TAB is whitespace to every layer and must stay ordinary.
-	got := termText(t, s, map[string]any{"cmd": "run a:1 echo a\tb"})
+	got := termText(t, s, map[string]any{"cmd": cmd, "args": []any{"echo a\tb"}})
 	if strings.Contains(got, "raw_control_byte") {
 		t.Errorf("TAB is ordinary whitespace and must not be refused:\n%s", got)
 	}
@@ -93,7 +98,7 @@ func TestAKeystrokeIsADirectiveNotAByte(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	// Prime the shell so the interrupt below lands on a running line editor.
-	termText(t, s, map[string]any{"cmd": "run " + h + " echo READY", "timeout": 2})
+	termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo READY"}, "timeout": 2})
 	waitForGrepContent(t, s, h, "READY")
 
 	// `ctrl+c`, the spelling the directive publishes. The test used `ctrl-c`, which the

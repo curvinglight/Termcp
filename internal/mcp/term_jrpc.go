@@ -441,7 +441,7 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 	if !ok {
 		if op == "mcp" && sub != "open" {
 			// The stdio form: the handle names a shell running an MCP server.
-			return s.mcpStdio(ctx, stmt, sub, handle, rest[1:])
+			return s.mcpStdio(ctx, stmt, sub, handle, rest[1:], win)
 		}
 		return envelope.Slot{Code: 404, Headers: map[string]string{"Path": stmt.Path, "Error-Code": "not_found"},
 			Body: "no open channel named " + handle + " (copy a channel address from " + op + " open, or from ps for a shell)"}

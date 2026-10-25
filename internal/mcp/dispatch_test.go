@@ -417,7 +417,9 @@ func TestCloseWithAForwardIDDoesNotTerminateTheSession(t *testing.T) {
 		t.Fatalf("closing a forward terminated the session:\n%s", got)
 	}
 	// The shell still answers, which is the only proof that survives a status field.
-	if got := termText(t, s, map[string]any{"cmd": "run " + h + " echo alive"}); !strings.Contains(got, "alive") {
+	// The line travels as the VALUE of `$1` — a literal payload is refused now — so a
+	// reply that merely quotes the refusal cannot pass for the command's output.
+	if got := termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo alive"}}); !strings.Contains(got, "alive") {
 		t.Errorf("the channel stopped working after closing a forward:\n%s", got)
 	}
 

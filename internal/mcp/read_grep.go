@@ -44,6 +44,25 @@ const (
 // scan behind a parameter that looks like a size cap). Both are wrong, and the caller
 // cannot tell which one it got. A directive states its own cost.
 func (s *Server) readGrep(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+	// NO BLOCKING WINDOW, AND THAT IS THE WHOLE POINT OF A SEARCH. `read --grep` looks at
+	// bytes that are already in the transcript; waiting for bytes that are not there
+	// would make "no match" take as long as the caller's patience and answer the same.
+	return s.readGrepFrom(ctx, stmt, win, 0, 0)
+}
+
+// readGrepFrom is readGrep over the region that starts at from, blocking up to
+// blockFor seconds for bytes to appear.
+//
+// The offset is what lets `run --grep` search THIS command's output rather than the
+// whole channel: a run knows where its input started, and a search that ignored that
+// would answer with matches from a command the caller has already dealt with.
+//
+// THE BLOCKING WINDOW IS THE DIFFERENCE BETWEEN THE TWO CALLERS. A run has just typed a
+// command, so its bytes are NOT there yet, and a zero window made it scan nothing and
+// answer `no line matched ... in the 0 lines scanned` — honest, and useless (found by
+// driving it, not by a test). The run passes the part of its window the wait did not
+// spend; a plain `read --grep` passes zero.
+func (s *Server) readGrepFrom(ctx context.Context, stmt directive.Statement, win termArgs, from int64, blockFor float64) envelope.Slot {
 	pattern, _ := stmt.Flag("grep")
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -72,7 +91,7 @@ func (s *Server) readGrep(ctx context.Context, stmt directive.Statement, win ter
 	args := argsOf("shell_id", stmt.Target,
 		"max_bytes", float64(grepMaxScanBytes),
 		"max_lines", float64(0),
-		"timeout", float64(0),
+		"timeout", blockFor,
 	)
 	if v, ok := stmt.Flag("stream"); ok {
 		args["stream"] = v
@@ -99,7 +118,7 @@ func (s *Server) readGrep(ctx context.Context, stmt directive.Statement, win ter
 	// channel that just exited can be readable by bytes while line N is not yet
 	// indexed — the observed symptom was `Lines-Scanned: 1` on a buffer holding eight
 	// lines. An offset read needs no index: the bytes are the bytes.
-	args["offset"] = float64(0)
+	args["offset"] = float64(from)
 
 	res, fail := s.callTool(ctx, "shell_output", args)
 	if fail != nil {

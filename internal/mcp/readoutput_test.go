@@ -92,9 +92,15 @@ func TestParseReadParamsRanges(t *testing.T) {
 		ok   bool
 	}{
 		{"timeout 0 is the non-blocking read", map[string]any{"timeout": float64(0)}, true},
-		{"timeout 60 is the ceiling", map[string]any{"timeout": float64(60)}, true},
+		{"timeout 60 is inside the recommendation", map[string]any{"timeout": float64(60)}, true},
 		{"timeout below 0", map[string]any{"timeout": float64(-0.1)}, false},
-		{"timeout above 60", map[string]any{"timeout": float64(60.1)}, false},
+		// 60 IS A RECOMMENDATION, NOT A CEILING. It used to be an upper bound here while
+		// the documentation called it "the wait to stay under" — so the tool's own schema
+		// was a lie, and a caller asking for a longer window was answered "timeout must not
+		// be negative, got 60.1" (issue #168). The caller pays for the wait; the caller is
+		// the only party that can see its own link and its own watchdog.
+		{"timeout above 60 is a request", map[string]any{"timeout": float64(60.1)}, true},
+		{"a very long window is still a request", map[string]any{"timeout": float64(3600)}, true},
 		{"tail_lines 0 asks for zero lines", map[string]any{"tail_lines": float64(0)}, true},
 		{"tail_lines negative is refused", map[string]any{"tail_lines": float64(-1)}, false},
 		{"offset negative is refused", map[string]any{"offset": float64(-1)}, false},

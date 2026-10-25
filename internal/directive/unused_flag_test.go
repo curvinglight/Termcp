@@ -27,7 +27,11 @@ func TestEveryDeclaredFlagIsReadOrRefused(t *testing.T) {
 	all := strings.Join(sources, "\n")
 
 	for _, op := range Ops() {
-		for _, flag := range op.Flags {
+		for _, declared := range op.Flags {
+			// The declared entry may carry its domain ("offset:number"); the handler
+			// reads the NAME, so the annotation is stripped here rather than the
+			// declaration being kept in two lists.
+			flag, _, _ := strings.Cut(declared, ":")
 			// Both spellings reach the handlers: `grace` as a directive flag, and
 			// `grace` / `grace-seconds` as a tool argument.
 			camel := toCamel(flag)

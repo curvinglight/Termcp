@@ -199,8 +199,8 @@ func (s *Server) directiveAlias(_ context.Context, stmt directive.Statement, win
 		for name, expansion := range entries {
 			b.WriteString(name + " = " + expansion + "\n")
 		}
-		capped, code, cut := capGeneratedCounted(b.String(), win)
-		noteTruncated(headers, cut, win)
+		capped, code, cut, total := capGeneratedCounted(b.String(), win)
+		noteTruncated(headers, code, cut, total, win)
 		return envelope.Slot{Code: code, Headers: headers, Body: capped}
 	}
 	name, expansion, _ := strings.Cut(body, " ")

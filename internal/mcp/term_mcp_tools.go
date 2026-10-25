@@ -142,8 +142,9 @@ func (s *Server) mcpResultText(ctx context.Context, stmt directive.Statement, h 
 	if len(body) > 4096 {
 		if rec, ok := h.ch.LastAnswer(); ok {
 			return envelope.Slot{Code: 200, Headers: map[string]string{
-				"Path": stmt.Path, "Frame": fmt.Sprint(rec.N), "Bytes": fmt.Sprint(len(body)),
-			}, Body: receiptBody(rec.N, body, stmt, h)}
+				"Path": stmt.Path, "Frame": fmt.Sprint(rec.N),
+				"Bytes": fmt.Sprint(len(rec.Data)), "Decoded-Bytes": fmt.Sprint(len(body)),
+			}, Body: receiptBody(rec.N, body, len(rec.Data), stmt, h)}
 		}
 	}
 	return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: body}

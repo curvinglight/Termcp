@@ -99,7 +99,7 @@ func TestRecvFindsAFrameBehindStartupNoise(t *testing.T) {
 		t.Errorf("the wrong bytes were delivered:\n%s", got)
 	}
 	// The cursor advanced past the frame, not past the noise+frame.
-	if !strings.Contains(got, "200 OK") {
+	if !statusLineIs(got, "200") {
 		t.Errorf("recv should succeed:\n%s", got)
 	}
 	termText(t, s, map[string]any{"cmd": "close " + h})

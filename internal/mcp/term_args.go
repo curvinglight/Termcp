@@ -237,15 +237,23 @@ var termArgDecls = []termArgDecl{
 		Name:    "args",
 		Kind:    argStringArray,
 		Desc:    "Named = positional. The value IS the shell line: put the whole command in the variable, leave only the reference in cmd. DSL and shell are never mixed.",
-		DocNote: "Positional values for `$1`, `$2`, … (1-based; `$0` is refused; `${10}` is the unambiguous form for ten or more). The reference must BE the payload: the value is the shell line, and cmd is DSL, so a reference beside other shell text is refused rather than guessed at. Nothing quotes or escapes the value — if you want one word, write the quotes inside the value. EVERY value must be referenced by cmd: a value nothing names is refused before anything runs, because a dropped argument is invisible in the reply",
+		DocNote: "Positional values for `$1`, `$2`, … (1-based; `$0` is refused; `${10}` is the unambiguous form for ten or more). The reference must BE the payload: the value is the shell line, and cmd is DSL, so a reference beside other shell text is refused rather than guessed at. Nothing quotes or escapes the value — if you want one word, write the quotes inside the value. EVERY value must be referenced by cmd: a value nothing names is refused before anything runs, because a dropped argument is invisible in the reply. **These values ARE recorded in the server log** — as is anything typed literally into `cmd`, since a payload or a flag value is part of the command line. A password or a token belongs in `secrets`",
 		Def:     nil,
 		DefText: "",
 	},
 	{
 		Name:    "vars",
 		Kind:    argMap,
-		Desc:    "Named = positional. The value IS the shell line: put the whole command in the variable, leave only the reference in cmd. DSL and shell are never mixed.",
-		DocNote: "Named values for `$NAME` in `cmd`. The same mechanism as `args` under another spelling — the position decides the insertion, never which table named the value — so a `$NAME` that is the whole payload and a `$1` that is the whole payload behave identically. Every name must be referenced by cmd: an unused entry is refused before anything runs, and so is a `$NAME` this table does not define",
+		Desc:    "Named values for $NAME. Logged verbatim.",
+		DocNote: "Named values for `$NAME` in `cmd`. The same mechanism as `args` under another spelling — the position decides the insertion, never which table named the value — so a `$NAME` that is the whole payload and a `$1` that is the whole payload behave identically. Every name must be referenced by cmd: an unused entry is refused before anything runs, and so is a `$NAME` this table does not define. **These values ARE recorded in the server log**, which is what makes the log a faithful record of the call: a value that must not be written down belongs in `secrets` instead",
+		Def:     nil,
+		DefText: "",
+	},
+	{
+		Name:    "secrets",
+		Kind:    argMap,
+		Desc:    "Named values for $NAME that are NEVER logged. Put credentials here.",
+		DocNote: "Named values for `$NAME` in `cmd`, expanded exactly like `vars` and refused on the same rules (unused names, undefined names, one name in both tables). The ONE difference is the record: the server log names which secrets were passed and never writes their values, while `vars` is logged verbatim. That is the whole mechanism — there is no pattern matching and no guessing, because a redactor that recognises `-p` and misses `--password` is worse than none: it reports safety it does not have. So a caller that does not want a value on disk says so by where it puts it. Note that a secret expanded into a command line is still echoed back by the remote shell, and that echo is the channel's own transcript — the terminal cannot be asked to hide what it printed",
 		Def:     nil,
 		DefText: "",
 	},
@@ -332,6 +340,9 @@ func parseTermArgs(args map[string]any) (termArgs, *directive.Error) {
 	}
 	collect(readNumberArg(args, "timeout", &w.TimeoutSeconds))
 	var bytesLimit, linesLimit, totalLimit float64
+	if _, given := args["bytes_limit"]; given {
+		w.BytesLimitSet = true
+	}
 	collect(readNumberArg(args, "bytes_limit", &bytesLimit))
 	collect(readNumberArg(args, "lines_limit", &linesLimit))
 	collect(readNumberArg(args, "total_bytes_limit", &totalLimit))
@@ -381,11 +392,20 @@ func parseTermArgs(args map[string]any) (termArgs, *directive.Error) {
 	if err := readBoolArg(args, "structured_content", &w.StructuredContent); err != nil {
 		return termArgs{}, err
 	}
-	vars, derr := readVarsArg(args)
+	vars, derr := readNamedArg(args, "vars")
 	if derr != nil {
 		return termArgs{}, derr
 	}
-	w.Vars = vars
+	secrets, derr := readNamedArg(args, "secrets")
+	if derr != nil {
+		return termArgs{}, derr
+	}
+	named, derr := mergeNamed(vars, secrets)
+	if derr != nil {
+		return termArgs{}, derr
+	}
+	w.Vars = named
+	w.Secrets = secrets
 	posArgs, derr := readArgsArg(args)
 	if derr != nil {
 		return termArgs{}, derr
@@ -423,31 +443,67 @@ func readArgsArg(args map[string]any) ([]string, *directive.Error) {
 	return out, nil
 }
 
-// readVarsArg reads the vars dictionary.
+// readNamedArg reads one named-value dictionary: vars or secrets.
+//
+// The two are the same mechanism with one difference — where the values are RECORDED
+// — so one function reads both and they are merged into a single substitution table.
+// Keeping the reader single is what stops the two tables from drifting apart in what
+// they accept: a rule added for one would otherwise have to be remembered for the
+// other (issue #161 P0-1).
 //
 // Keys and values must both be strings: a caller that sent `{"N": 3}` meant the
 // string "3", but guessing that here would mean the substitution and the caller
-// disagree about what was sent. An empty or absent vars is nil, which
-// ParseWithVars reads as "substitute nothing".
-func readVarsArg(args map[string]any) (map[string]string, *directive.Error) {
-	raw, present := args["vars"]
+// disagree about what was sent. An empty or absent table is nil, which
+// ParseWithSubst reads as "substitute nothing".
+func readNamedArg(args map[string]any, name string) (map[string]string, *directive.Error) {
+	raw, present := args[name]
 	if !present || raw == nil {
 		return nil, nil
 	}
 	obj, ok := raw.(map[string]any)
 	if !ok {
-		return nil, &directive.Error{Msg: "vars must be an object of name: value pairs, got " + typeNameOf(raw)}
+		return nil, &directive.Error{Msg: name + " must be an object of name: value pairs, got " + typeNameOf(raw)}
 	}
 	out := make(map[string]string, len(obj))
-	for name, v := range obj {
-		if name == "" {
-			return nil, &directive.Error{Msg: "vars has an entry with an empty name; every key must name the variable it fills"}
+	for k, v := range obj {
+		if k == "" {
+			return nil, &directive.Error{Msg: name + " has an entry with an empty name; every key must name the variable it fills"}
 		}
 		s, isString := v.(string)
 		if !isString {
-			return nil, &directive.Error{Msg: "vars[" + name + "] must be a string, got " + typeNameOf(v)}
+			return nil, &directive.Error{Msg: name + "[" + k + "] must be a string, got " + typeNameOf(v)}
 		}
-		out[name] = s
+		out[k] = s
+	}
+	return out, nil
+}
+
+// mergeNamed folds secrets into the table that expands `$NAME`.
+//
+// ONE TABLE, TWO RECORDS. Which table a name came from changes nothing about the
+// substitution — a `$NAME` is a `$NAME` — and only the log tells them apart. A name
+// defined in both is refused rather than resolved by precedence: the caller wrote two
+// values for one reference, and any rule picked here would be a silent choice between
+// them.
+func mergeNamed(vars, secrets map[string]string) (map[string]string, *directive.Error) {
+	for name := range secrets {
+		if _, both := vars[name]; both {
+			return nil, &directive.Error{Msg: "the name " + name + " is defined in both vars and secrets; " +
+				"a reference has one value, so put it in the table whose record you want"}
+		}
+	}
+	if len(secrets) == 0 {
+		return vars, nil
+	}
+	if len(vars) == 0 {
+		return secrets, nil
+	}
+	out := make(map[string]string, len(vars)+len(secrets))
+	for k, v := range vars {
+		out[k] = v
+	}
+	for k, v := range secrets {
+		out[k] = v
 	}
 	return out, nil
 }

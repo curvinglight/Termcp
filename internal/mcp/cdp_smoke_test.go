@@ -166,7 +166,7 @@ func TestRealBrowserThroughTheCdpDoor(t *testing.T) {
 	if both := termText(t, s, map[string]any{"cmd": "ls internal cdp"}); !strings.Contains(both, h) || !strings.Contains(both, second) {
 		t.Fatalf("ls does not name both connections (%q, %q):\n%s", h, second, both)
 	}
-	if got := termText(t, s, map[string]any{"cmd": "close " + second}); !strings.Contains(got, "204") {
+	if got := termText(t, s, map[string]any{"cmd": "close " + second}); !statusLineIs(got, "204") {
 		t.Fatalf("closing the second connection failed:\n%s", got)
 	}
 
@@ -200,7 +200,7 @@ func TestRealBrowserThroughTheCdpDoor(t *testing.T) {
 
 	// Enable a domain, then evaluate WITHOUT writing a sessionId: the child handle
 	// carries it, which is the whole point.
-	if got := termText(t, s, map[string]any{"cmd": `call ` + child + ` {"method":"Page.enable"}`}); !strings.Contains(got, "200") {
+	if got := termText(t, s, map[string]any{"cmd": `call ` + child + ` {"method":"Page.enable"}`}); !statusLineIs(got, "200") {
 		t.Fatalf("Page.enable through the child handle failed:\n%s", got)
 	}
 
@@ -273,7 +273,7 @@ func TestRealBrowserThroughTheCdpDoor(t *testing.T) {
 	}
 
 	// `close <peer>:N` detaches; the tab stays.
-	if got := termText(t, s, map[string]any{"cmd": "close " + child}); !strings.Contains(got, "204") {
+	if got := termText(t, s, map[string]any{"cmd": "close " + child}); !statusLineIs(got, "204") {
 		t.Fatalf("detach through the child handle failed:\n%s", got)
 	}
 	if after := termText(t, s, map[string]any{"cmd": "get " + h}); strings.Contains(after, child) {

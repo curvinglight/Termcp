@@ -378,6 +378,11 @@ func (s *Server) handleStartSubShell(_ context.Context, request mcpgo.CallToolRe
 	}
 	cs, err := sess.CreateChildShell(command, toolArgs, mode == "pty", rows, cols, name)
 	if err != nil {
+		// A LABEL ALREADY IN USE IS AN ARGUMENT PROBLEM (issue #188): the caller can fix
+		// it by choosing another name, and answering 500 would say the server failed.
+		if errors.Is(err, session.ErrLabelTaken) {
+			return toolError(CodeInvalidArgument, "%s", err.Error()), nil
+		}
 		return toolError(CodeOperationFailed, "%s", err.Error()), nil
 	}
 	// Echo sess.ID, not the argument: the response's ids must be usable as ids, and
@@ -590,9 +595,17 @@ func parseReadParams(args map[string]any) (readParams, *mcpgo.CallToolResult) {
 		FromLine:  int64(getFloat64(args, "from_line", 0)),
 		Stream:    getString(args, "stream", ""),
 	}
-	if p.Timeout < 0 || p.Timeout > 60 {
-		// NO UPPER BOUND: this is the same number the `timeout` argument documents as a
-		// recommendation. Refusing it here would make the tool's own schema a lie.
+	if p.Timeout < 0 {
+		// THERE IS NO UPPER BOUND. `timeout` is documented as a recommendation, not a
+		// ceiling (see the window section of the guide): how long a command may take is
+		// the caller's bill to pay, and the caller is the only party that can see its own
+		// link and its own watchdog. A ceiling here made the tool's own schema a lie.
+		//
+		// It used to read `> 60` while the comment beside it said NO UPPER BOUND, so any
+		// window above a minute was refused — and the message described only the negative
+		// case, naming the positive number it had just rejected (issue #168: `timeout: 90`
+		// answered "timeout must not be negative, got 89.35"). A caller cannot tell from
+		// that whether to lower the number or wait.
 		return readParams{}, toolError(CodeInvalidArgument, "%s", fmt.Sprintf("timeout must not be negative, got %v", p.Timeout))
 	}
 	if err := transcript.ValidateParams(p); err != nil {

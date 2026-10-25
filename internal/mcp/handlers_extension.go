@@ -15,7 +15,11 @@ import (
 // restated here rather than derived from the reconciler because the tool's
 // surface is a decision about what an agent may do, not about what the
 // reconciler can do.
-var extensionActions = []string{"list", "get", "create", "update", "delete", "retry"}
+//
+// restart is retry's other name, and the one a caller looks for: the action rebuilds
+// a session, which is what "restart" means and what "retry" only implies. Both are
+// accepted so neither entrance has to know which word the other one chose.
+var extensionActions = []string{"list", "get", "create", "update", "delete", "retry", "restart"}
 
 // extensionToolDescription is the extension surface in one paragraph. The tool
 // is the only place an agent hears about extensions, so it has to carry both
@@ -71,7 +75,7 @@ func (s *Server) handleExtensionOps(ctx context.Context, request mcpgo.CallToolR
 		return s.handleExtensionUpdate(ctx, request)
 	case "delete":
 		return s.handleExtensionDelete(ctx, request)
-	case "retry":
+	case "retry", "restart":
 		return s.handleExtensionRetry(ctx, request)
 	default:
 		return toolError(CodeInvalidArgument, "action must be one of %s", strings.Join(extensionActions, ", ")), nil

@@ -135,6 +135,22 @@ func testShellIdleArgs() []any {
 
 func testReadOutputUntil(t *testing.T, s *Server, shellID, marker string, timeout time.Duration) string {
 	t.Helper()
+	return testReadOutputUntilCount(t, s, shellID, marker, 1, timeout)
+}
+
+// testReadOutputUntilCount waits until the marker has been seen want times, and
+// returns everything it accumulated.
+//
+// THE COUNT MATTERS BECAUSE AN ECHO IS NOT AN ANSWER. A terminal echoes the line it
+// was given before the shell runs it, so a marker appears twice for one command, and a
+// caller that stops at the first occurrence has not waited for the command at all. A
+// test that then compares two snapshots of the transcript is comparing two photographs
+// of a moving thing (issue #189).
+//
+// The reads CONSUME (no offset), so each call sees only the bytes that arrived since
+// the last one — which is why the count has to be accumulated across them.
+func testReadOutputUntilCount(t *testing.T, s *Server, shellID, marker string, want int, timeout time.Duration) string {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var output string
 	for time.Now().Before(deadline) {
@@ -151,7 +167,7 @@ func testReadOutputUntil(t *testing.T, s *Server, shellID, marker string, timeou
 		}
 		readM := parseResult(t, readResult)
 		output += readM["output"].(string)
-		if strings.Contains(output, marker) {
+		if strings.Count(output, marker) >= want {
 			break
 		}
 	}
@@ -752,25 +768,29 @@ func TestHandleReadOutput_InvalidTimeout(t *testing.T) {
 	m := parseResult(t, startResult)
 	shellID := m["shell_id"].(string)
 
-	for _, timeout := range []float64{-1, 61, 999} {
+	// ONLY A NEGATIVE TIMEOUT IS A MISTAKE. The window is the caller's bill to pay, so
+	// a large one is a request and not an error: `timeout: 61` and `timeout: 999` used
+	// to be refused by an upper bound the comment beside it already denied, and the
+	// message described the negative case while naming a positive number (issue #168).
+	// This test used to assert that refusal, which is what made the lie look intended.
+	for _, timeout := range []float64{61, 999, 0} {
 		req := makeRequest(map[string]any{
 			"shell_id": shellID,
 			"timeout":  timeout,
 		})
 		result, _ := s.handleReadOutput(context.Background(), req)
-		if !result.IsError {
-			t.Fatalf("expected error for timeout %v", timeout)
+		if result.IsError {
+			t.Fatalf("timeout %v is a window, not an error: %s", timeout, result.Content[0].(mcpgo.TextContent).Text)
 		}
 	}
 
-	// Zero is an explicit non-blocking read and must not require a retry.
-	zeroReq := makeRequest(map[string]any{
+	negReq := makeRequest(map[string]any{
 		"shell_id": shellID,
-		"timeout":  0.0,
+		"timeout":  -1.0,
 	})
-	zeroResult, _ := s.handleReadOutput(context.Background(), zeroReq)
-	if zeroResult.IsError {
-		t.Fatalf("timeout=0 should be accepted: %s", zeroResult.Content[0].(mcpgo.TextContent).Text)
+	negResult, _ := s.handleReadOutput(context.Background(), negReq)
+	if !negResult.IsError {
+		t.Fatal("a negative timeout is a typo, not a wish, and must be refused")
 	}
 }
 

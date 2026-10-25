@@ -114,3 +114,41 @@ func hex4(s string) (uint32, bool) {
 	}
 	return v, true
 }
+
+// TrailingEscapeStart reports where in s an escape begins that s cuts short — a
+// \uXXXX with fewer than four hex digits, or a lone backslash at the very end — or
+// -1 when s does not end inside one.
+//
+// WHY A CALLER WANTS THIS. `read --at` serves a frame a slice at a time, and the
+// offset it hands back for the next slice is a byte count it chose. A count that
+// lands between the \u and its hex digits gives the next reader the leftovers: the
+// seam reads "17e讯云" instead of "腾讯云". Backing off to this index is the same job
+// the UTF-8 boundary check does for a character cut in half — and it belongs here,
+// next to the code that knows what an escape is, rather than being counted a second
+// time by whoever is doing the slicing.
+func TrailingEscapeStart(s string) int {
+	i := strings.LastIndexByte(s, '\\')
+	if i < 0 {
+		return -1
+	}
+	tail := s[i:]
+	// \uXXXX is six bytes; a longer tail holds a whole one and is not a cut.
+	if len(tail) >= 6 {
+		return -1
+	}
+	// A lone backslash is the first byte of an escape that has not arrived yet;
+	// anything else shorter than six bytes has to at least look like the start of one.
+	if len(tail) > 1 && !strings.HasPrefix(tail, `\u`) {
+		return -1
+	}
+	// A backslash in an even-length run is itself escaped, so what follows it is
+	// content: "\\u4e2d" is six characters, not one.
+	run := 0
+	for j := i; j >= 0 && s[j] == '\\'; j-- {
+		run++
+	}
+	if run%2 == 0 {
+		return -1
+	}
+	return i
+}

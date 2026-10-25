@@ -319,15 +319,38 @@ func (s *Session) watchTransport(es *sshclient.ExecSession) {
 	s.watchWG.Add(1)
 	go func() {
 		defer s.watchWG.Done()
+		// THE REASON IS LOGGED WHERE AN OPERATOR LOOKS.
+		//
+		// This line used to be Debug, which is BELOW the daemon's default level (Info),
+		// so on a normal run it was never written — and the one durable record of why a
+		// session disappeared was therefore off. The session itself is then gone from
+		// every surface, and the transcript message says the same sentence whether the
+		// network dropped, the far side closed, or something else ended the transport
+		// (issue #176). Four sessions were lost in one afternoon and ruling out the
+		// causes took four separate experiments; the error that would have answered it
+		// was in this discarded line.
+		//
+		// Warn rather than Info because a transport that ends with an error is not the
+		// session's ordinary exit: the caller may not have asked for it.
+		// THE TRANSCRIPT SAYS WHICH OF THE TWO IT WAS, because the caller reads the
+		// transcript and not the log. One sentence for both events ("SSH connection lost
+		// — network disconnected") claimed a cause nobody had established: the same text
+		// covered a dropped network, a closed far side and a restarted relay (issue
+		// #176). The error decides, and it is also in the log line above.
+		message := transportClosedMessage
 		if err := es.WaitTransport(); err != nil {
-			slog.Debug("session transport closed", "session_id", s.ID, "err", err)
+			slog.Warn("session transport lost", "session_id", s.ID, "err", err)
+			// The error IS the cause, and it is the only thing that can distinguish a
+			// dropped network from a far side that went away. The sentence no longer
+			// asserts one on its own (issue #176).
+			message = transportLostMessage + ": " + err.Error()
 		} else {
-			slog.Debug("session transport closed", "session_id", s.ID)
+			slog.Info("session transport closed", "session_id", s.ID)
 		}
 		// A deliberate close (Terminate, Disconnect, Delete) sets closing before it
 		// touches the transport, so markDeadWithMessage drops this notification
 		// instead of reporting an intentional teardown as a network loss.
-		s.markDeadWithMessage(transportLostMessage)
+		s.markDeadWithMessage(message)
 	}()
 }
 
@@ -491,7 +514,23 @@ func (s *Session) Terminate(force bool, gracePeriod time.Duration) {
 // connection dies under it (network loss, remote sshd gone). The per-shell
 // watcher and the session-level transport watcher report the same event, so the
 // text lives here rather than at either call site.
-const transportLostMessage = "❌ SSH connection lost — network disconnected"
+//
+// It names no cause: "— network disconnected" used to be appended here and was a
+// diagnosis this code is not in a position to make. The watcher that HAS the error
+// appends it; the per-shell watcher, which does not, leaves it at this sentence.
+const transportLostMessage = "❌ SSH connection lost"
+
+// transportClosedMessage is the same event with NO error behind it: the transport
+// ended cleanly, which is what a far side that shut down on purpose looks like. It is
+// a separate sentence because the transcript is the only record the caller has, and
+// "network disconnected" is a diagnosis this code is not in a position to make from a
+// nil error.
+const transportClosedMessage = "❌ the session's transport closed"
+
+// exitReasonRequested is why a session the CALLER closed says it is gone. It is
+// recorded rather than left empty because "no reason" and "nobody asked" are
+// different states, and `get` prints whichever it was (issue #176).
+const exitReasonRequested = "❌ closed on request"
 
 // normalizeOnExit maps anything that is not the explicit "close" to the default
 // behaviour. An unknown value must not silently end a user's connection: the
@@ -556,6 +595,13 @@ func (s *Session) markDeadWithMessage(systemMessage string) {
 	if systemMessage != "" && s.closing {
 		return
 	}
+	// A session the CALLER closed has a reason too, and "no reason" is not it: whoever
+	// asks `get` after a close wants to be told the close was theirs, not left to guess
+	// between that and something breaking. beginClosing() sets s.closing before the
+	// deliberate paths call here, which is exactly what distinguishes them.
+	if systemMessage == "" && s.closing {
+		systemMessage = exitReasonRequested
+	}
 	s.markDeadLocked(systemMessage)
 }
 
@@ -582,6 +628,14 @@ func (s *Session) markDeadLocked(systemMessage string) {
 		if s.Status == api.SessionRunning {
 			s.Status = api.SessionExited
 			s.UpdatedAt = clock.Now()
+		}
+		// WHY, not just THAT. This is the only record of the reason that outlives the
+		// process: the caller asks precisely when the session is no longer live, and by
+		// then the transcript (which carries the same sentence) may be gone with the
+		// directory (issue #176). A deliberate close passes "" and keeps the field empty
+		// rather than claiming a cause.
+		if systemMessage != "" && s.ExitReason == "" {
+			s.ExitReason = systemMessage
 		}
 		s.mu.Unlock()
 

@@ -77,21 +77,10 @@ const (
 	// all — while the frame directives' help used to tell callers to quote the frame.
 	spanVerbatim
 
-	// spanArithmetic is the inside of `$(( ))` / `(( ))`, where a QUOTED WORD IS
-	// NOT AN OPERAND.
-	//
-	// The shell reads an arithmetic expansion as an expression, so the data rule's
-	// one quoted word is a syntax error there and the line never runs:
-	//
-	//	run h:1 echo $(( $1 + 1 ))   args ["2"]  ->  echo $(( '2' + 1 ))
-	//	                                             syntax error: operand expected
-	//
-	// The parser already knows where these regions are (an ArithmExp or ArithmCmd
-	// node), so they are reported by the same AST pass that reports payloads rather
-	// than guessed at from the text. Inside one, a value is inserted as the caller's
-	// own bytes — the caller chose an arithmetic context, and only a bare operand can
-	// be one.
-	spanArithmetic
+	// THERE WAS A FOURTH MODE HERE — `spanArithmetic`, the inside of `$(( ))`, where a
+	// quoted word is not an operand. It is gone with the region that produced it: the
+	// whole-word rule refuses a reference glued to the operators around it, so no
+	// accepted statement ever consulted it. See the note in analyzeSource.
 )
 
 // span is a half-open byte range of cmd with the insertion mode that governs it.
@@ -123,7 +112,7 @@ type span struct {
 // region the reference is in.
 func (s span) admits(src string, start, end int) (mode spanMode, raw bool) {
 	switch s.mode {
-	case spanVerbatim, spanArithmetic:
+	case spanVerbatim:
 		// A shell never reads these, so the value is the caller's own bytes.
 		return s.mode, true
 
@@ -623,6 +612,23 @@ func (t *sentinelTable) expand(s string) string {
 	}
 }
 
+// isOneHole reports whether s is EXACTLY one hole and nothing else.
+//
+// This is how a payload declared `var` is checked: the caller wrote `$1`, the source
+// the parser sees holds this call's stand-in token for it, and "the payload is one
+// token, alone" is the same statement as "the payload is one variable reference".
+func (t *sentinelTable) isOneHole(s string) bool {
+	if t == nil || !strings.HasPrefix(s, t.prefix) || !strings.HasSuffix(s, "__") {
+		return false
+	}
+	digits := s[len(t.prefix) : len(s)-2]
+	if digits == "" {
+		return false
+	}
+	id, err := strconv.Atoi(digits)
+	return err == nil && id >= 0 && id < len(t.vals)
+}
+
 // expandStatement fills the raw holes of one parsed statement.
 //
 // It runs AFTER parsing, so the Statement's fields already hold the sentinels the
@@ -689,4 +695,85 @@ func isIdentStart(c byte) bool {
 
 func isIdentPart(c byte) bool {
 	return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+// spell renders a substituted string back the way the caller wrote it.
+//
+// It exists for ERROR TEXT ONLY. A refusal that quotes `a__hole_9f3c_0__` tells the
+// caller their input contains something it does not — the marker is this parser's
+// bookkeeping, and leaking it turns a teaching error into a puzzle.
+func (t *sentinelTable) spell(s string) string {
+	if t == nil || t.prefix == "" {
+		return s
+	}
+	for i := range t.vals {
+		s = strings.ReplaceAll(s, t.prefix+strconv.Itoa(i)+"__", "$"+strconv.Itoa(i+1))
+	}
+	return s
+}
+
+// gluedReference reports whether s holds a hole that is not a whole word.
+//
+// THE WHOLE-WORD RULE, IN ONE PLACE. A reference may be the whole word it sits in, and
+// that is all: `a$1`, `/tmp/$1` and `$1/b` are one word built from two languages. The
+// test is the boundary around each hole, not the shape of the whole string, because the
+// string may hold SEVERAL words — a RestValue flag (`--argv sh -c $1`) is a word list,
+// and each word in it is judged on its own.
+//
+// The marker carries a random seed, so a caller whose own text looks like a hole does
+// not match this prefix and is left alone.
+func (t *sentinelTable) gluedReference(s string) bool {
+	if t == nil || t.prefix == "" {
+		return false
+	}
+	for at := 0; at < len(s); {
+		i := strings.Index(s[at:], t.prefix)
+		if i < 0 {
+			return false
+		}
+		i += at
+		j := i + len(t.prefix)
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j+2 <= len(s) && s[j:j+2] == "__" {
+			end := j + 2
+			if (i > 0 && !isSpaceByte(s[i-1])) || (end < len(s) && !isSpaceByte(s[end])) {
+				return true
+			}
+			at = end
+			continue
+		}
+		at = i + len(t.prefix)
+	}
+	return false
+}
+
+// isOneWordHole reports whether s is EXACTLY one reference, quotes aside.
+//
+// THE WHOLE-WORD RULE, ASKED AT THE ONLY LEVEL WHERE IT HAS AN ANSWER. A word is the
+// unit both grammars agree on, so the question is not "does this string contain a
+// reference" but "is this string, as one word, nothing but a reference". Whitespace is
+// not the test — `$(( $1 + 1 ))` has spaces around the reference and is still one word
+// that means two things.
+//
+// A quoted reference is still a whole-word reference: the quotes are how the caller
+// wrote a word, not a second language.
+func (t *sentinelTable) isOneWordHole(s string) bool {
+	if t == nil || t.prefix == "" {
+		return false
+	}
+	s = trimOneQuotePair(s)
+	if !strings.HasPrefix(s, t.prefix) || !strings.HasSuffix(s, "__") {
+		return false
+	}
+	return t.isOneHole(s)
+}
+
+// trimOneQuotePair removes one matching pair of surrounding quotes, if present.
+func trimOneQuotePair(s string) string {
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+		return s[1 : len(s)-1]
+	}
+	return s
 }

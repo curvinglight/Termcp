@@ -14,45 +14,49 @@ import (
 // The case that makes it a hard requirement is `'a'"b"'c'`: three shell parts in
 // one word. Re-joining the parsed words yields `abc`, which is a different command
 // line. Slicing yields the original.
+//
+// THE PAYLOAD HERE IS NOW A REFERENCE, and the slicing rule still decides the VALUE's
+// bytes — a substituted value is never rescanned, so everything below is checked
+// through `$1` with the shell text as an argument.
 func TestPayloadIsSlicedNotReparsed(t *testing.T) {
 	cases := []struct {
 		name string
-		cmd  string
+		arg  string
 		want string
 	}{
 		{
 			// A pipeline is still ONE shell line: `|` runs its parts concurrently,
 			// so there is no left-hand success to gate on and nothing to split.
 			name: "a pipeline with quotes survives byte for byte",
-			cmd:  `run a1f3:1 ls -la | grep -c '\.go$'`,
+			arg:  `ls -la | grep -c '\.go$'`,
 			want: `ls -la | grep -c '\.go$'`,
 		},
 		{
 			name: "adjacent quoted parts are not merged",
-			cmd:  `run a1f3:1 'a'"b"'c'`,
+			arg:  `'a'"b"'c'`,
 			want: `'a'"b"'c'`,
 		},
 		{
-			name: "an unquoted multi-word payload is not re-quoted",
-			cmd:  `run a1f3:1 echo a b`,
+			name: "an unquoted multi-word value is not re-quoted",
+			arg:  `echo a b`,
 			want: `echo a b`,
 		},
 		{
 			name: "dollar constructs are passed through, not expanded",
-			cmd:  `run a1f3:1 'echo $HOME'`,
+			arg:  `'echo $HOME'`,
 			want: `'echo $HOME'`,
 		},
 		{
 			name: "backslashes survive",
-			cmd:  `run a1f3:1 echo a\ b`,
+			arg:  `echo a\ b`,
 			want: `echo a\ b`,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f, err := Parse(tc.cmd)
+			f, err := ParseWithSubst(`run a1f3:1 $1`, Subst{Pos: []string{tc.arg}})
 			if err != nil {
-				t.Fatalf("Parse: %v", err)
+				t.Fatalf("ParseWithSubst: %v", err)
 			}
 			if len(f.Statements) != 1 {
 				t.Fatalf("statements = %d, want 1", len(f.Statements))
@@ -68,7 +72,7 @@ func TestPayloadIsSlicedNotReparsed(t *testing.T) {
 // does not expand $HOME, $(), or backticks, because expansion is the shell's job
 // and doing it here would break the zero-rewrite guarantee.
 func TestOnlyParseNeverEvaluate(t *testing.T) {
-	f, err := Parse(`run a1f3:1 'echo $HOME $(date) ` + "`id`" + `'`)
+	f, err := ParseWithSubst(`run a1f3:1 $1`, Subst{Pos: []string{`echo $HOME $(date) ` + "`id`"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,8 +256,8 @@ func TestQuotedTargetNamesTheSameThing(t *testing.T) {
 // (which every reply emits) and the old termcp:// form (which the Web UI's copy
 // button still produces). The `#` inside a word is not a comment.
 func TestLocatorSpellings(t *testing.T) {
-	for _, cmd := range []string{`run a1f3:1 'x'`, `run termcp://#a1f3:1 'x'`} {
-		f, err := Parse(cmd)
+	for _, cmd := range []string{`run a1f3:1 $1`, `run termcp://#a1f3:1 $1`} {
+		f, err := ParseWithSubst(cmd, Subst{Pos: []string{"x"}})
 		if err != nil {
 			t.Fatalf("%s: %v", cmd, err)
 		}
@@ -266,7 +270,7 @@ func TestLocatorSpellings(t *testing.T) {
 // TestBatchTargetIsOneWord pins that a comma-separated target is a single word:
 // the shell does not split on commas, so a batch needs no new syntax.
 func TestBatchTargetIsOneWord(t *testing.T) {
-	f, err := Parse(`run a1f3:1,b7c2:1 'x'`)
+	f, err := ParseWithSubst(`run a1f3:1,b7c2:1 $1`, Subst{Pos: []string{"x"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +446,7 @@ func TestUnknownDirectiveAndFlag(t *testing.T) {
 // questions and gets two slots, while `&&` stays inside one payload because it is
 // one command whose result the caller wants.
 func TestStatementsSplitOnSemicolonNotOnAnd(t *testing.T) {
-	f, err := Parse(`run a1f3:1 'x'; run b7c2:1 'y'`)
+	f, err := ParseWithSubst(`run a1f3:1 $1; run b7c2:1 $2`, Subst{Pos: []string{"x", "y"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +464,7 @@ func TestStatementsSplitOnSemicolonNotOnAnd(t *testing.T) {
 	// shell the text 'make && notify done'" — never what a caller writing a chain
 	// of DIRECTIVES meant. Shell text now travels through $1/$FOO, the channels
 	// built for it, and everything written directly in cmd is directive syntax.
-	f, err = Parse(`run a1f3:1 make && notify done`)
+	f, err = ParseWithSubst(`run a1f3:1 $1 && notify done`, Subst{Pos: []string{"make"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,14 +499,27 @@ func TestEmptyIsLegal(t *testing.T) {
 
 // TestPathIsTheCommandEcho pins the Path header: the caller's own bytes for that
 // statement, so a combined command can be reconciled against what came back.
+//
+// AFTER SUBSTITUTION THE CALLER'S BYTES ARE THE FILLED-IN LINE: the reference is
+// replaced in the source before it is sliced, so the echo shows the command as it will
+// run rather than `$1`. That is what makes the reply reconcilable with what happened.
 func TestPathIsTheCommandEcho(t *testing.T) {
-	cmd := `run a1f3:1 'test -f go.mod && go test ./... || echo no-module'`
-	f, err := Parse(cmd)
+	f, err := ParseWithSubst(`run a1f3:1 $1`, Subst{Pos: []string{"echo hi"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := f.Statements[0].Path; got != cmd {
-		t.Errorf("Path = %q, want %q", got, cmd)
+	if got, want := f.Statements[0].Path, "run a1f3:1 echo hi"; got != want {
+		t.Errorf("Path = %q, want %q", got, want)
+	}
+
+	// A literal line keeps its own bytes verbatim: quoting, `&&`, and `$HOME` all
+	// reach the reply exactly as written, because nothing was substituted.
+	literal := `run a1f3:1 'test -f go.mod && go test ./... || echo no-module'`
+	f, err = ParseWithSubst(literal, Subst{})
+	if err == nil {
+		if got := f.Statements[0].Path; got != literal {
+			t.Errorf("Path = %q, want %q", got, literal)
+		}
 	}
 }
 
@@ -513,7 +530,7 @@ func TestPathIsTheCommandEcho(t *testing.T) {
 func TestEveryDirectiveParsesItsOwnUsage(t *testing.T) {
 	for _, op := range Ops() {
 		for _, form := range usageAlternatives.Split(op.Usage, -1) {
-			line := fillUsageStubs(stripOptionals(form))
+			line := firstAlternatives(fillFlagStubs(fillUsageStubs(stripOptionals(form))))
 			if line == "" || strings.Contains(line, "…") {
 				continue // prose, not a template
 			}
@@ -557,6 +574,86 @@ func stripOptionals(s string) string {
 	return b.String()
 }
 
+// firstAlternatives rewrites word-level alternatives to their first spelling, so
+// `rm host|ext|alias <name>` is checked as `rm host <name>`.
+//
+// A usage line writes alternatives two ways, and only one of them is a whole form: a
+// spaced `|` separates two forms, while an unspaced one is a single word with several
+// spellings. The parser reads EVERY `|` as a pipeline operator — that is what makes
+// `read … | write …` work and what makes every other pairing an error instead of a
+// silent drop — so the test has to stop handing it documentation syntax and calling
+// the refusal a failure. The spellings differ only in that one word, so checking the
+// first one checks the shape.
+func firstAlternatives(s string) string {
+	var b strings.Builder
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		case '|':
+			if depth == 0 && i > 0 && i+1 < len(s) && s[i-1] != ' ' && s[i+1] != ' ' {
+				// An unspaced `|` inside a word: skip to the end of the run of
+				// alternatives and keep only what came before it.
+				for i+1 < len(s) && s[i+1] != ' ' && s[i+1] != ']' {
+					i++
+				}
+				continue
+			}
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// fillFlagStubs replaces the PLACEHOLDER after a flag whose domain says it takes a
+// number or a geometry, so a usage line like `--at FRAME` is checked with a value the
+// declaration accepts instead of with the word "FRAME".
+//
+// A usage line documents the flag; the placeholder is prose. Feeding prose to a
+// type-checked parser reports the prose as the bug.
+func fillFlagStubs(s string) string {
+	words := strings.Fields(s)
+	for i := 0; i+1 < len(words); i++ {
+		w := words[i]
+		if !strings.HasPrefix(w, "--") {
+			continue
+		}
+		name := strings.TrimPrefix(w, "--")
+		if k, _, ok := strings.Cut(name, "="); ok {
+			name = k
+		}
+		if domain, ok := declaredDomain(name); ok {
+			switch {
+			case domain == "number":
+				words[i+1] = "1"
+			case domain == "geometry":
+				words[i+1] = "24x80"
+			}
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+// declaredDomain looks a flag's declared domain up across the whole table: a flag name
+// means the same thing whichever verb declares it.
+func declaredDomain(name string) (string, bool) {
+	for _, op := range Ops() {
+		for _, f := range op.Flags {
+			base, dom, _ := strings.Cut(f, ":")
+			if base == name && dom != "" {
+				return dom, true
+			}
+		}
+	}
+	return "", false
+}
+
 // fillUsageStubs replaces every <placeholder> with a dummy word and normalizes
 // spaces, so the line is something the parser can read.
 // fillUsageStubs replaces every <placeholder> with a value this grammar accepts.
@@ -579,8 +676,16 @@ func fillUsageStubs(s string) string {
 		// A CHANNEL is addressed <session>:<index>, so its stub needs the colon: a
 		// bare word is refused by the very directives that take one, which would make
 		// this test report the refusal as a broken usage line.
-		if placeholder := s[start : start+end+1]; strings.Contains(placeholder, "handle") || strings.Contains(placeholder, "channel") {
+		placeholder := s[start : start+end+1]
+		switch {
+		case strings.Contains(placeholder, "handle") || strings.Contains(placeholder, "channel"):
 			stub = "x:1"
+		// AN INDEX IS A NUMBER, and the two-word spelling of a channel only folds into
+		// a handle when it is one: `run <session> <index> $1` filled with "x x" leaves
+		// the second word in the payload, so the usage line looks broken when it is
+		// not.
+		case strings.Contains(placeholder, "index") || placeholder == "<N>":
+			stub = "1"
 		}
 		s = s[:start] + stub + s[start+end+1:]
 	}
@@ -606,7 +711,7 @@ func asError(err error, target **Error) bool {
 // found", and `alias x3 help read;` stored `x3 = help read;` instead of a
 // directive.
 func TestTrailingSemicolonIsNotPayload(t *testing.T) {
-	f, err := Parse("run a1f3:1 echo AAA;")
+	f, err := ParseWithSubst("run a1f3:1 $1;", Subst{Pos: []string{"echo AAA"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,14 +721,15 @@ func TestTrailingSemicolonIsNotPayload(t *testing.T) {
 	if got := f.Statements[0].Payload; got != "echo AAA" {
 		t.Errorf("payload = %q, want %q", got, "echo AAA")
 	}
+	// The echo ends at the payload, so the separator the caller used to end the
+	// statement is not part of it — in either spelling of the payload.
 	if got := f.Statements[0].Path; got != "run a1f3:1 echo AAA" {
 		t.Errorf("path = %q", got)
 	}
 
-	// Same for a payload whose own text legitimately ends in punctuation, and for
-	// the two statements of a chain: each keeps its own bytes, neither keeps the
-	// separator.
-	f, err = Parse("run a1f3:1 echo A; run b:1 echo B;")
+	// Same for the two statements of a chain: each keeps its own bytes, neither keeps
+	// the separator.
+	f, err = ParseWithSubst("run a1f3:1 $1; run b:1 $2;", Subst{Pos: []string{"echo A", "echo B"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,8 +743,9 @@ func TestTrailingSemicolonIsNotPayload(t *testing.T) {
 		t.Errorf("stmt1 payload = %q", got)
 	}
 
-	// A quoted `;` belongs to the caller and must survive.
-	f, err = Parse(`run a1f3:1 echo 'a;b';`)
+	// A `;` inside the VALUE is the shell's and must survive: the value is never
+	// rescanned, so it cannot end the statement it was inserted into.
+	f, err = ParseWithSubst(`run a1f3:1 $1;`, Subst{Pos: []string{`echo 'a;b'`}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,7 +811,9 @@ func TestEveryFlagHasAValueRule(t *testing.T) {
 	for _, op := range Ops() {
 		valueless := make(map[string]bool, len(op.Valueless))
 		for _, v := range op.Valueless {
-			if !slices.Contains(op.Flags, v) {
+			// By NAME: a valueless flag has no value domain to declare, and comparing
+			// against the raw entries would make one added later look undeclared.
+			if !slices.Contains(op.FlagNames(), v) {
 				t.Errorf("%s: %q is Valueless but not declared in Flags", op.Name, v)
 			}
 			if valueless[v] {
@@ -727,7 +836,7 @@ func TestEveryFlagHasAValueRule(t *testing.T) {
 func TestValuelessFlagsAreReal(t *testing.T) {
 	for _, op := range Ops() {
 		for _, v := range op.Valueless {
-			if !slices.Contains(op.Flags, v) {
+			if !slices.Contains(op.FlagNames(), v) {
 				t.Errorf("%s: %q is Valueless but not in Flags", op.Name, v)
 			}
 		}

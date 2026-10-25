@@ -70,3 +70,26 @@ func TestTheRollbackHeaderIsDocumented(t *testing.T) {
 		}
 	}
 }
+
+// TestTheRunPageSaysTheInterfaceIsImprecise.
+//
+// The reports that keep arriving about a pty share one expectation: that the tool should
+// know whether the command ran, whether something holds the foreground, whether the line
+// was eaten. A person at the same screen cannot know any of that either — they read the
+// screen — and the terminal has never offered a sharper sense. That is the usable model,
+// so it is stated as a rule rather than re-argued per report.
+func TestTheRunPageSaysTheInterfaceIsImprecise(t *testing.T) {
+	for _, want := range []string{
+		// The rule itself.
+		"THE INTERFACE IS IMPRECISE, AND THAT IS THE INTERFACE",
+		// What to do instead of asking for a state.
+		"USE IT THE WAY A HUMAN USES ONE",
+		// And the negative fact an empty reply must not be read as.
+		"an empty window is not evidence that nothing happened",
+	} {
+		if !strings.Contains(runDetail, want) {
+			t.Errorf("help run no longer says %q, so a caller is back to expecting a precise "+
+				"state from an interface that has none", want)
+		}
+	}
+}

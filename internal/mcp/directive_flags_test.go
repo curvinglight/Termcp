@@ -26,6 +26,10 @@ func TestNoDirectiveFlagIsDead(t *testing.T) {
 	src := stripCommentsAndStrings(t, readPackageSource(t))
 	for _, op := range directive.Ops() {
 		for _, f := range op.Flags {
+			// A DECLARED ENTRY MAY CARRY ITS DOMAIN (`offset:number`, `stream:enum=o,e,all`),
+			// and the annotation is part of the declaration rather than the name: the
+			// source reads `stmt.Flag("offset")`, so the name is what this checks.
+			name, _, _ := strings.Cut(f, ":")
 			// A FLAG IS ALIVE ONLY IF SOMETHING READS IT, and the check has to be
 			// syntactic: the old version looked for the quoted name anywhere in the
 			// package, so `--directive` passed on the strength of the word appearing in
@@ -35,16 +39,16 @@ func TestNoDirectiveFlagIsDead(t *testing.T) {
 			// The forms below are the only ways this package reads a flag; a prose
 			// mention or another verb's use of the same word no longer counts.
 			alive := []string{
-				`stmt.Flag("` + f + `")`,
-				`boolFlag(stmt, "` + f + `")`,
-				`atoiFlag(stmt, "` + f + `"`,
-				`setFlagString(args, stmt, "` + f + `"`,
-				`setFlagNumber(args, stmt, "` + f + `"`,
-				`setFlagList(args, stmt, "` + f + `"`,
-				`setFlagArgvList(args, stmt, "` + f + `"`,
-				`setFlagJSONObject(args, stmt, "` + f + `"`,
-				`setFlagJSONList(args, stmt, "` + f + `"`,
-				`[2]string{"` + f + `"`,
+				`stmt.Flag("` + name + `")`,
+				`boolFlag(stmt, "` + name + `")`,
+				`atoiFlag(stmt, "` + name + `"`,
+				`setFlagString(args, stmt, "` + name + `"`,
+				`setFlagNumber(args, stmt, "` + name + `"`,
+				`setFlagList(args, stmt, "` + name + `"`,
+				`setFlagArgvList(args, stmt, "` + name + `"`,
+				`setFlagJSONObject(args, stmt, "` + name + `"`,
+				`setFlagJSONList(args, stmt, "` + name + `"`,
+				`[2]string{"` + name + `"`,
 			}
 			ok := false
 			for _, form := range alive {
@@ -56,7 +60,7 @@ func TestNoDirectiveFlagIsDead(t *testing.T) {
 			if !ok {
 				t.Errorf("%s: flag --%s is accepted by the parser but read by nobody: "+
 					"a caller can set it and the server ignores it. Either consume it or drop it from Flags.",
-					op.Name, f)
+					op.Name, name)
 			}
 		}
 	}

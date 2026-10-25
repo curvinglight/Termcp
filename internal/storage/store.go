@@ -393,6 +393,22 @@ func (s *Store) LoadSessions() ([]api.Session, error) {
 	return out, nil
 }
 
+// ReadSession reads one session's manifest from disk, whether or not any process holds
+// that session in memory.
+//
+// It exists for the caller that has already failed to find a session in the registry and
+// needs to tell "this process never had it" from "the record is here and this process
+// did not load it" (issue #176). LoadSessions answers the same question by reading every
+// session; this reads the one that was asked about.
+func (s *Store) ReadSession(sessionID string) (*api.Session, error) {
+	if err := validateID(sessionID); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readManifest(s.sessionDir(sessionID))
+}
+
 // loadShellsLocked reads the shell manifests under a session directory, ordered
 // by creation time. Caller holds s.mu.
 func (s *Store) loadShellsLocked(sessionID string) []api.Session {

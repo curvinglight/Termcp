@@ -174,10 +174,11 @@ frame is in the log either way, so page it:
   read internal cdp:1 --at 57 --offset 4096   the next 4 KB
   read internal cdp:1 --at 57 --offset 4096 --bytes 512    a smaller page
 
---at pages INSIDE one frame; --since pages forward in TIME. Offsets are bytes and the
-reply reports Offset and Next-Offset, so continuing is copyable. A slice never ends
-in the middle of a character: the boundary backs off, which is why a page can be a
-byte or two short of what you asked for.
+--at pages INSIDE one frame; --since pages forward in TIME. Offsets are bytes of the
+frame as the log holds it (the reply reports Bytes for that size, Decoded-Bytes for
+the same frame as text, then Offset and Next-Offset), so continuing is copyable. A
+slice never ends in the middle of a character or of a \uXXXX escape: the boundary
+backs off, which is why a page can be a byte or two short of what you asked for.
 
 A SCREENSHOT DOES NOT COME BACK AS TEXT. Page.captureScreenshot answers with
 base64, and a 150 KB blob in a reply is neither readable nor cheap. Until the pipe

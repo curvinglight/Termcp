@@ -179,8 +179,17 @@ func TestStoreRejectsPathEscape(t *testing.T) {
 func TestPresetFillsShape(t *testing.T) {
 	t.Run("mcp drives a pipe", func(t *testing.T) {
 		e := Preset(KindMCP)
-		if e.Mode != "pipe" || e.Command == "" {
-			t.Errorf("mcp preset = %+v, wants a pipe with a command", e)
+		if e.Mode != "pipe" {
+			t.Errorf("mcp preset = %+v, wants a pipe", e)
+		}
+		// NO COMMAND, NO ARGS: an MCP server is a program plus its argv, and there is
+		// nothing conventional to guess. `npx -y example-mcp-server` used to be the
+		// default, which was wrong in both directions — a create that named its own
+		// program kept the args (`--command cat` ran `cat -y example-mcp-server`), and
+		// one that named nothing produced a template that validated and could never
+		// run. Leaving it out fails at create time with "mode=pipe requires a command".
+		if e.Command != "" || len(e.Args) != 0 {
+			t.Errorf("mcp preset must not supply a program, got command=%q args=%v", e.Command, e.Args)
 		}
 		for _, id := range []string{capability.ShellInput, capability.ShellKey, capability.ShellOutput} {
 			if !contains(e.Allow, id) {
@@ -231,8 +240,12 @@ func TestApplyDefaultsPreservesAuthorChoices(t *testing.T) {
 	if e.Command != "node" {
 		t.Errorf("author's Command should win, got %q", e.Command)
 	}
-	if e.Args == nil || e.Args[0] != "-y" {
-		t.Errorf("unset Args should take the preset, got %v", e.Args)
+	// An author's command must not arrive with a preset's arguments attached. This
+	// used to assert the opposite — `Command: "node"` and then `Args[0] == "-y"` —
+	// which is the same bug the preset caused at runtime, written down as the
+	// expected behaviour, which is why it survived.
+	if len(e.Args) != 0 {
+		t.Errorf("an author's Command must not inherit preset args, got %v", e.Args)
 	}
 	if e.Notes != mcpNotes {
 		t.Error("unset Notes should take the preset recipe")

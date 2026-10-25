@@ -54,13 +54,22 @@ type Session struct {
 	// an interactive terminal, "pipe" for a line-oriented run-to-exit command).
 	// It is empty on session records — a session is a connection container and
 	// owns no mode. The session_start mode is merely the mode of the first shell.
-	Mode      SessionMode   `json:"mode,omitempty"`
-	Status    SessionStatus `json:"status"` // running | exited | error
-	ExitCode  *int          `json:"exit_code"`
-	CreatedAt int64         `json:"created_at"` // Unix ms
-	UpdatedAt int64         `json:"updated_at"` // Unix ms
-	Rows      int           `json:"rows"`
-	Cols      int           `json:"cols"`
+	Mode     SessionMode   `json:"mode,omitempty"`
+	Status   SessionStatus `json:"status"` // running | exited | error
+	ExitCode *int          `json:"exit_code"`
+	// ExitReason is WHY the session left `running`, in the words the transcript
+	// used: a transport that died under it, a transport that ended cleanly, or a
+	// close the caller asked for. Empty means nothing recorded it.
+	//
+	// It is persisted with the manifest because the caller who needs it is asking
+	// precisely when the session is no longer live: a restarted process restores the
+	// session as DEAD, and "why" is the one fact it cannot reconstruct from anything
+	// else on disk (issue #176). `get` prints it.
+	ExitReason string `json:"exit_reason,omitempty"`
+	CreatedAt  int64  `json:"created_at"` // Unix ms
+	UpdatedAt  int64  `json:"updated_at"` // Unix ms
+	Rows       int    `json:"rows"`
+	Cols       int    `json:"cols"`
 	// SSHConfig is the canonical, non-secret profile name used to create this session.
 	// It is separate from Name because callers may rename a session after it starts.
 	SSHConfig string `json:"ssh_config,omitempty"`

@@ -262,7 +262,7 @@ func TestStdioFormIsUnchanged(t *testing.T) {
 	s := newTestServer(t)
 	h := openPipe(t, s, "cat")
 	frame := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
-	if out := termText(t, s, map[string]any{"cmd": "call " + h + " " + frame}); !strings.Contains(out, "202") {
+	if out := termText(t, s, map[string]any{"cmd": "call " + h + " --send " + frame}); !statusLineIs(out, "202") {
 		t.Fatalf("the stdio form stopped accepting a frame:\n%s", out)
 	}
 }

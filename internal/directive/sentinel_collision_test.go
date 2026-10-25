@@ -41,24 +41,27 @@ func TestTheHolePrefixNeverCollides(t *testing.T) {
 // whose cmd carries marker text still gets its values filled, because the prefix was
 // extended rather than reused.
 func TestASourceFullOfTheMarkerStillParses(t *testing.T) {
-	// The marker appears in the cmd itself, in a position the fill pass scans. A naive
-	// fixed prefix would find that text and read it as a hole.
+	// The marker appears in the cmd itself, as a literal the caller wrote. A naive fixed
+	// prefix would find that text and read it as a hole.
+	//
+	// The marker sits in the PATH and the reference in the flag, because a reference has
+	// to be a whole word: `--data __hole__ $1` would be a value followed by a stray word,
+	// which the parser refuses rather than dropping.
 	f, err := ParseWithSubst(
-		"write h file $1 --data __hole__ $2",
-		Subst{Pos: []string{"/tmp/x", "value"}},
+		`write h file __hole__ --data $1`,
+		Subst{Pos: []string{"value"}},
 	)
 	if err != nil {
 		t.Fatalf("ParseWithSubst: %v", err)
 	}
 	st := f.Statements[0]
-	if st.Key != "/tmp/x" {
-		t.Errorf("key = %q, want /tmp/x — a marker in the source swallowed the fill", st.Key)
+	// The marker text the CALLER wrote stays their bytes: the collision path is what
+	// makes a marker-shaped literal survive while a reference beside it is filled.
+	if st.Key != "__hole__" {
+		t.Errorf("key = %q, want the caller's own marker text", st.Key)
 	}
-	// The marker text the CALLER wrote is their bytes, and a flag value is one word:
-	// `--data __hole__ $2` hands the flag the marker and leaves $2 as a positional.
-	// The point is that the marker was not read as a hole.
 	d, _ := st.Flag("data")
-	if d != "__hole__" {
-		t.Errorf("data = %q, want the caller's own marker text", d)
+	if d != "value" {
+		t.Errorf("data = %q, want the reference filled in", d)
 	}
 }

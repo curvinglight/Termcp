@@ -359,7 +359,10 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 			return Window{}, errf(ErrOperation, "%s", err.Error())
 		}
 		end := src.Live.ReaderCursor(p.ReaderID)
-		total := src.Live.BufferLen()
+		// The source's length, not the buffer's: the log may hold bytes the buffer has
+		// not been given yet, and a reply that names a smaller total than the channel
+		// has is a false fact (see Source.Len).
+		total, _ := src.Len()
 		// The browser path strips ANSI inside ReadTerminalStream, so `out` is the
 		// rendered form and `raw` is what it was rendered from. Checking the RAW
 		// bytes is what makes the refusal honest: a stripped string could pass

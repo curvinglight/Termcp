@@ -25,7 +25,7 @@ func TestAPtyOpenWaitsForTheShellToSpeak(t *testing.T) {
 
 	// THE WRITE HAPPENS IMMEDIATELY, which is the whole point: no sleep, no wait for a
 	// prompt, because the open already waited.
-	termText(t, s, map[string]any{"cmd": "run " + h + " echo ready-marker"})
+	termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"echo ready-marker"}})
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -51,7 +51,7 @@ func TestAPipeOpenDoesNotWait(t *testing.T) {
 
 	// And its input still arrives: a pipe buffers, so the bytes are there when the
 	// process reads them.
-	termText(t, s, map[string]any{"cmd": "run " + h + " hello-pipe"})
+	termText(t, s, map[string]any{"cmd": "run " + h + " $1", "args": []any{"hello-pipe"}})
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		// A zero timeout makes the read a peek: without it every poll would wait out the
@@ -75,7 +75,7 @@ func TestAChildChannelIsAlsoReadyWhenItAnswers(t *testing.T) {
 	second := handleFrom(t, termText(t, s, map[string]any{"cmd": "open " + sid + " --name s2"}))
 	defer termText(t, s, map[string]any{"cmd": "close " + second})
 
-	termText(t, s, map[string]any{"cmd": "run " + second + " echo second-marker"})
+	termText(t, s, map[string]any{"cmd": "run " + second + " $1", "args": []any{"echo second-marker"}})
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if strings.Contains(termText(t, s, map[string]any{"cmd": "read " + second + " --from-line 1", "timeout": 0}), "second-marker") {

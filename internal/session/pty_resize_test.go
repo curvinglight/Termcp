@@ -53,23 +53,43 @@ func TestSession_PtyResizeReachesChild(t *testing.T) {
 	// askSize runs the size command in the shell and returns until the child
 	// reports exactly rows x cols (empty when it never does).
 	//
-	// Send ONCE, then only read. The earlier version re-sent the command on every
-	// poll iteration, so a slow first read (Windows PowerShell taking longer than
-	// the 300ms read window to echo anything) queued a second copy behind the
-	// first. The output then contained several interleaved echoes of the command
-	// and never matched the marker — a failure that looked like "the resize did
+	// ASK AGAIN, DON'T JUST KEEP READING (issue #189).
+	//
+	// A window-change REPLY IS NOT "THE TERMINAL WAS RESIZED". The server records the
+	// new window and hands it to a goroutine (`sess.winch <- win`, then `req.Reply`) —
+	// so the client's WindowChange returns while the pty may still be the old size, and
+	// this test then ran `stty size` into that gap. The child printed the OLD geometry
+	// and the answer was FINAL: polling the output for ten seconds cannot turn one
+	// answer into another, which is why the failure was reported as "the resize never
+	// reached the child" and why it only appeared under load (a longer gap).
+	//
+	// Asking again is what a person does with a terminal, and it is the only thing that
+	// can observe a state that settles after the request was acknowledged.
+	//
+	// THE COMMAND IS STILL SENT ONCE PER ATTEMPT, not once per poll iteration: an
+	// earlier version re-sent on every read, so a slow first read queued a second copy
+	// of the line behind the first and the output contained several interleaved echoes
+	// that never matched the marker — a failure that looked like "the resize did
 	// not reach the child" but was the test typing over itself.
 	askSize := func(rows, cols int) string {
 		t.Helper()
 		want := marker + fmt.Sprintf("%d %d", rows, cols)
-		if err := s.PrimaryShell().SendTerminalBytes([]byte(testShellInput(sizeCmd)), false); err != nil {
-			t.Fatalf("send size command: %v", err)
-		}
-		var out string
 		deadline := time.Now().Add(10 * time.Second)
+		var out string
 		for time.Now().Before(deadline) {
-			chunk, _ := s.ReadOutput(context.Background(), 300*time.Millisecond, true, 0, 0)
-			out += chunk
+			if err := s.PrimaryShell().SendTerminalBytes([]byte(testShellInput(sizeCmd)), false); err != nil {
+				t.Fatalf("send size command: %v", err)
+			}
+			// One answer per attempt: read until the marker shows up or the window
+			// closes, then ask again.
+			attempt := time.Now().Add(2 * time.Second)
+			for time.Now().Before(attempt) {
+				chunk, _ := s.ReadOutput(context.Background(), 300*time.Millisecond, true, 0, 0)
+				out += chunk
+				if strings.Contains(chunk, marker) {
+					break
+				}
+			}
 			if strings.Contains(out, want) {
 				return out
 			}

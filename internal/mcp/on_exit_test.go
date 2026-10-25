@@ -178,13 +178,16 @@ func TestOnExitIsDiscoverableOnTheWire(t *testing.T) {
 	}
 
 	// The flag must be accepted by the parser, and an unknown value must not be
-	// silently coerced: the handler validates it, so a typo is an error rather
+	// silently coerced: the value's domain is declared WITH the flag (`on-exit:enum=
+	// keep,close`), so the parser refuses a typo before any handler runs — rather
 	// than a session that quietly stays in the running list.
 	if _, err := directive.Parse("connect internal --on-exit close"); err != nil {
 		t.Errorf("--on-exit is not accepted by the connect grammar: %v", err)
 	}
-	if _, err := directive.Parse("connect internal --on-exit bogus"); err != nil {
-		t.Errorf("--on-exit must parse even with an unknown value (the handler validates it): %v", err)
+	if _, err := directive.Parse("connect internal --on-exit bogus"); err == nil {
+		t.Error("--on-exit bogus parsed: a typo must be refused, not read as the default")
+	} else if !strings.Contains(err.Error(), "keep") || !strings.Contains(err.Error(), "close") {
+		t.Errorf("the refusal must list the values the flag takes: %v", err)
 	}
 
 	// And the default is still the old behaviour: a model must not think every

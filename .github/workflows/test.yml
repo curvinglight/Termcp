@@ -43,7 +43,9 @@ jobs:
         # Keep these flags in sync with the Makefile `test` target; the stress
         # variant (make test-stress) perturbs scheduling to flush out lifecycle
         # races that -race cannot see. See docs/agents/testing.md.
-        run: go test ./... -count=1 -shuffle=on -race -timeout 240s
+        # 600s is a hang detector, not a budget: internal/mcp alone is ~190s
+        # locally (issue #189 measured 168-196s across three runs).
+        run: go test ./... -count=1 -shuffle=on -race -timeout 600s
 
       - name: Test pure-API build
         run: |

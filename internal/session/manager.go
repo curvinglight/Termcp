@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/approval"
@@ -37,6 +38,37 @@ type Manager struct {
 	// independent and one must not displace another.
 	activityMu        sync.Mutex
 	activityListeners []func(shellID string, src InputSource, submit bool)
+
+	// persistMu serialises persistOne, because taking a snapshot and writing it are
+	// ONE operation and the code is not shaped like it.
+	//
+	// persistOne reads the session at the top and writes it at the bottom, with the
+	// shell manifests (an fsync each, ~7ms) in between. Without this lock two persists
+	// race, and the loser is the NEWER state: a persist that started before a session
+	// died can finish after the one that recorded why it died, putting the older
+	// manifest back on disk with the reason gone — which is precisely the fact issue
+	// #176 exists to keep.
+	//
+	// Seen as `TestWhyASessionDiedIsRecordedAndSurvivesARestart` failing on CI with the
+	// reason live in memory and empty on disk, and reproduced locally at -cpu=1. It is
+	// not a test-only race: `get` after a restart is where a user asks why their session
+	// disappeared, and the answer was being overwritten.
+	//
+	// Per manager rather than per session: the store already takes one lock per manifest
+	// write, so the fsync order is unchanged, and a map of per-session locks would be
+	// state to keep correct for no measured gain.
+	persistMu sync.Mutex
+
+	// persistHook, when set, runs inside persistOne between taking the snapshot and
+	// writing it — the window the lock above closes. Nil in production; a test uses it to
+	// hold that window open and prove a second persist cannot enter it, which a
+	// probabilistic race test cannot do (measured: forty forced iterations of the real
+	// interleaving still passed with the lock removed).
+	//
+	// An atomic pointer because persistOne reads it from whatever goroutine the session's
+	// exit watcher happens to be on, while the test that installed it is writing it. A
+	// plain field is a data race, and the race detector said so on the first CI run.
+	persistHook atomic.Pointer[func()]
 
 	sessions    sync.Map // string → *Session
 	internalSSH *sshserver.Server
@@ -343,11 +375,16 @@ func (m *Manager) persistOne(id string) {
 	if m.store == nil {
 		return
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	s := m.Get(id)
 	if s == nil {
 		return
 	}
 	sess := s.Info()
+	if hook := m.persistHook.Load(); hook != nil {
+		(*hook)()
+	}
 	// A manifest that fails to write is state the caller believes is durable, so it
 	// is logged rather than discarded. This is not hypothetical: on Windows the
 	// rename can be refused while a reader holds the old manifest open, and when
@@ -416,6 +453,25 @@ func (m *Manager) persist(sessions ...[]api.Session) {
 	for i := range list {
 		m.persistOne(list[i].ID)
 	}
+}
+
+// PersistedSession returns the manifest on disk for a session id, or nil when there is
+// none.
+//
+// It is the answer to a question the registry cannot answer about itself: a caller that
+// failed to find a session wants to know whether this process never had it or whether the
+// record is sitting on disk unloaded (issue #176). Two roads lead to the second: the id
+// was `rm`'d after this process started, or the caller is talking to a different
+// `--data-dir` / a different instance than the one that created the session.
+func (m *Manager) PersistedSession(sessionID string) *api.Session {
+	if m.store == nil || sessionID == "" {
+		return nil
+	}
+	sess, err := m.store.ReadSession(sessionID)
+	if err != nil || sess == nil {
+		return nil
+	}
+	return sess
 }
 
 // RestoreDead loads persisted sessions into the registry as read-only DEAD

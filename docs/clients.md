@@ -242,7 +242,8 @@ curl -sS -X POST http://<host>:18765/api/term -d '{"cmd":"help run"}'  # 单条�
 **slot 里的失败**（HTTP 仍是 2xx），按 slot 读 `code`。
 
 端到端一句「打开 termcp://rock64 并执行 `uname -a`」即可完成：`{"cmd":"pty
-termcp://rock64"}` 建会话，然后 `{"cmd":"run <handle> uname -a"}` 发命令并读回输出。
+termcp://rock64"}` 建会话，然后 `{"cmd":"run <handle> $1","args":["uname -a"]}`
+发命令并读回输出——**命令行走 `args` 值，不写进 `cmd`**（`run` 的 payload 只接一个变量引用）。
 
 ## 接入脚本 / 程序（REST API）
 

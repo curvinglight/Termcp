@@ -41,7 +41,7 @@ func TestNumericFlagsRefuseNonNumbers(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := termText(t, s, map[string]any{"cmd": tc.cmd})
-			if !strings.Contains(got, "400") {
+			if !statusLineIs(got, "400") {
 				t.Fatalf("a non-numeric value must be a 400:\n%s", got)
 			}
 			if !strings.Contains(got, tc.want) {
@@ -62,7 +62,7 @@ func TestRefusedNumericFlagHasNoEffect(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	before := ptySize(t, s, h)
-	if got := termText(t, s, map[string]any{"cmd": "resize " + h + " abc 999"}); !strings.Contains(got, "400") {
+	if got := termText(t, s, map[string]any{"cmd": "resize " + h + " abc 999"}); !statusLineIs(got, "400") {
 		t.Fatalf("resize abc must be refused:\n%s", got)
 	}
 	if after := ptySize(t, s, h); after != before {
@@ -83,12 +83,12 @@ func TestResizeRefusesNonPositiveSizes(t *testing.T) {
 		"resize " + h + " 5 -5",
 	} {
 		got := termText(t, s, map[string]any{"cmd": cmd})
-		if !strings.Contains(got, "400") || !strings.Contains(got, ">= 1") {
+		if !statusLineIs(got, "400") || !strings.Contains(got, ">= 1") {
 			t.Errorf("%q must be refused with the bound:\n%s", cmd, got)
 		}
 	}
 	// A real size still works, and really takes effect.
-	if got := termText(t, s, map[string]any{"cmd": "resize " + h + " 42 142"}); !strings.Contains(got, "204") {
+	if got := termText(t, s, map[string]any{"cmd": "resize " + h + " 42 142"}); !statusLineIs(got, "204") {
 		t.Fatalf("a valid resize must succeed:\n%s", got)
 	}
 	if size := ptySize(t, s, h); size.rows != 42 || size.cols != 142 {

@@ -573,7 +573,7 @@ func TestShortHandleResolvesLikeTheLocator(t *testing.T) {
 
 	// Writes and reads go through the same door, so a handle that resolves for a
 	// read must be the one a run writes to.
-	if out := termText(t, s, map[string]any{"cmd": "run " + sid + ":2 echo short-handle"}); !strings.Contains(out, "short-handle") {
+	if out := termText(t, s, map[string]any{"cmd": "run " + sid + ":2 $1", "args": []any{"echo short-handle"}}); !strings.Contains(out, "short-handle") {
 		t.Fatalf("run %s:2 did not reach the channel:\n%s", sid, out)
 	}
 

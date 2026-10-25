@@ -115,10 +115,38 @@ func (s *Server) requireSession(sessionID string) (*session.Session, *mcpgo.Call
 			if sess := s.sessMgr.Get(p.SessionID); sess != nil {
 				return sess, nil
 			}
-			return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' not found", p.SessionID))
+			return nil, toolError(CodeSessionNotFound, "%s", s.sessionNotFoundMessage(p.SessionID))
 		}
 	}
-	return nil, toolError(CodeSessionNotFound, "%s", fmt.Sprintf("Session '%s' not found", sessionID))
+	return nil, toolError(CodeSessionNotFound, "%s", s.sessionNotFoundMessage(sessionID))
+}
+
+// sessionNotFoundMessage is the 404 for a session the registry does not hold.
+//
+// "Session 'x' not found" is true and useless: it is the same sentence for a typo, for an
+// id this process never loaded, and for an id that lives in another instance's data
+// directory. The caller cannot tell which, and the three call for different next moves —
+// so when a record for that id IS on disk, the reply says so (issue #176).
+//
+// The check costs one manifest read, and only on the failure path.
+func (s *Server) sessionNotFoundMessage(sessionID string) string {
+	msg := fmt.Sprintf("Session '%s' not found", sessionID)
+	if s.sessMgr == nil {
+		return msg
+	}
+	sess := s.sessMgr.PersistedSession(sessionID)
+	if sess == nil {
+		return msg
+	}
+	// The record is on disk but not in this process. Two roads: a second termcp is using
+	// this data directory (its `ls` lists this session, this one's does not), or this
+	// process did not restore it. Either way the id is not a typo, which is the fact the
+	// bare 404 was hiding.
+	return fmt.Sprintf(
+		"%s in this process, but its record is on disk (status %s, last written %s). "+
+			"The id is not a typo: either another termcp instance is using this data directory, "+
+			"or this one did not restore it. `ls --all` lists what this process knows.",
+		msg, sess.Status, ageOf(sess.UpdatedAt))
 }
 
 // splitBatchIDs splits the comma-separated form of a session_id argument, which

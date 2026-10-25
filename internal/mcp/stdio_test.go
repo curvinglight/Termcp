@@ -241,7 +241,19 @@ func TestStreamFilter_PtyMergesStderr(t *testing.T) {
 	})
 
 	testRunLine(t, s, shellID, testInteractiveOutputCommand("PTY_STDIO_PROBE"))
-	testReadOutputUntil(t, s, shellID, "PTY_STDIO_PROBE", 5*time.Second)
+	// WAIT FOR THE OUTPUT, NOT FOR THE ECHO (issue #189).
+	//
+	// `echo PTY_STDIO_PROBE` puts the marker in the transcript TWICE: once as the
+	// terminal echoing the line the caller typed, and once when the shell runs it. The
+	// echo arrives first, so waiting for ONE occurrence returned while the command's own
+	// output was still on its way — and the two snapshots compared at the end of this
+	// test (`stream=o` against the unfiltered read) are taken a moment apart, so bytes
+	// landing in between make them differ. That is a test that compares two photographs
+	// of a moving thing and calls the difference a filter bug.
+	//
+	// Waiting for the SECOND occurrence means the command has produced its output, which
+	// is the state the comparison is about.
+	testReadOutputUntilCount(t, s, shellID, "PTY_STDIO_PROBE", 2, 5*time.Second)
 
 	m := readStream(t, s, shellID, "e", map[string]any{"offset": 0.0})
 	if out := m["output"].(string); out != "" {

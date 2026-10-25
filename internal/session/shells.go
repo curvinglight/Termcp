@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -51,6 +52,12 @@ func (s *Session) removeChildShell(id string) {
 }
 
 // CreateChildShell opens a new SSH session channel on the parent's existing SSH connection.
+// ErrLabelTaken reports that a channel in this session already carries the label.
+//
+// A sentinel so the surfaces can answer a caller mistake with a 4xx: the label is an
+// argument, and an argument the server cannot use is not a server fault.
+var ErrLabelTaken = errors.New("label already in use")
+
 func (s *Session) CreateChildShell(command string, args []string, pty bool, rows, cols int, name string) (*ChildShell, error) {
 	s.shellStateMu.Lock()
 	defer s.shellStateMu.Unlock()
@@ -60,6 +67,32 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 	s.mu.RUnlock()
 	if s.closing || !running {
 		return nil, fmt.Errorf("session has exited")
+	}
+
+	// A LABEL IS TAKEN OR REFUSED, NOT DUPLICATED (issue #188).
+	//
+	// A label exists so a caller can tell one channel from another, and two channels
+	// carrying the same one defeats exactly that: `ls` shows two rows that read alike and
+	// the caller who wrote the label to distinguish them cannot. Refused rather than
+	// suffixed, because a suffix the caller did not choose is a name it cannot paste
+	// back into the next command.
+	//
+	// CHECKED BEFORE THE SSH CHANNEL EXISTS, so a refused open costs nothing and leaves
+	// no half-made channel behind. An exited channel still holds its label: it stays
+	// addressable for reading, so its name is still in use.
+	if name != "" {
+		taken := ""
+		s.shells.Range(func(_, v any) bool {
+			if sh, ok := v.(*ChildShell); ok && sh.Name == name {
+				taken = fmt.Sprintf("%s:%d", s.ID, sh.Index)
+				return false
+			}
+			return true
+		})
+		if taken != "" {
+			return nil, fmt.Errorf("%w: %q is already the label of %s. Pick another, or close that channel first",
+				ErrLabelTaken, name, taken)
+		}
 	}
 
 	sshClient := s.SSHClient()

@@ -42,6 +42,11 @@ type Kind string
 const (
 	Upload   Kind = "upload"
 	Download Kind = "download"
+	// Copy is one node to another: `read … | write …`. It is neither an upload nor a
+	// download — the bytes never touch this process's caller and usually do not touch
+	// its disk either — and calling it one of the two would make `get task` answer a
+	// question about a direction nobody asked about.
+	Copy Kind = "copy"
 )
 
 // ErrNotFound is returned for an unknown or expired task id.

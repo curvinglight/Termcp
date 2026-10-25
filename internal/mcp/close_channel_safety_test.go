@@ -26,7 +26,7 @@ func TestCloseChannelDoesNotTearDownSession(t *testing.T) {
 	// starting (a heavy profile, a cold page cache, a loaded CI runner) echoes them
 	// later — an immediate read then finds only the shell's banner and the test fails
 	// over the scheduler, not over the behaviour it is pinning.
-	termText(t, s, map[string]any{"cmd": "run " + h2 + " echo IN_S2", "timeout": 2})
+	termText(t, s, map[string]any{"cmd": "run " + h2 + " $1", "args": []any{"echo IN_S2"}, "timeout": 2})
 	waitForContent(t, s, h2, "IN_S2")
 
 	// 1. `close <channel> --force` must be REFUSED (400), not silently destroy s1.
@@ -40,7 +40,7 @@ func TestCloseChannelDoesNotTearDownSession(t *testing.T) {
 	}
 
 	// 2. s1 must still be fully alive after that refusal.
-	after := termText(t, s, map[string]any{"cmd": "run " + h1 + " echo STILL_ALIVE", "timeout": 2})
+	after := termText(t, s, map[string]any{"cmd": "run " + h1 + " $1", "args": []any{"echo STILL_ALIVE"}, "timeout": 2})
 	if !strings.Contains(after, "STILL_ALIVE") {
 		t.Fatalf("s1 was destroyed by the refused close on s2:\n%s", after)
 	}
@@ -58,7 +58,7 @@ func TestCloseChannelDoesNotTearDownSession(t *testing.T) {
 	}
 
 	// 5. s1 is STILL alive.
-	after2 := termText(t, s, map[string]any{"cmd": "run " + h1 + " echo STILL_ALIVE_2", "timeout": 2})
+	after2 := termText(t, s, map[string]any{"cmd": "run " + h1 + " $1", "args": []any{"echo STILL_ALIVE_2"}, "timeout": 2})
 	if !strings.Contains(after2, "STILL_ALIVE_2") {
 		t.Fatalf("s1 died when s2 was cleanly closed:\n%s", after2)
 	}

@@ -42,8 +42,6 @@ func TestEveryRegionStatesHowItTakesAValue(t *testing.T) {
 		{"a shell line takes it whole", `run s1:1 $1`, Subst{Pos: []string{"a b"}}, `a b`, ""},
 		{"the whole payload is the caller's line", `run s1:1 $1`, Subst{Pos: []string{"a b"}}, `a b`, ""},
 		{"a frame is verbatim", `call s1:1 cdp '{"e":"$1"}'`, Subst{Pos: []string{"2+3"}}, `'{"e":"2+3"}'`, ""},
-		{"an arithmetic expression is bare", `run s1:1 echo $(( $1 + 1 ))`, Subst{Pos: []string{"2"}}, `echo $(( 2 + 1 ))`, ""},
-		{"a heredoc body is text", "run s1:1 cat <<EOF\n$1\nEOF\n", Subst{Pos: []string{"echo C"}}, "cat <<EOF\necho C\nEOF", ""},
 		// A FLAG VALUE IS SUBSTITUTED WITH THE PARSER'S RECOGNITION AND INSERTED BARE. The
 		// two halves come from different places and both are stated here: whether a `$1`
 		// counts is the grammar's answer (so `'$1'` is the caller's literal), and how the

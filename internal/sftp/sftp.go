@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -52,10 +53,22 @@ type FileResult struct {
 
 // FileStatResult holds the result of a file_stat operation.
 type FileStatResult struct {
-	Name     string           `json:"name"`
-	Size     int64            `json:"size"`
-	IsDir    bool             `json:"is_dir"`
-	ModTime  int64            `json:"mod_time,omitempty"` // Unix ms; 0 = unknown
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	IsDir   bool   `json:"is_dir"`
+	ModTime int64  `json:"mod_time,omitempty"` // Unix ms; 0 = unknown
+	// Mode is the permission bits as a caller would chmod them ("0664").
+	//
+	// IT IS HERE BECAUSE "IS THIS EXECUTABLE" WAS UNANSWERABLE (issue #191). A
+	// script that a caller had just written failed `open --argv` with "permission
+	// denied", and every surface that could have said "mode 664" instead reported
+	// size and mtime: the caller went looking at mounts, users and paths while the
+	// fact sat in the stat response nobody had asked for.
+	Mode string `json:"mode,omitempty"`
+	// Uid and Gid name the owner, which is the second half of "why can this not be
+	// run/read": a 755 file owned by someone else is still not yours to write.
+	Uid      string           `json:"uid,omitempty"`
+	Gid      string           `json:"gid,omitempty"`
 	Children []FileStatResult `json:"children,omitempty"`
 }
 
@@ -97,6 +110,15 @@ func (s *Client) StatFile(remotePath string) (*FileStatResult, error) {
 		IsDir:   fi.IsDir(),
 		ModTime: clock.Millis(fi.ModTime()),
 	}
+	// The permission facts ride on the platform's own struct. pkg/sftp's server
+	// reports them, and the internal VFS may not: absent is "unknown", rendered as
+	// an omitted field rather than a made-up 0 — a 0000 would read as "no access at
+	// all", which is a different claim from "this server does not say".
+	if st, ok := fi.Sys().(*sftp.FileStat); ok && st != nil {
+		result.Mode = fmt.Sprintf("%04o", st.Mode&0o7777)
+		result.Uid = strconv.FormatUint(uint64(st.UID), 10)
+		result.Gid = strconv.FormatUint(uint64(st.GID), 10)
+	}
 
 	if fi.IsDir() {
 		entries, err := s.client.ReadDir(remotePath)
@@ -104,12 +126,18 @@ func (s *Client) StatFile(remotePath string) (*FileStatResult, error) {
 			return result, nil // partial result
 		}
 		for _, e := range entries {
-			result.Children = append(result.Children, FileStatResult{
+			child := FileStatResult{
 				Name:    e.Name(),
 				Size:    e.Size(),
 				IsDir:   e.IsDir(),
 				ModTime: clock.Millis(e.ModTime()),
-			})
+			}
+			if st, ok := e.Sys().(*sftp.FileStat); ok && st != nil {
+				child.Mode = fmt.Sprintf("%04o", st.Mode&0o7777)
+				child.Uid = strconv.FormatUint(uint64(st.UID), 10)
+				child.Gid = strconv.FormatUint(uint64(st.GID), 10)
+			}
+			result.Children = append(result.Children, child)
 		}
 	}
 

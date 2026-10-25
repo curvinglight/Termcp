@@ -128,7 +128,32 @@ type Op struct {
 	// The first entry is the DEFAULT: a verb whose kind can be inferred from
 	// TargetKind's shape (channels) lists none, and a verb that needs one lists it.
 	Kinds []string
+	// PayloadType says what the bytes after the target ARE, and it is the declaration
+	// that keeps the directive language and the shell apart.
+	//
+	// THE ZERO VALUE IS "the caller's text, unread", which is what a payload meant
+	// before this field existed — so nothing changed for the directives that do not
+	// say. The one that says is `run` (and `input`): its payload must be EXACTLY ONE
+	// VARIABLE REFERENCE ($1 or $NAME), because that is the only way the shell text
+	// gets into the line as a VALUE instead of being written into the directive
+	// language directly.
+	//
+	// WHY IT MATTERS. `run h:1 ls -la` and `run h:1 $1` with args ["ls -la"] both
+	// reach the shell, but only the second one has a boundary: in the first, the
+	// payload is read by the shell parser at the same time as the directive is read by
+	// this one, so `run h:1 ls | write h:2 file /x` is a shell pipeline into a program
+	// called `write` and `run h:1 echo a; b` is two directives. Every one of those
+	// readings is a guess about which language the caller was speaking, and a guess is
+	// what this refuses to make.
+	PayloadType string
+
 	// Flags lists the accepted option names (without the leading --).
+	//
+	// AN ENTRY MAY CARRY ITS DOMAIN: "offset:number", "stream:enum=o,e,all". The
+	// annotation is part of the same list rather than a second table beside it,
+	// because two lists that have to stay in step is how a declared flag ends up with
+	// no declared domain and nobody notices. A name with no annotation accepts any
+	// value, which is what every flag did before.
 	Flags []string
 	// RetiredFlags documents flags that were removed, paired with their replacement.
 	// An error naming a retired flag tells the caller what to use instead of leaving
@@ -193,6 +218,35 @@ type Op struct {
 	Core bool
 }
 
+// nodeNotes records the one thing about a node that its verbs do not say.
+//
+// THE VERB LINES ARE DERIVED, AND THIS MAP IS NOT. `help <node>` collects every
+// usage line naming the word, because a hand-kept list of verbs drifts the first
+// time a verb is added. This is the case that derivation cannot cover: a
+// capability spelled as a FLAG on an existing verb has no line of its own, and
+// nothing in the table says `--restart` belongs to the ext kind rather than host
+// or alias.
+//
+// So it is kept to one short entry per node, on purpose. An entry that grew into a
+// paragraph would be the signal that the node needs a verb of its own — which is
+// what #181 turned out to be, and why `edit ext <name> --restart` now exists.
+var nodeNotes = map[string]string{
+	"ext": `An extension can also be REBUILT, which is not a verb here because it changes
+nothing:
+
+  edit ext <name> --restart
+
+The process holds the script it started with, so a target whose extension script has
+been updated in place — a git pull changes the file and not the session template —
+needs the session torn down before the new code can run. Nothing else would notice.`,
+}
+
+// NodeNote returns the note for a node, when its verbs do not tell the whole story.
+func NodeNote(name string) (string, bool) {
+	note, ok := nodeNotes[name]
+	return note, ok
+}
+
 // Statement is one directive after parsing.
 type Statement struct {
 	Op     string
@@ -248,6 +302,25 @@ type Statement struct {
 	// opaque token before parsing, so a `&&` inside args[0] can never be mistaken
 	// for an operator here.
 	Cond string
+
+	// Pipe is the statement on the RIGHT of a `|`, when this one is on the left of
+	// one. It is the one pipeline this language has, and it is deliberately narrow:
+	// `read … | write …` copies bytes from one node to another WITHOUT passing them
+	// through the caller's context, which is the only thing a pipeline buys here.
+	//
+	// WHY THIS IS NOT A GENERAL OPERATOR. `|` already means something else one layer
+	// down: inside a payload it belongs to the REMOTE SHELL — `run h:1 $1 | wc -l`
+	// hands the terminal a command line, and the `args` help says so. A second meaning
+	// that depended on which verb was on the left would be a table the caller has to
+	// memorise, and the caller is a model that will guess "shell". So anything that is
+	// not `read | write` is REFUSED by name rather than silently doing one of the two.
+	//
+	// Before this field existed the right side was parsed and thrown away:
+	// `read a1f3 | write a2b4 file /x` was ONE statement, `read`, with err == nil.
+	Pipe *Statement
+	// Piped is true for the statement on the right of a `|`. The dispatcher runs the
+	// pair as one copy; this half on its own has no address to run against.
+	Piped bool
 
 	// Background is true when this statement was terminated with `&`, which makes it
 	// PARALLEL: it runs concurrently with the statements around it instead of waiting
@@ -385,16 +458,16 @@ var ops = []Op{
 		// `connect h --mode nonsense` answered 200 and `--mode pty --argv echo hi`
 		// answered with a pipe — the two ways a flag can lie at once. Removing it makes
 		// the refusal name the flag instead of the caller guessing (issue #143).
-		Flags:     []string{"name", "argv", "rows", "cols", "size", "on-exit"},
+		Flags:     []string{"name", "argv", "rows:number", "cols:number", "size:geometry", "on-exit:enum=keep,close"},
 		RestValue: []string{"argv"},
 		MaxArgs:   1,
 		Usage:     "connect <host> [--argv <command>] [--on-exit keep|close] [--name …]",
 		Detail:    connectDetail},
 	{Name: "open", Core: true, Kind: KindFlags, Target: true, TargetKind: TargetSession,
 		Kinds: []string{"forward", "mcp", "cdp", "jrpc"},
-		Flags: []string{"pipe", "pty", "argv", "name", "on-exit", "rows", "cols", "size",
-			"bind-host", "remote-host", "remote-port", "local-port", "local-host",
-			"dynamic", "remote", "target"},
+		Flags: []string{"pipe", "pty", "argv", "name", "on-exit:enum=keep,close", "rows:number", "cols:number",
+			"size:geometry", "bind-host", "remote-host", "remote-port:number", "local-port:number",
+			"local-host", "dynamic", "remote", "target"},
 		Valueless: []string{"pipe", "pty", "dynamic", "remote"},
 		RestValue: []string{"argv"},
 		Usage:     "open <session> [--argv <cmd> [--pty]]   |   open <session> forward …   |   open <session> mcp|cdp|jrpc <url>   |   open <session> cdp:N --target <targetId>",
@@ -417,7 +490,7 @@ var ops = []Op{
 		// container. A declared kind is recognised, and the dispatcher's default branch
 		// then answers with what to write instead.
 		Kinds: []string{"forward", "mcp", "cdp", "jrpc", "file", "task"},
-		Flags: []string{"grace", "forward-id"},
+		Flags: []string{"grace:number", "forward-id"},
 		RetiredFlags: map[string]string{
 			"force": "--force is gone. `close` stops and keeps the record, `rm` erases it.",
 		},
@@ -433,12 +506,15 @@ var ops = []Op{
 	// --- inside a channel ---
 
 	{Name: "run", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChain,
-		Usage:  "run <channel> <line>   |   run <session> <index> <line>",
-		Detail: runDetail},
+		PayloadType: PayloadVar,
+		Flags:       []string{"tail:number", "grep", "grep-limit:number", "encoding"},
+		Usage:       "run <channel> [--tail N] [--grep RE] $1   |   run <session> <index> $1",
+		Detail:      runDetail},
 	{Name: "input", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChain,
-		Usage:  "input <channel> <text>   |   input <session> <index> <text>",
-		Detail: inputDetail},
-	{Name: "key", Core: true, Kind: KindFlags, Target: true, MinArgs: 1, Flags: []string{"repeat"}, TargetKind: TargetChain,
+		PayloadType: PayloadVar,
+		Usage:       "input <channel> $1   |   input <session> <index> $1",
+		Detail:      inputDetail},
+	{Name: "key", Core: true, Kind: KindFlags, Target: true, MinArgs: 1, Flags: []string{"repeat:number"}, TargetKind: TargetChain,
 		Usage: "key <channel> <key> [--repeat N]"},
 	{Name: "resize", Kind: KindFlags, Target: true, MinArgs: 2, TargetKind: TargetChain,
 		Usage: "resize <channel> <rows> <cols>"},
@@ -451,11 +527,16 @@ var ops = []Op{
 	// --- bytes in and out of a node ---
 
 	{Name: "read", Core: true, Kind: KindFlags, Target: true,
-		Kinds:     []string{"file", "cdp", "mcp", "jrpc"},
-		Flags:     []string{"cursor", "since", "at", "offset", "bytes", "from-line", "tail", "stream", "raw", "grep", "grep-limit", "frame", "encoding"},
+		Kinds: []string{"file", "cdp", "mcp", "jrpc"},
+		Flags: []string{"cursor:number", "since:number", "at:number", "offset:number", "bytes:number",
+			"from-line:number", "tail:number", "stream:enum=o,e,all", "raw", "grep", "grep-limit:number",
+			"frame", "encoding"},
 		Valueless: []string{"raw", "frame"},
-		Usage:     "read <session> <index> [--tail N|--from-line N|--cursor N] [--grep RE]   |   read <session> file <path>   |   read <session> cdp|mcp|jrpc[:N][@target] [--since N] [--grep RE]   |   read <session> cdp:N --at FRAME [--offset BYTES] [--bytes N]",
-		Detail:    readDetail},
+		Usage: "read <session> <index> [--tail N|--from-line N|--cursor N] [--grep RE]   |   " +
+			"read <session> file <path>   |   read <session> cdp|mcp|jrpc[:N][@target] [--since N] [--grep RE]   |   " +
+			"read <session> cdp:N --at FRAME [--offset BYTES] [--bytes N]   |   " +
+			"read <session> <index> | write <session> file <path>",
+		Detail: readDetail},
 	// NO TargetKind: `write <session> file <path>` names a container and
 	// `write <handle> <frame>` names a channel, so a shape check would refuse one of
 	// the two legitimate forms. The dispatcher tells them apart by Kind.
@@ -464,7 +545,8 @@ var ops = []Op{
 		// --size is the truncate target. It was missing, so `--op truncate` could not be
 		// satisfied by any spelling: the handler requires remote_path and size, and the
 		// flag for size did not exist.
-		Flags:  []string{"data", "mode", "local-path", "offset", "length", "size", "old-text", "new-text", "op", "uid", "gid", "atime", "mtime"},
+		Flags: []string{"data", "mode", "local-path", "offset:number", "length:number", "size:number",
+			"old-text", "new-text", "op", "uid:number", "gid:number", "atime:number", "mtime:number"},
 		Usage:  "write <session> file <path> [--data TEXT|--local-path FILE] [--mode …] [--op chmod|truncate|…]",
 		Detail: writeDetail},
 
@@ -498,8 +580,8 @@ var ops = []Op{
 			"default-shell", "default-mode", "default-approval",
 			"jump-host", "jump-user", "jump-port", "jump-password", "jump-private-key", "jump-key-passphrase",
 			"kind", "target", "command", "args", "url", "headers", "allow", "paths", "notes", "enabled",
-			"forwards"},
-		Valueless: []string{"trust-unknown-host", "default-approval", "enabled"},
+			"forwards", "restart"},
+		Valueless: []string{"trust-unknown-host", "default-approval", "enabled", "restart"},
 		RestValue: []string{"args"},
 		Usage:     "edit host|ext|alias <name> [flags]",
 		Detail:    editDetail},
@@ -510,7 +592,13 @@ var ops = []Op{
 		Usage:  "notify [--level info|success|warn|error] [--sticky] [--on <session>] [--title T] <body>",
 		Detail: notifyDetail},
 	{Name: "help", Core: true, Kind: KindFlags,
-		Usage: "help [verb]"},
+		// --all asks for the page instead of the summary. The summary is what a
+		// caller wants most of the time (which flag does what), and the page is what
+		// it wants once it has decided to produce the thing — so the cheap question
+		// gets a cheap answer and the expensive one stays one word away.
+		Flags:     []string{"all"},
+		Valueless: []string{"all"},
+		Usage:     "help [verb] [--all]"},
 }
 
 // spanDetail decodes the one-letter statuses, which are terse by design (they are
@@ -607,6 +695,44 @@ hold a position, the default read answered with the TAIL of the history — the 
 bytes on every call, offsets that never advanced — which reads exactly like the
 live answer and is a different question. --offset 0 is the full replay, and --tail N is still a tail.
 
+A PIPELINE IS A COPY, AND IT IS THE ONLY PIPELINE IN THIS LANGUAGE.
+
+  read a1f3:1 --cursor 0 | write b2c4 file /tmp/log
+
+The bytes go from the left node to the right one WITHOUT passing through your
+context: no window, no rendering, and nothing held in between — the two ends are
+wired straight to each other and the copy streams in chunks. That is the whole
+reason to use it instead of two calls: read-then-write moves the same bytes, but
+it moves them through you.
+
+THE LEFT SIDE'S ADDRESSING IS YOURS; ITS WINDOW IS NOT. --cursor, --offset,
+--from-line, --tail and --stream pick WHICH bytes, exactly as they do on a plain
+read. The window (bytes_limit, lines_limit) does not apply, because a window exists
+to protect a context these bytes never enter — so a copy is the whole span, and the
+call's bytes_limit caps it only when you name one.
+
+A COPY IS RAW, AND A READ IS RENDERED. What lands in the destination is what the
+channel carried — escape sequences and all — because a copy is bytes and the point
+is that they arrive unchanged. A plain read is the opposite by default: it renders
+what a terminal would have shown, which is right for looking at and wrong for
+copying, because a terminal's screen is not the terminal's bytes. If you want the
+rendered text in a file, read it and write it yourself.
+
+THE DESTINATION IS A FILE: write <session> file <path>. A terminal is not a file
+— it echoes, wraps and interprets what it is given, and it cannot say "done" — so
+a copy into a channel is refused by name rather than arriving corrupt.
+
+IT ANSWERS 202 WITH A RECEIPT, like every other transfer. A copy is measured in the
+link's time, not in milliseconds, and a call that waited for it would be killed
+partway by whatever watchdog is in front of you. get task <id> waits, and
+reports progress while it runs.
+
+| ANYWHERE ELSE IS REFUSED, and the reason is that it already means something one
+layer down: inside a payload it belongs to the REMOTE SHELL. run h:1 $1 with args
+["ls | wc -l"] is a shell pipeline. Only read | write is a termcp pipeline, so
+every other pairing is an error naming the rule rather than a guess about which of
+the two you meant.
+
 --grep RE FILTERS BEFORE THE WINDOW, AND THE DIFFERENCE MATTERS. The pattern runs
 over this daemon's own transcript — the command already finished, its bytes are
 here, and shipping 2000 lines so you can find three of them is the most expensive
@@ -630,7 +756,17 @@ decoded before anything else looks at them, so --grep matches characters rather
 than byte sequences and a JSON-RPC frame from an extension that prints GBK is
 readable at all. Content-Range still counts the bytes in the buffer, so paging by
 --cursor keeps working: gbk, gb18030, cp936, big5, shift_jis, euc-kr,
-windows-1252.
+windows-1252, utf-16 (utf-16le / utf-16be).
+
+UTF-16 IS NOT A CORNER CASE ON WINDOWS: PowerShell 5.1 redirects with it (a BOM and
+UTF-16LE) unless told otherwise, so a log produced by the redirection this tool
+recommends comes back as a BOM followed by every ASCII byte and a zero — mode: text,
+and unreadable (issue #177). utf-16 reads the BOM to decide the byte order, which is
+the form to prefer: the caller usually cannot see how the file was written, and the
+file says.
+The read names it for the caller too — a window of UTF-16 bytes that is not valid
+UTF-8 is refused with the charset its BOM confirms, so the flag is needed only to
+say "decode it", exactly as above.
 
 It also decides where a byte window may end: a window that cuts inside a
 character withholds those bytes (they stay unread, the next read delivers them
@@ -708,8 +844,10 @@ resumes exactly where this one stopped.
 
 --at PAGES INSIDE ONE FRAME, which is the other axis. A frame too big to inline is
 answered as a receipt naming its number; --offset starts that frame at a byte and
---bytes sets the page size (4 KB by default). Offsets are bytes, the reply reports
-Offset and Next-Offset, and a slice never ends in the middle of a character.
+--bytes sets the page size (4 KB by default). Offsets are bytes of the frame AS THE
+LOG HOLDS IT — the reply reports Bytes for that size and Decoded-Bytes for the same
+frame as text, then Offset and Next-Offset to continue. A slice never ends in the
+middle of a character or of a \uXXXX escape.
 
   read internal cdp:1 --at 57 --offset 0
   read internal cdp:1 --at 57 --offset 4096 --bytes 512
@@ -721,6 +859,14 @@ of a line-oriented pipe and advances ONLY when that frame was complete: an incom
 frame is held for the next call rather than cut in half. That cursor is kept per
 channel, independent of the plain byte reader — so reading raw bytes never consumes
 a frame, and reading frames never shifts the byte position of a plain read.
+
+WHAT COUNTS AS A FRAME IS THE MESSAGE, NOT THE JSON. A frame is an object carrying
+id or method, or an array of such objects (a batch); a value that is merely legal
+JSON is skipped, and the scan keeps looking behind it. This is not pedantry: a
+server's own log line can hold JSON — PowerShell writes InputObject[0]: some text —
+and a caller handed [0] reads a peer that answered with an empty array. When
+nothing in the window is a message, the 204 quotes the bytes it looked at, so a
+caller can tell a banner from a slow peer.
 
 AN EMPTY REPLY IS USUALLY EARLY, NOT BROKEN. On a live pty a 204 means "sampled,
 nothing new since the cursor" — the command may simply not have printed yet. The
@@ -771,6 +917,15 @@ see your own text answered by the other program, it was input, not a command. Ch
 the echo when a reply makes no sense, and send the matching key (key <channel>
 ctrl-c, ctrl-d) or write the answer deliberately.
 
+THE INTERFACE IS IMPRECISE, AND THAT IS THE INTERFACE — not a defect waiting to be
+fixed. There is no precise state to ask for: a person at the same screen cannot tell
+"the command ran" from "the program ate my line" except by reading what the screen
+shows, and a terminal has never offered anything better. So the bytes in the reply ARE
+the state, and an empty window is not evidence that nothing happened: it means no
+bytes arrived while you were watching. USE IT THE WAY A HUMAN USES ONE — look, then
+decide what to type next. Demanding a status code for "did it run" is asking for a
+sense the terminal does not have.
+
 SOMEONE ELSE MAY BE USING THIS CHANNEL. That is normal, not a fault: the same
 channel is open in the Web UI, and a person (or a script on the HTTP entrance) can
 type into it between your calls. Nothing ever promises you the channel is yours
@@ -797,6 +952,12 @@ for the stream to go STILL — half a second without a new byte ends the wait �
 falls back to timeout seconds (default 2) only while the command has printed
 nothing at all, where there is nothing else to watch.
 
+The reply says WHICH of the two happened, because the difference is the whole
+question: Completion: quiet means the stream went quiet (the ordinary ending — the
+command may have finished, or may be working without printing), and Still-Running:
+true means the window ran out while bytes were still arriving. Neither one claims
+the command finished, because a pty gives nothing to base that on.
+
 A reply that ends mid-output is not a lost command: the bytes are still in the
 stream. read has its own cursor and does not continue after the sample — it
 repeats what the sample already showed and then follows the stream, which is what
@@ -808,40 +969,97 @@ Content-Range on this reply numbers the CHANNEL's stream, not the reply: bytes
 399 bytes were dropped. The number is where the sample sits, so it stays stable
 across reads and tells you whether you are behind.
 
+Input-At IS WHERE THIS COMMAND'S OUTPUT BEGINS, and it is the one number that makes
+the sample usable on its own:
+
+  run a1f3:1 $1 make       -> 200, Input-At: 4096, Content-Range: bytes 4096-5231/5231
+  read a1f3:1 --offset 4096    the same bytes back, and then it follows the stream
+
+It is present even when the reply is empty, which is the case that needs it most: a
+204 with Input-At says the command was accepted and has produced nothing yet, and the
+same 204 without it is indistinguishable from a cursor that is already past the
+output. It is the offset BEFORE the input — the echo included — so re-reading from
+it gives back this window rather than skipping the line you just typed.
+
+--tail AND --grep ARE THE SAME WINDOW PARAMETERS read HAS, and both are scoped to
+THIS COMMAND's output rather than to the channel. THEY GO BEFORE THE PAYLOAD, because
+the payload is the rest of the line:
+
+  run a1f3:1 --tail 20 $1          the last 20 lines of what this command printed
+  run a1f3:1 --grep ERROR $1       only the lines that match, with their real line numbers
+
+That scoping is the whole point of having them here. A 5000-word scan prints about
+1.4 MB, and the caller wants its last lines or its errors — but the alternative was
+to run and then read, and the read would have had to say where the command's output
+began. --tail is taken from this command's window, so a previous command's unread
+tail is not part of the answer; a trimmed reply says so (Trimmed: the last N of M
+lines) instead of dropping the rest silently. --grep counts MATCHES, not raw lines,
+and does not consume the transcript: two searches see the same bytes.
+
 For a program whose output you need in full, prefer pipe (--argv) on the same
 entry — its exit IS observable, so a read after it returns the whole output.
 
-SENDING SEVERAL SHELL COMMANDS. The payload is ONE line, and a semicolon in cmd
-separates DIRECTIVES, not shell commands: run h:1 pwd; whoami is two termcp
-statements, and the second one is an unknown directive called whoami. Pass the
-shell text through the args argument instead:
+ONE WORD, ONE LANGUAGE. cmd IS THE DIRECTIVE LANGUAGE: a reference ($1, $2, $NAME) is
+the WHOLE word it sits in, never glued to a literal. There is no shell concatenation
+here, because a word made of two languages is read twice and means something different
+to each reader:
+
+  write h file /tmp/$1                REFUSED
+  write h file /x --data a$1          REFUSED
+  write h file /x --data $(( $1 + 1 ))  REFUSED
+
+The capability is not lost, it is spelled — the whole thing travels as the value:
+
+  cmd: "write h file $1"              args: ["/tmp/x"]
+  cmd: "write h file /x --data $1"    args: ["a-prefix"]
+
+A flag value is ONE word for the same reason: a value that needs a space is quoted
+(--data "a b"), and a value that contains shell punctuation is quoted too — an
+unquoted > or | is the shell's, and it would end the value where the shell grammar
+says so rather than where you did. A command line belongs in args.
+
+THE PAYLOAD IS A VARIABLE, NEVER A LINE. run and input take exactly one reference
+($1, $2, ${10}, or $NAME) and nothing else; the shell text is the value that
+reference carries:
+
+  cmd: "run h:1 $1"                   args: ["cd /app && make test"]
+  cmd: "run h:1 $1"                   args: ["pwd; whoami; date"]
+  cmd: "run h:1 $1"                   args: ["cat <<EOF\nhello\nEOF"]
+
+Writing the line directly is refused, and the reason is not tidiness: the payload
+would then be read by two languages at once. run h:1 ls | write h:2 file /x is
+a shell pipeline into a program called write to one reader and a termcp pipe to
+the other, and on Linux write exists (it messages another user's terminal), so
+the mistake answers with something that looks like a system fault. One reference,
+one language, no guessing.
+
+A semicolon in cmd separates DIRECTIVES, not shell commands: run h:1 pwd; whoami
+is two termcp statements and the second is an unknown directive called whoami.
+That has not changed; what changed is where the shell's own ; goes — inside the
+value:
 
   cmd: "run h:1 $1"                   args: ["pwd; whoami; date"]
   cmd: "run h:1 $1; run h:1 $2; ps"   args: ["make build", "make test"]
 
-A positional value that IS the whole payload reaches the terminal VERBATIM, so
-semicolons, loops, heredocs and quotes are the shell's to read. "The whole
-payload" includes the forms where the line simply ENDS after it — a trailing
-&, ; or && is the separator that closes this directive, not another word of it,
-so all of these hand the terminal a command line:
+THE STATEMENT'S OWN PUNCTUATION STILL WORKS, because it is termcp's and it ends
+the statement rather than the line:
 
-  run h:1 $1 &                       backgrounded
+  run h:1 $1 &                       run this concurrently
   run h:1 $1 ; ls host               this directive, then another
   run h:1 $1 && run h:1 $2           two directives with a condition between
+  run h:1 $1 | write h:2 file /p     a pipeline: copy the bytes there instead
 
-One that has a word BEFORE it is substituted as ONE QUOTED WORD, because there
-the caller named an argument rather than the command line: run h:1 echo $1. When
-a command needs a prefix, put the whole line in one argument:
-args: ["cd /app && make test"].
-
-What follows the reference is the rest of the line, and it does not change the
-answer: run h:1 $1 | wc -l and run h:1 $1 > /tmp/out hand the terminal a command
-line with a pipe or a redirect after it, because the payload of that directive is
-the reference.
+A shell-level &, | or > is the shell's, so it goes in the VALUE:
+args: ["make -j8 > /tmp/build.log 2>&1 &"].
 
 $0 is refused (args is 1-based), and ${N} is the unambiguous spelling at 10 or
-more. Named values are a different channel: vars substitutes $NAME as one quoted
-word of DATA, which is right for a flag value and wrong for a command line.
+more. Named values ($NAME) and positional ones ($1) are ONE channel under two
+spellings: the POSITION decides how a value is inserted, never which table named it,
+so a $NAME that is the whole payload behaves exactly like a $1 that is. What differs
+between the tables is the RECORD, not the insertion — args and vars are written to the
+server log, secrets is not. (This paragraph used to say vars was "wrong for a command
+line" and quoted the value as data; it was true before the two tables were merged, and
+it contradicted the argument's own documentation for as long as it survived.)
 
 EVERY VALUE YOU PASS HAS TO BE NAMED SOMEWHERE IN cmd, and this is checked before
 anything runs. A value nothing references is refused rather than dropped: the
@@ -872,6 +1090,24 @@ terminal would read an empty reply as "no output" instead of "still running".
 --on-exit keep|close decides what happens to a PIPE channel when its process exits:
 keep leaves it readable (the default, so its output is never lost), close frees it
 immediately. It has no meaning on a pty, whose shell does not exit.
+
+--name IS A LABEL FOR THE CHANNEL, and it is not an address:
+
+  open a1f3 --argv sleep 5 --name web
+
+  a1f3:2 pipe (stderr separable: --stream e) [web] (session a1f3, channel 2)
+
+The address stays a1f3:2 — what the reply prints in the first column is what every
+other command takes — and the label is the column ls and get show next to it. It
+exists because a caller running four things at once reads :1 .. :4 and cannot tell
+which is which, and because the numbers are minted in order rather than kept.
+
+A LABEL IS TAKEN OR REFUSED. Two channels in one session cannot share one: the label
+would stop doing the only thing it does, and ls would show two rows that read alike.
+The refusal names the channel that holds it. An exited channel still holds its label
+(it is still addressable for reading), so reuse means choosing another name.
+--name with an empty value is refused too: a channel either has a label or it does
+not, and silently opening an unnamed one hides a name that was never computed.
 
 The other children are named by a KIND before the key:
 
@@ -934,11 +1170,21 @@ THE NOUN IS PART OF THE ADDRESS, not a separate flag: what hangs off a session i
 addressed <session> <kind> <key>. Omitting the kind means channels, whose key is the
 index — so a1f3:1 and a1f3 1 are the same node.
 
-` + "`ls <peer>` asks the peer, not a cache: a tab list one navigation stale would\nhand out target ids that no longer attach."
+` + "`ls <peer>` asks the peer, not a cache: a tab list one navigation stale would\nhand out target ids that no longer attach." + lsChannelsNote
+
+const lsChannelsNote = `
+
+FINISHED CHANNELS ARE FOLDED, and the listing says how many. open --argv per
+command is an ordinary way to work and each one leaves a channel behind that stays
+readable, so ls --shells grows into a wall the caller has to read past to find the
+one it is using. They are not gone: ls --all lists them, their addresses still read,
+and the last line of a folded listing names the count — a listing that dropped them in
+silence would read as "those channels are gone" and the caller would stop looking for
+output it still has.`
 
 const getDetail = `Describe one node: a session, one of its channels, or a peer.
 
-  get a1f3              status, endpoint, mode, age
+  get a1f3              status, endpoint, mode, age, and why it ended
   get a1f3:1            that channel's state
   get a1f3 cdp:1            the connection: endpoint, frame cursor, attached tabs
   get a1f3 cdp:1@<id>       one tab: target, url, enabled domains
@@ -1004,6 +1250,16 @@ const writeDetail = `Write a file on a session.
 or --local-path. The write is a plain overwrite, not an append: use --offset only
 when you mean to patch bytes in place.
 
+PATHS ARE POSIX ON THE WIRE, ON EVERY PLATFORM. SFTP is a POSIX-shaped protocol, so
+a Windows absolute path has a second spelling: C:/tc/x is /C:/tc/x on the wire, and
+that is what a server recognises as absolute. Written as C:/tc/x it is RELATIVE to
+a server that resolves paths against a working directory, which then joins the two
+and fails with a system error about the file NAME — a sentence that says nothing
+about the spelling, and that arrives after an extension's whitelist has already
+admitted the path. Use /C:/... in the request and in the extension's declared
+paths, which are matched against the same string you pass. help read, docs/api.md
+and this page said nothing about it until issue #186.
+
 --local-path IS A TRANSFER AND ANSWERS 202 WITH A RECEIPT. Moving a file over SFTP
 takes as long as the link takes, and a caller behind a tool-call watchdog would
 otherwise be killed partway through — leaving a truncated file on the far side with
@@ -1019,6 +1275,11 @@ no error anywhere. So the call returns in milliseconds:
 get task <id> returns the moment the transfer finishes, and answers with its
 progress when the window expires instead of failing. ls task lists them,
 close task <id> cancels one.
+
+IT CAN ALSO BE THE DESTINATION OF A PIPELINE. read a1f3:1 | write b2c4 file /tmp/x
+copies bytes between two nodes without them passing through the caller's context;
+the content comes from the left side, so --data and --local-path are refused there
+rather than silently ignored. See help read.
 
 THE TARGET NEVER HOLDS A PARTIAL FILE. A whole-file write streams to a temporary
 sibling and is renamed over the target only on a clean exit, so an interrupted or
@@ -1045,7 +1306,23 @@ A HOST ENTRY IS REMOVED WITH rm, NOT edit: rm host prod. Configuration and live 
 share the erase verb because they are the same intent on different halves of the tree —
 delete exists only for the composite form, rm host|ext|alias.
 
-Same gate as create: without --mcp-manage-ssh-configs a host write is refused 403.`
+Same gate as create: without --mcp-manage-ssh-configs a host write is refused 403.
+
+--restart REBUILDS AN EXTENSION'S SESSION, and it is the only thing here that is not
+a configuration change. An edit rebuilds too, but only when it changes the TEMPLATE:
+the reconciler compares a fingerprint, so a session template that reads the same
+builds the same thing and nothing happens. The case that leaves is the one where the
+file is the same and its contents are not — a git pull in a clone, a redeploy — and
+then the process is still running the script it started with:
+
+  edit ext myserver --restart
+
+The reconciler calls this action retry, and retry is accepted too; restart is the
+word a caller reaches for after an update, which is why it is the documented one.
+
+It changes nothing else, so it is refused in combination with any of the flags above
+rather than half-performed: "edit the description" and "rebuild the process" are two
+operations, and a call that asks for both gets neither.`
 
 const deleteDetail = `Remove saved configuration.
 
@@ -1058,19 +1335,23 @@ is removed with rm; a host entry is a saved one and is removed with delete. Keep
 the two verbs apart is what stops "did that stop it or forget it?" from being a
 question.`
 
-const inputDetail = `TYPING IS NOT SUBMITTING. type sends the bytes to the shell's input line and
+const inputDetail = `TYPING IS NOT SUBMITTING. input sends the bytes to the shell's input line and
 stops there; nothing runs until something presses enter. That is what makes it
 useful for driving a TUI, where enter would confirm a menu item instead of starting
 a command — and it is the trap when you meant to run a command:
 
-  type h make        line now holds "make", nothing has run
-  run  h test        appends to it — the shell sees "maketest"
+  input h $1   args: ["make"]     line now holds "make", nothing has run
+  run   h $1   args: ["test"]     appends to it — the shell sees "maketest"
 
-So pair a type with an explicit enter, or do not use type for a command:
+THE TEXT IS A VALUE, like run's command line: a payload here is one reference, so
+anything the terminal should receive — a key sequence, a ;, a quote — travels as
+the value rather than being read as directive syntax.
 
-  type h make; key h enter      type the line, then run it
+So pair an input with an explicit enter, or do not use input for a command:
+
+  input h $1; key h enter       type the line, then run it
   key h enter --repeat 2        enter twice (a TUI that confirms with a blank line)
-  run h make                    one call: type the payload and press enter
+  run h $1                      one call: type the payload and press enter
 
 key takes the KEY NAME from terminal vocabulary — enter, tab, esc, space, up,
 down, left, right, backspace, delete, home, end, pageup, pagedown, or a single
@@ -1078,7 +1359,8 @@ character. --repeat N presses it N times in one call.`
 
 // fileDetail is the file directive's flag map.
 //
-// The one-line Usage can only name the actions, but `file` carries more flags than// any other directive (22, versus 3-7 elsewhere) and each action accepts a
+// The one-line Usage can only name the actions, but `file` carries more flags than
+// any other directive (22, versus 3-7 elsewhere) and each action accepts a
 // different subset. Without this page the flags were reachable only by guessing
 // or by reading the source: `help file` was 106 bytes while `help watch` was 999,
 // so the directive with the most parameters had the least documentation.
@@ -1201,6 +1483,9 @@ DRIVING ONE. ext list gives each extension's status, its handle and the first
 line of its notes; ext get <name> gives the whole template, notes included. Read
 the notes before first use — they are the extension's own operating instructions,
 written by whoever pinned it, and they are the part that changes how you drive it.
+THE LIST SHOWS TEN AND COUNTS THE REST (ls ext --all lists every one), because a
+host with forty extensions is a page of rows and the one you need may be past the
+bottom; a name not shown is still addressable, so nothing is out of reach.
 Only a status of available has handles: probing is a connection attempt in
 flight, unavailable has last_failure and next_retry, disabled is parked by its
 author. Take the handle from the LATEST listing after a restart — a restarted
@@ -1215,10 +1500,15 @@ address terminal work by shell_id. For the same reason, NEVER close, terminate o
 delete an extension's session: it would take down more than the one you are
 looking at. termcp restarts a dead extension on its own; take the new handle.
 
-kind=mcp, stdio: the handle is the SHELL running the server. Drive it with mcp
-tools|send|recv (see help mcp). Frames can arrive in pieces — a result with
+kind=mcp, stdio: the handle is the SHELL running the server. Drive it the way any
+channel is driven — call <handle> <frame> to write one and wait for its reply, or
+read <handle> --frame to take the next frame off the stream. Frames can arrive in
+pieces — a result with
 partial_tail_bytes > 0 is an unfinished frame, so keep reading the same cursor
-until a complete JSON object is in hand; never parse a partial frame. The
+until a complete JSON object is in hand; never parse a partial frame. Only a
+JSON-RPC message is a frame (an object with id or method, or an array of them), so
+a line of the server's own output that happens to hold JSON is reported rather than
+returned. The
 server's logs come on stderr, so read them with --stream e and they never splice
 into a frame. Handshake: initialize, then notifications/initialized, then
 tools/list.
@@ -1662,7 +1952,7 @@ func ParseWithSubst(src string, sub Subst) (*File, error) {
 		// with opaque tokens BEFORE this parse, so a `&&` inside a value is part of
 		// that token and cannot appear here as an operator.
 		for _, part := range flattenCond(stmt) {
-			parsed, ok, err := parseStatement(src, part.stmt)
+			parsed, ok, err := parseStatement(src, part.stmt, sentinels)
 			if err != nil {
 				// The first failure wins: a cmd is one instruction, and reporting the
 				// rest of a broken instruction teaches nothing. A directive the caller
@@ -1677,7 +1967,37 @@ func ParseWithSubst(src string, sub Subst) (*File, error) {
 			if !ok {
 				continue
 			}
+			// The statement's own punctuation, before anything asks about its shape:
+			// a trailing `&` is this language's operator and the payload check has to
+			// know that, or `run h:1 $1 &` looks like a payload with an `&` in it.
+			parsed.Background = part.stmt.Background
+
+			// WHAT THE PAYLOAD IS, BEFORE IT STOPS BEING A REFERENCE.
+			if op, known := Lookup(parsed.Op); known {
+				if err := checkPayloadType(parsed, sentinels, op); err != nil {
+					if derr, ok := err.(*Error); ok {
+						derr.Parsed = len(out.Statements)
+					}
+					return nil, err
+				}
+			}
 			filled := sentinels.expandStatement(parsed)
+			// WHAT THE VALUE IS, AFTER IT IS THE VALUE. The whole-word rule and the
+			// payload rule have to run BEFORE this line, because both are questions
+			// about the shape of the caller's text and a hole is still visible there.
+			// A domain question is the opposite: `--repeat $1` is a number when the
+			// value arrives, and asking before the holes are filled refused it as
+			// "got \"__hole_…\"" — every numeric, enum and geometry flag was
+			// unreachable through a reference, and the caller was told their 3 was not
+			// a number.
+			if op, known := Lookup(filled.Op); known {
+				if err := checkParamDomains(filled, op); err != nil {
+					if derr, ok := err.(*Error); ok {
+						derr.Parsed = len(out.Statements)
+					}
+					return nil, err
+				}
+			}
 			if err := checkTargetKindAfterSubst(filled); err != nil {
 				if derr, ok := err.(*Error); ok {
 					derr.Parsed = len(out.Statements)
@@ -1808,24 +2128,26 @@ func analyzeSource(src string) ([]span, []ref) {
 				r.dq = insideRange(dq, r.start, r.end)
 				refs = append(refs, r)
 			}
-		case *syntax.ArithmExp:
-			// ARITHMETIC CONTEXT COMES FROM THE PARSER. `$(( ))` is an expression, not a
-			// word list, so the quoting that makes a value data would make the
-			// expression invalid — and the node type is the only thing that knows the
-			// difference between a `$1` in an operand and a `$1` in a command line.
-			spans = append(spans, span{start: int(n.Pos().Offset()), end: int(n.End().Offset()), mode: spanArithmetic})
-		case *syntax.Redirect:
-			// A HERE-DOCUMENT BODY IS ITS OWN NODE.
-			//
-			// `Redirect.Hdoc` is the body the parser already read — lines between the
-			// `<<EOF` line and the terminator. A quoted delimiter means the shell
-			// expands nothing in the body, which the grammar mirrors by emitting no
-			// ParamExp nodes; an unquoted delimiter DOES emit them, and the span tells
-			// the replacer to insert them bare as text rather than quoted as a word.
-			if n.Hdoc != nil && !wordIsQuoted(n.Word) {
-				spans = append(spans, span{start: int(n.Hdoc.Pos().Offset()), end: int(n.Hdoc.End().Offset()), mode: spanVerbatim})
-			}
 		}
+		// TWO REGION KINDS USED TO BE COLLECTED HERE, and both are unreachable now.
+		//
+		// The rule that a reference is the WHOLE word it sits in (see
+		// checkOneWordOneLanguage) means no reference can sit inside shell syntax any
+		// more, so a region describing shell syntax has nothing left to decide:
+		//
+		//   - ARITHMETIC (`ArithmExp`): `--data $(( $1 + 1 ))` and `run h:1 echo $(( $1 +
+		//     1 ))` are both refused — the reference is glued to the operators around it.
+		//     Every statement that produced one of these spans is refused, so the span
+		//     never reached a decision: measured, the insertion mode it selects
+		//     (`spanArithmetic`) does not appear in a single accepted statement.
+		//   - A HERE-DOCUMENT BODY (`Redirect.Hdoc`): a here-doc needs a redirect, and a
+		//     redirect is refused on a verb that runs no command line, while a payload
+		//     verb's payload must be exactly one reference — `run h:1 $1 <<EOF` is
+		//     refused for that reason. The body's references are refused with it.
+		//
+		// ponytail: this is deleted BECAUSE the whole-word rule holds. Lifting that rule
+		// is the one change that makes both regions live again, and this comment is
+		// where the two walks go back.
 		return true
 	})
 	for _, stmt := range file.Stmts {
@@ -1864,35 +2186,6 @@ func refOfParam(src string, p *syntax.ParamExp) (ref, bool) {
 		name:       name,
 		positional: allDigits(name),
 	}, true
-}
-
-// wordIsQuoted asks the AST whether the delimiter word was quoted.
-//
-// THE GRAMMAR'S OWN MODEL, NOT A STRING SCAN. In a heredoc, what makes the body
-// literal is that any part of the delimiter was quoted — a single quote, a double
-// quote, or an escaped character (`<<\EOF`). The AST tells these three apart by
-// node type and literal contents:
-//   - SglQuoted or DblQuoted means the caller used quotes;
-//   - a Lit holding a backslash means a character was escaped;
-//   - anything else (an ordinary unescaped Lit) is an unquoted delimiter.
-//
-// Asking the AST nodes rather than scanning the source slice keeps the quoting
-// model where it belongs: in the parser that already classified each part.
-func wordIsQuoted(w *syntax.Word) bool {
-	if w == nil {
-		return false
-	}
-	for _, p := range w.Parts {
-		switch part := p.(type) {
-		case *syntax.SglQuoted, *syntax.DblQuoted:
-			return true
-		case *syntax.Lit:
-			if strings.Contains(part.Value, "\\") {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // insideRange reports whether [start,end) sits inside any of these ranges.
@@ -2150,11 +2443,275 @@ func commandEnd(stmt *syntax.Stmt) int {
 	return int(stmt.End().Offset())
 }
 
+// checkValueWasNotCutOff refuses the two shapes where a flag's value silently ENDS.
+//
+// THIS IS THE SAME DEFECT THE PAYLOAD RULE FIXES, one layer down, and it is why this
+// language kept leaking into itself. A directive's words are read by two grammars at
+// once — this one and the shell's — and wherever the shell grammar takes over without
+// saying so, the caller's bytes stop meaning what they wrote. Measured, not imagined:
+//
+//	write s file /x --data a>b      the shell reads `>b` as a REDIRECT, so the value
+//	                                became "a", `>b` went nowhere, and the reply was
+//	                                200 with no error anywhere.
+//	write s file /x --data a b      `b` is a second word: the value is "a" and `b`
+//	                                becomes a positional that nothing reads.
+//
+// The fix is not to interpret those bytes — that is the shell's job, and this parser
+// does not run commands. It is to REFUSE them and say which value to pass instead. A
+// value the grammar cannot cut is the only kind that means what it says.
+func checkValueWasNotCutOff(op Op, flag, value string, rest []word, at int, holes *sentinelTable) error {
+	// A WORD RIGHT AFTER THE VALUE IS A WORD THAT WAS CUT OFF. This is checked at the
+	// one place that knows a value flag just took a word, rather than by guessing from
+	// arity: `key s:1 enter` and `help read` take bare words legitimately, and a rule
+	// about "leftover words" would refuse them.
+	//
+	// A PAYLOAD VERB IS EXEMPT: the word after its flags IS the payload (`notify --for
+	// 5s the body`), and that payload has its own declaration and its own check.
+	if op.hasPayload() {
+		return nil
+	}
+	if at+1 < len(rest) && !strings.HasPrefix(rest[at+1].text, "--") {
+		return &Error{
+			Op: op.Name,
+			Msg: "--" + flag + " took " + strconv.Quote(holes.spell(value)) + " as its value, and " + strconv.Quote(holes.spell(rest[at+1].text)) +
+				" is a separate word after it — so it is not part of the value and nothing would use it.\n" +
+				"Quote a value that contains a space (--" + flag + " \"a b\"), or pass it as args.",
+			Usage: op.Usage,
+		}
+	}
+	return nil
+}
+
+// checkNoRedirect refuses a redirect on a verb that does not run a command line.
+//
+// A REDIRECT IS THE SHELL'S, and this parser does not run commands: `write … --data
+// a>b` was accepted with the value "a" and the `>b` dropped on the floor. The payload
+// directives are exempt because their payload IS the rest of the line — `call` sends a
+// frame verbatim and `run`/`input` take a reference, where a redirect is not reachable
+// through a spelling this table documents.
+func checkNoRedirect(stmt *syntax.Stmt, op Op) error {
+	if len(stmt.Redirs) == 0 || op.hasPayload() {
+		return nil
+	}
+	r := stmt.Redirs[0]
+	return &Error{
+		Op: op.Name,
+		Msg: op.Name + " does not take a redirect, and " + strconv.Quote(r.Op.String()) + " was read as one by the " +
+			"shell grammar — so everything after it was cut off the value you wrote.\n" +
+			"Shell operators belong inside a VALUE: quote it (--data \"a>b\"). A command line belongs in args.",
+		Usage: op.Usage,
+	}
+}
+
+// checkOneWordOneLanguage enforces the rule the whole language rests on: cmd IS THE DSL.
+//
+// A reference is either the WHOLE WORD it sits in, or it is not in cmd at all. There is
+// no spelling in which a value and a literal become one word, because a word made of two
+// languages is read twice and means something different to each reader:
+//
+//	write h file /tmp/$1              a path assembled from a literal and a value
+//	--data a$1                        the value "a" glued to the caller's bytes
+//	--data $(( $1 + 1 ))              a value that is also an arithmetic expression
+//
+// THIS IS CHECKED ON THE WORD LIST, not on the statement's fields. Every field below
+// (target, kind key, positional, flag value, word list) is cut from these words, so one
+// check here covers all of them — and a field-by-field version would have to be
+// remembered again for each field added later.
+//
+// THE PAYLOAD IS NOT HERE, and does not need to be: it is sliced from the raw source
+// rather than built from words, and checkPayloadType already requires it to be exactly
+// one reference. A frame (`call`, PayloadSpan spanVerbatim) is exempt by declaration:
+// it never passes through a shell, so a reference inside its template is the peer's.
+func checkOneWordOneLanguage(op Op, rest []word, holes *sentinelTable) error {
+	if holes == nil || holes.prefix == "" {
+		// No substitution ran, so there is nothing to be glued to: every `$N` in cmd is
+		// the shell's own text and this language has no claim on it.
+		return nil
+	}
+	for _, w := range rest {
+		if !strings.Contains(w.text, holes.prefix) || holes.isOneWordHole(w.text) {
+			continue
+		}
+		return &Error{
+			Op: op.Name,
+			Msg: "cmd mixes a value with shell text: " + strconv.Quote(holes.spell(w.text)) + "\n" +
+				"cmd IS THE DIRECTIVE LANGUAGE. It holds verbs, addresses and references — a reference " +
+				"($1, $2, $NAME) has to be the WHOLE word it sits in, never glued to a literal, because a " +
+				"word made of two languages is read twice and means something different to each reader. " +
+				"There is no shell concatenation here.\n" +
+				"Pass the whole thing as the value instead:\n" +
+				"  cmd: \"" + op.Name + " … $1\"   args: [<the whole value>]",
+			Usage: op.Usage,
+		}
+	}
+	return nil
+}
+
+// checkPayloadType enforces what an Op declared its payload to BE.
+//
+// IT IS CHECKED BEFORE THE HOLES ARE FILLED IN, which is the only moment the question
+// has an answer: afterwards `$1` is gone and the payload is the shell line itself, so
+// "was this a value or a line?" can no longer be asked. The payload at this point is a
+// slice of the SUBSTITUTED source, so a reference appears as its stand-in token — one
+// token, and nothing else around it, is exactly what "the payload is one variable"
+// means in that text.
+//
+// WHY `run` NEEDS IT. The payload of `run` used to be "the rest of the line, read by
+// the shell parser at the same time as the directive is read by this one". That is two
+// languages sharing one text, and every combination of them is a different guess:
+//
+//	run h:1 ls | write h:2 file /x   a shell pipeline into a program called `write`
+//	run h:1 echo a; b                two termcp directives
+//	run h:1 make && notify done      a condition, or a shell `&&`?
+//
+// Requiring one variable reference removes the guess without removing the capability:
+// the shell text still arrives intact, it just arrives as a VALUE — `args: ["ls | wc
+// -l"]` is the command line, and the payload is the reference that carries it.
+func checkPayloadType(st Statement, holes *sentinelTable, op Op) error {
+	if op.PayloadType != PayloadVar {
+		return nil
+	}
+	raw := strings.TrimSpace(st.Payload)
+	// A TRAILING `&` IS TERMCP'S OPERATOR, NOT THE SHELL'S. `commandEnd` keeps it in the
+	// payload on purpose — for a literal shell line `sleep 100 &` it is the shell's
+	// backgrounding — but a var payload cannot carry shell punctuation any more, so the
+	// only thing a trailing `&` can mean is "run this statement concurrently". A shell
+	// level `&` goes in the value: args ["sleep 100 &"].
+	if st.Background {
+		raw = strings.TrimSpace(strings.TrimSuffix(raw, "&"))
+	}
+	// TWO SPELLINGS ARE THE SAME ANSWER. A substituted source holds this call's
+	// stand-in token where the reference was; an un-substituted one (`Parse`, and the
+	// usage lines a caller reads) still holds `$1`. Both mean "one variable", and the
+	// rule is about the SHAPE of the payload, not about which pass is looking at it.
+	if holes.isOneHole(raw) || isSingleRef(raw) {
+		return nil
+	}
+	return &Error{
+		Op: op.Name,
+		Msg: op.Name + " takes a VARIABLE, not a command line: its payload must be exactly one reference " +
+			"($1, $2 … or $NAME), and the shell text goes in that value.\n" +
+			"Writing the line directly is refused because the payload would then be read by two languages " +
+			"at once: `" + firstLine(holes.spell(raw)) + "` is a shell pipeline to one reader and a termcp directive to " +
+			"the other, and neither reading is a guess worth making.\n" +
+			"Use: " + op.Name + " <channel> $1   with args: [\"the command line\"]",
+		Usage: op.Usage,
+	}
+}
+
+// isSingleRef reports whether s is exactly one variable reference and nothing else:
+// `$1`, `${12}`, `$NAME`.
+func isSingleRef(s string) bool {
+	if len(s) < 2 || s[0] != '$' {
+		return false
+	}
+	rest := s[1:]
+	if rest[0] == '{' {
+		return len(rest) > 2 && rest[len(rest)-1] == '}' && strings.Count(rest, "}") == 1
+	}
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// firstLine keeps a refusal short enough to read.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	if len(s) > 60 {
+		return s[:60] + "…"
+	}
+	return s
+}
+
+// parsePipeline reads `a | b` as two statements, and refuses every pairing that is
+// not the one pipeline this language has.
+//
+// THE REFUSAL IS THE FEATURE. `|` inside a payload is the REMOTE SHELL's operator
+// (`run h:1 $1 | wc -l`), so a caller that writes `run h:1 ls | write h:2 file /x`
+// is not asking for a copy — it is asking the remote shell to pipe into a program
+// called `write`, and on Linux that program exists (it messages another user's
+// terminal). The two meanings cannot be told apart from the character, only from the
+// verb, so the verb is what this checks and what the error names.
+func parsePipeline(src string, outer *syntax.Stmt, bin *syntax.BinaryCmd, holes *sentinelTable) (Statement, bool, error) {
+	left, ok, err := parseStatement(src, bin.X, holes)
+	if err != nil {
+		return Statement{}, false, err
+	}
+	if !ok {
+		return Statement{}, false, nil
+	}
+	// THE RIGHT SIDE IS NAMED BEFORE IT IS PARSED. `read a1f3:1 | grep x` is the
+	// mistake this whole check exists for — a caller writing a SHELL pipeline — and
+	// the generic "unknown directive: grep" answers a question they did not ask.
+	// Naming the rule is the answer to the one they did.
+	if call := leadCall(bin.Y.Cmd); call != nil && len(call.Args) > 0 {
+		if word, ok := literalWord(src, call.Args[0]); ok {
+			if _, known := Lookup(word); !known {
+				return Statement{}, false, &Error{
+					Op: left.Op,
+					Msg: "`" + word + "` is not a directive, and the right side of a termcp `|` must be one: " +
+						"`read … | write …` copies bytes from one node to another, and it is the only pipeline " +
+						"in this language.\nA SHELL pipeline is written inside a payload, where `|` belongs to " +
+						"the shell: `run h:1 $1` with args [\"ls | " + word + "\"].",
+					Usage: "read <session> <index> | write <session> file <path>",
+				}
+			}
+		}
+	}
+	right, ok, err := parseStatement(src, bin.Y, holes)
+	if err != nil {
+		return Statement{}, false, err
+	}
+	if !ok {
+		return Statement{}, false, nil
+	}
+
+	// Background and Cond are NOT set here: the caller of parseStatement reads them
+	// off the outer statement, which is the one that carries the `&` or the `&&`.
+	// `read … | write … &` therefore stays a backgrounded copy.
+	refuse := func(msg string) (Statement, bool, error) {
+		return Statement{}, false, &Error{Op: left.Op, Msg: msg,
+			Usage: "read <session> <index> [--stream o|e] | write <session> file <path>"}
+	}
+
+	switch {
+	case bin.Op == syntax.PipeAll:
+		return refuse("`|&` is not a termcp operator: a pipeline moves BYTES from one node to another, " +
+			"and each side has exactly one stream. Use `|`, and pick the left side's stream with " +
+			"`read … --stream o|e`.")
+	case left.Pipe != nil || right.Pipe != nil || right.Piped:
+		return refuse("a pipeline here has exactly two ends: `read … | write …`. " +
+			"Chaining a third is refused rather than run in an order you would have to guess — " +
+			"write the second copy as its own statement.")
+	case left.Op != "read" || right.Op != "write":
+		return refuse("`|` connects two termcp directives only as `read … | write …`, which copies bytes " +
+			"from one node to another without them passing through your context; got `" + left.Op +
+			" | " + right.Op + "`.\n" +
+			"Inside a payload `|` belongs to the REMOTE SHELL — `run h:1 $1` with args [\"ls | wc -l\"] is " +
+			"how a shell pipeline is written. To sequence two directives, use `;` or `&&`.")
+	}
+
+	left.Pipe = &right
+	right.Piped = true
+	// The echo in the reply is the line the caller wrote, not the half this statement
+	// happens to be: a receipt for `read … | write …` that echoes only `read …` reads
+	// like the copy was never asked for.
+	left.Path = strings.TrimSpace(src[outer.Pos().Offset():commandEnd(outer)])
+	return left, true, nil
+}
+
 // parseStatement reads one statement. ok is false for a statement that is not a
 // directive at all (an assignment, a redirection-only command) — those are left
 // for the next statement rather than reported, because `cmd` is a shell string
 // and a caller may legitimately begin with something else.
-func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
+func parseStatement(src string, stmt *syntax.Stmt, holes *sentinelTable) (Statement, bool, error) {
 	call := leadCall(stmt.Cmd)
 	if call == nil || len(call.Args) == 0 {
 		return Statement{}, false, nil
@@ -2176,6 +2733,27 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 			Usage: "help",
 			Rest:  restOfStatement(src, stmt),
 		}
+	}
+
+	// A REDIRECT ON A VERB THAT RUNS NOTHING IS A CUT-OFF VALUE, not a shell command.
+	if err := checkNoRedirect(stmt, op); err != nil {
+		return Statement{}, false, err
+	}
+
+	// A PIPELINE IS TWO STATEMENTS CONNECTED, and this is the only place that sees
+	// the shell AST, so it is read here. `&&`/`||` are split elsewhere (flattenCond),
+	// and `;`/`&` never reach here because the shell parser already made them
+	// separate Stmts.
+	//
+	// A PAYLOAD VERB KEEPS THE PIPE. `run h:1 $1 | wc -l` is the remote shell's
+	// pipeline and the payload already contains it (`bodyEnd` covers the whole binary
+	// command). The same goes for `--argv`, whose whole point is "the rest of the line
+	// is the program's words". So the operator reading applies only to verbs that take
+	// neither, and those are exactly the ones where a discarded right side is a bug.
+	if bin, isPipe := stmt.Cmd.(*syntax.BinaryCmd); isPipe &&
+		(bin.Op == syntax.Pipe || bin.Op == syntax.PipeAll) &&
+		!op.hasPayload() && len(op.RestValue) == 0 {
+		return parsePipeline(src, stmt, bin, holes)
 	}
 
 	// The statement's body ends at the command, not at the `;`/newline that
@@ -2204,6 +2782,27 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 			start: arg.Pos().Offset(),
 			end:   arg.End().Offset(),
 		})
+	}
+
+	// ONE WORD, ONE LANGUAGE — asked before any word is read, because a word that is
+	// two things at once has no single answer to give the readers below.
+	//
+	// THE TARGET IS ONE WORD TOO, and it is the first one for every verb.
+	if len(rest) > 0 {
+		if err := checkOneWordOneLanguage(op, rest[:1], holes); err != nil {
+			return Statement{}, false, err
+		}
+	}
+	// WHAT IS LEFT IS ALL DSL, unless this verb takes a payload. A payload verb's
+	// remaining words are its flags and then the payload itself, and the payload is not
+	// a word: it is sliced from the raw source and checked against the declaration
+	// (checkPayloadType), which is the only place that knows whether a payload is a
+	// reference, a frame or a shell line. Its FLAGS are still words, and they are
+	// checked below where the payload begins and the words before it are known.
+	if !op.hasPayload() {
+		if err := checkOneWordOneLanguage(op, rest, holes); err != nil {
+			return Statement{}, false, err
+		}
 	}
 
 	// A KIND MAY OCCUPY THE TARGET'S POSITION.
@@ -2358,7 +2957,22 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 			} else {
 				storeFlag(out.Flags, key, val)
 			}
+			// THE VALUE ENDED HERE, AND THIS IS THE ONLY PLACE THAT KNOWS IT. Both
+			// spellings are covered because the check is about what FOLLOWS the value:
+			// `--data a b` and `--data=a b` are the same truncation.
+			if err := checkValueWasNotCutOff(op, key, val, rest, i, holes); err != nil {
+				return Statement{}, false, err
+			}
 			i++
+		}
+		// THE WORDS IN FRONT OF A PAYLOAD ARE STILL WORDS. The top of this function skips
+		// them because a payload verb's remaining words end in the payload, which is not a
+		// word; the flags in front of it are cmd, and this is the one point that knows
+		// where the payload starts.
+		if op.hasPayload() {
+			if err := checkOneWordOneLanguage(op, rest[:i], holes); err != nil {
+				return Statement{}, false, err
+			}
 		}
 		if i == len(rest) {
 			if op.MinArgs > 0 {
@@ -2444,6 +3058,9 @@ func parseStatement(src string, stmt *syntax.Stmt) (Statement, bool, error) {
 			} else {
 				storeFlag(out.Flags, key, val)
 			}
+			if err := checkValueWasNotCutOff(op, key, val, rest, i, holes); err != nil {
+				return Statement{}, false, err
+			}
 		}
 	}
 
@@ -2515,14 +3132,14 @@ func SessionTargetProblem(op Op, target string) string {
 	return op.Name + " needs a SESSION, not the channel \"" + target + "\". " +
 		"A channel address names one shell inside a session; this directive acts on the " +
 		"container. To stop a single channel use `close " + target + "`; to erase the " +
-		"whole session use its id without the `:N` suffix (`ps` prints it in the first column)."
+		"whole session use its id without the `:N` suffix (`ls` prints it in the first column)."
 }
 
 // ChannelTargetProblem is the message for a target that names a container where a
 // channel was required.
 //
 // It is exported because the same refusal happens at two layers — the parser and
-// the dispatch entry — and the two must say the same thing. It names `ps` and the
+// the dispatch entry — and the two must say the same thing. It names `ls` and the
 // shape rather than just rejecting, because "which channel" is answerable in one
 // line and an error that only refuses leaves the caller to work it out.
 func ChannelTargetProblem(op Op, target string) string {
@@ -2816,8 +3433,124 @@ func valuelessFlag(op Op, key string) bool {
 
 // allowedFlag reports whether the directive accepts a flag.
 func allowedFlag(op Op, key string) bool {
+	_, _, ok := flagDomain(op, key)
+	return ok
+}
+
+// PayloadVar is the one payload type this language declares: exactly one variable
+// reference, so the shell line arrives as a VALUE.
+const PayloadVar = "var"
+
+// FlagNames returns the declared flags with their value-domain annotation stripped.
+//
+// THE ANNOTATION IS PART OF THE DECLARATION, NOT PART OF THE NAME. Writing the domain
+// into the flag's own entry ("offset:number") is what keeps one list true instead of
+// two, but `offset:number` is not a flag anybody can pass — and every surface that
+// renders a flag name reads this table. Rendering the raw entries put `--cursor:number`
+// in `help read` with an empty description beside it, because the summary table is keyed
+// by the name. So the annotation is stripped at the one place names leave this package.
+func (op Op) FlagNames() []string {
+	out := make([]string, 0, len(op.Flags))
 	for _, f := range op.Flags {
-		if f == key {
+		base, _, _ := strings.Cut(f, ":")
+		out = append(out, base)
+	}
+	return out
+}
+
+// flagDomain finds a declared flag and returns its name, its domain and whether it is
+// declared at all. The domain is written into the flag's own entry ("offset:number"),
+// so there is one list to keep true rather than two.
+func flagDomain(op Op, key string) (name, domain string, ok bool) {
+	for _, f := range op.Flags {
+		base, dom, _ := strings.Cut(f, ":")
+		if base == key {
+			return base, dom, true
+		}
+	}
+	return "", "", false
+}
+
+// checkParamDomains refuses a value that is outside the domain its flag declared, and
+// it runs AFTER substitution so a value that arrived through $1 is checked too.
+//
+// IT IS NOT A REPLACEMENT FOR THE HANDLERS' OWN CHECKS, it is the layer above them:
+// a handler validates what it needs to do its job, this one catches a value the
+// declaration already knew was impossible — and catches it before any handler runs,
+// which is the difference between "the reply explains the flag" and "the reply reports
+// whatever the handler did with the wrong value".
+func checkParamDomains(st Statement, op Op) error {
+	for name, v := range st.Flags {
+		if v == nil {
+			continue
+		}
+		_, domain, ok := flagDomain(op, name)
+		if !ok || domain == "" {
+			continue
+		}
+		kind, values, _ := strings.Cut(domain, "=")
+		switch kind {
+		case "number":
+			if !isNumber(*v) {
+				return &Error{Op: op.Name, Msg: "--" + name + " takes a number, got " + strconv.Quote(*v), Usage: op.Usage}
+			}
+		case "enum":
+			if !inList(*v, values) {
+				return &Error{Op: op.Name, Msg: "--" + name + " takes one of " + strings.ReplaceAll(values, ",", ", ") +
+					", got " + strconv.Quote(*v), Usage: op.Usage}
+			}
+		case "geometry":
+			// --size IS `<rows>x<cols>`, and it used to be parsed by fmt.Sscanf, which
+			// returns 0 for anything it does not understand — and the caller of that
+			// parser then skipped the values when they were 0. So `--size nonsense`
+			// started a terminal at the default size and said nothing.
+			if !isGeometry(*v) {
+				return &Error{Op: op.Name, Msg: "--" + name + " takes ROWSxCOLS (e.g. 40x120), got " +
+					strconv.Quote(*v), Usage: op.Usage}
+			}
+		}
+	}
+	return nil
+}
+
+// isNumber accepts what the numeric flag readers accept: an integer or a decimal,
+// with an optional sign. It is deliberately the same shape they parse, so this layer
+// cannot pass something they will reject (or reject something they would take).
+func isNumber(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if _, err := strconv.ParseFloat(s, 64); err != nil {
+		return false
+	}
+	return true
+}
+
+// isGeometry accepts `<digits>x<digits>`, which is the one shape --size documents.
+func isGeometry(s string) bool {
+	rows, cols, ok := strings.Cut(strings.ToLower(strings.TrimSpace(s)), "x")
+	if !ok {
+		return false
+	}
+	digits := func(v string) bool {
+		if v == "" {
+			return false
+		}
+		for i := 0; i < len(v); i++ {
+			if v[i] < '0' || v[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return digits(rows) && digits(cols)
+}
+
+func inList(v, list string) bool {
+	v = strings.TrimSpace(v)
+	for _, allowed := range strings.Split(list, ",") {
+		if v == strings.TrimSpace(allowed) {
 			return true
 		}
 	}

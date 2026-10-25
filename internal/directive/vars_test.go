@@ -36,9 +36,6 @@ func TestTheValueIsInsertedAsWritten(t *testing.T) {
 		{"flag value", `write h file /tmp/x --data $P`,
 			Subst{Named: map[string]string{"P": value}},
 			func(st Statement) string { v, _ := st.Flag("data"); return v }},
-		{"heredoc body", "run h:1 cat <<EOF\n$P\nEOF\n",
-			Subst{Named: map[string]string{"P": "echo C"}},
-			func(st Statement) string { return st.Payload }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -47,9 +44,6 @@ func TestTheValueIsInsertedAsWritten(t *testing.T) {
 				t.Fatalf("%s: %v", c.cmd, err)
 			}
 			want := value
-			if c.name == "heredoc body" {
-				want = "cat <<EOF\necho C\nEOF"
-			}
 			if got := c.read(f.Statements[0]); got != want {
 				t.Errorf("%s: inserted %q, want %q (nothing rewrites the value)", c.name, got, want)
 			}
@@ -93,7 +87,20 @@ func TestParseWithSubstUndefinedVariableIsAnError(t *testing.T) {
 // when no vars is supplied. A caller that wants $HOME resolved remotely still gets
 // that, which is why substitution is opt-in per call.
 func TestParseWithoutSubstLeavesVariablesAlone(t *testing.T) {
-	f, err := Parse("run h:1 echo $HOME")
+	// A payload that IS a reference is a payload that is a reference, whether or not a
+	// table was supplied: the shape is what the directive declares, and `Parse` has no
+	// table to fill it from.
+	f, err := Parse("run h:1 $HOME")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Statements[0].Payload; got != "$HOME" {
+		t.Errorf("payload = %q, want %q", got, "$HOME")
+	}
+
+	// The shell's own `$HOME` is now the caller's to write inside a VALUE, where nothing
+	// rescans it: `run h:1 $1` with args ["echo $HOME"] types exactly that.
+	f, err = ParseWithSubst("run h:1 $1", Subst{Pos: []string{"echo $HOME"}})
 	if err != nil {
 		t.Fatal(err)
 	}
