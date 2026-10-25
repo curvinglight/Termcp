@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-mcp-ai/termcp/internal/approval"
@@ -63,7 +64,11 @@ type Manager struct {
 	// hold that window open and prove a second persist cannot enter it, which a
 	// probabilistic race test cannot do (measured: forty forced iterations of the real
 	// interleaving still passed with the lock removed).
-	persistHook func()
+	//
+	// An atomic pointer because persistOne reads it from whatever goroutine the session's
+	// exit watcher happens to be on, while the test that installed it is writing it. A
+	// plain field is a data race, and the race detector said so on the first CI run.
+	persistHook atomic.Pointer[func()]
 
 	sessions    sync.Map // string → *Session
 	internalSSH *sshserver.Server
@@ -377,8 +382,8 @@ func (m *Manager) persistOne(id string) {
 		return
 	}
 	sess := s.Info()
-	if m.persistHook != nil {
-		m.persistHook()
+	if hook := m.persistHook.Load(); hook != nil {
+		(*hook)()
 	}
 	// A manifest that fails to write is state the caller believes is durable, so it
 	// is logged rather than discarded. This is not hypothetical: on Windows the

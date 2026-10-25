@@ -49,13 +49,14 @@ func TestTwoPersistsCannotInterleave(t *testing.T) {
 	inside := make(chan struct{})
 	release := make(chan struct{})
 	var holdOnce sync.Once
-	m.persistHook = func() {
+	hook := func() {
 		holdOnce.Do(func() {
 			close(inside)
 			<-release
 		})
 	}
-	defer func() { m.persistHook = nil }()
+	m.persistHook.Store(&hook)
+	defer m.persistHook.Store(nil)
 
 	firstDone := make(chan struct{})
 	go func() { m.persistOne(id); close(firstDone) }()
