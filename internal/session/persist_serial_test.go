@@ -76,4 +76,19 @@ func TestTwoPersistsCannotInterleave(t *testing.T) {
 	close(release)
 	<-firstDone
 	<-secondDone
+
+	// LET THE SESSION DIE AND ITS WRITE LAND BEFORE CLEANUP. A session's exit watcher
+	// persists on the way out, and a write landing while t.TempDir removes the directory
+	// fails the CLEANUP — reported as this test's failure, after the assertion that
+	// matters had already passed (seen on macOS: "unlinkat …: directory not empty").
+	// Waiting for the persisted status is the same settle the sibling test does, and it
+	// is the only thing that says the writer is done rather than merely quiet.
+	_ = srv.Stop()
+	settle := time.Now().Add(10 * time.Second)
+	for time.Now().Before(settle) {
+		if rec, err := store.ReadSession(id); err == nil && rec != nil && rec.Status != api.SessionRunning {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
