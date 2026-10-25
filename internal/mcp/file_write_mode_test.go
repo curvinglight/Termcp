@@ -87,9 +87,12 @@ func TestALocalWriteWithoutAModeIsStillAccepted(t *testing.T) {
 func TestStatReportsTheModeOfAFile(t *testing.T) {
 	s := newTestServer(t)
 	sid := internalSession(t, s)
-	// A name with no separator in it, so the assertion is about the mode and not about
-	// how a temp path happened to be spelled.
-	path := "/tmp/stat-mode-probe.sh"
+	// THE PATH IS THE TEST'S OWN TEMP DIR, not /tmp. On a Windows runner /tmp resolves to
+	// D:	mp, which does not exist, so the write was refused with "the directory /tmp does
+	// not exist" — a green local suite (this machine has C:	mp) and a red windows leg.
+	// t.TempDir is the repo's rule for exactly this reason: never hardcode a shared
+	// absolute path.
+	path := filepath.Join(t.TempDir(), "stat-mode-probe.sh")
 	if got := termText(t, s, map[string]any{
 		"cmd": "write " + sid + " file " + path + " --data hi",
 	}); !statusLineIs(got, "200") {
