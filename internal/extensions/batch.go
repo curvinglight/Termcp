@@ -177,7 +177,11 @@ func (s *Store) ImportDocument(data []byte) (*BatchImportResult, error) {
 		}
 		created = append(created, it.name)
 	}
-	s.notifyChange()
+	// An import writes many templates under one lock; each created name is
+	// announced, because the runtime's unit of work is a template.
+	for _, name := range created {
+		s.notifyChange(name)
+	}
 	return result, nil
 }
 

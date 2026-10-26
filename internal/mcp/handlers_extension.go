@@ -19,16 +19,16 @@ import (
 // restart is retry's other name, and the one a caller looks for: the action rebuilds
 // a session, which is what "restart" means and what "retry" only implies. Both are
 // accepted so neither entrance has to know which word the other one chose.
-var extensionActions = []string{"list", "get", "create", "update", "delete", "retry", "restart"}
+var extensionActions = []string{"list", "get", "use", "release", "create", "update", "delete", "retry", "restart"}
 
 // extensionToolDescription is the extension surface in one paragraph. The tool
 // is the only place an agent hears about extensions, so it has to carry both
 // halves: what the layer is, and how a listed extension is actually driven.
 const extensionToolDescription = `Extensions: named, pinned sessions whose capabilities are trimmed to what their template allows — an MCP server driven over a pipe shell, a read-only window onto remote files, or an interactive terminal with instructions attached. Every enabled extension on a host shares one connection with the others that were granted the same capabilities, each driving its own shell_id in it.
 
-action=list returns every extension with its status and, when available, the session_id/shell_id you drive it through — several extensions can report the same session_id, so address work by shell_id. action=get returns one template in full, including the notes that are its operating instructions: read them before first use, they are the extension's own documentation. create and update author templates: kind + target is enough to start, every other field is an override, an omitted field keeps its stored value and an empty array clears it. An MCP template names either command/args (a stdio server to run) or url (an HTTP endpoint to relay, with headers) — the two are alternatives. delete removes a template (and the connection it kept warm, when nothing else is left on it). retry asks termcp to reconnect an unavailable extension now instead of waiting out its backoff.
+action=list returns every extension with its status and, when available, the session_id/shell_id you drive it through — several extensions can report the same session_id, so address work by shell_id. An extension that declares no forward is STARTED ON DEMAND: its status is "idle" until something asks for it, and action=use is the ask — it brings the extension up and returns the handles. open ext <name> Nothing else starts one, and an instance nothing uses for its idle_timeout is closed again (the handles you were holding then answer with what happened to them). action=get returns one template in full, including the notes that are its operating instructions: read them before first use, they are the extension's own documentation. create and update author templates: kind + target is enough to start, every other field is an override, an omitted field keeps its stored value and an empty array clears it. An MCP template names either command/args (a stdio server to run) or url (an HTTP endpoint to relay, with headers) — the two are alternatives. delete removes a template (and the connection it kept warm, when nothing else is left on it). retry asks termcp to reconnect an unavailable extension now instead of waiting out its backoff.
 
-An available extension is an ordinary session: call the run and read directives (or file --action read / --action stat) against its handles. A call the template did not whitelist is genuinely refused — the refusal is the template doing its job, not a bug. Extension sessions are infrastructure: they are not listed by session_list and stay warm for reuse, so never terminate or delete them. If one has died, it reports unavailable and is restarted — wait for it, then take the new handle from action=list.`
+An available extension is an ordinary session: call the run and read directives (or file --action read / --action stat) against its handles. A call the template did not whitelist is genuinely refused — the refusal is the template doing its job, not a bug. Extension sessions are infrastructure: they are not listed by session_list and are never terminated or deleted by hand, so never terminate or delete them. A template that declares a forward is not on demand: a listener has no caller to start it, so it comes up with termcp and stays up. If an extension has died, it reports unavailable and is restarted — wait for it, then take the new handle from action=use or action=list.`
 
 // extensionForwardItems is the items schema for the forwards array. mcp-go has
 // no array-of-object helper, so the property built by WithArray is widened here;
@@ -69,6 +69,10 @@ func (s *Server) handleExtensionOps(ctx context.Context, request mcpgo.CallToolR
 		return s.handleExtensionList(ctx, request)
 	case "get":
 		return s.handleExtensionGet(ctx, request)
+	case "use":
+		return s.handleExtensionUse(ctx, request)
+	case "release":
+		return s.handleExtensionRelease(ctx, request)
 	case "create":
 		return s.handleExtensionCreate(ctx, request)
 	case "update":
@@ -204,6 +208,79 @@ func (s *Server) handleExtensionDelete(ctx context.Context, request mcpgo.CallTo
 	return successResult(), nil
 }
 
+// handleExtensionUse is the ask: bring an on-demand extension up and hand back
+// the handles. It is the only action with a lifecycle side effect, which is why
+// it is its own word rather than something `get` does behind the caller's back —
+// a read that dials a host is a surprise, and the caller that wants it says so.
+//
+// The template is returned with the runtime half, so one call gives the caller
+// everything `get` would plus the instance: the notes are the operating
+// instructions, and the handles are what they are instructions for.
+func (s *Server) handleExtensionUse(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	args := request.GetArguments()
+	name := strings.TrimSpace(getString(args, "name", ""))
+	if name == "" {
+		return toolError(CodeInvalidArgument, "%s", "name is required"), nil
+	}
+	ext, err := s.extensions.Store().Load(name)
+	if err != nil {
+		return toolError(CodeRuleNotFound, "extension %q not found", name), nil
+	}
+	// The wait is a bound on the caller's patience, not on the dial: a host that is
+	// slow to answer returns `probing` with what the caller should poll, rather
+	// than a failure it would have to guess was not one.
+	st, err := s.extensions.Acquire(name, extensionUseBudget)
+	if err != nil {
+		return toolError(CodeOperationFailed, "starting extension %q: %s", name, err), nil
+	}
+	entry := extensionConfigMap(ext)
+	extensionRuntimeFields(entry, st, true)
+	if st.Status == extensions.StatusIdle {
+		entry["status"] = extensions.StatusAvailable
+	}
+	b, err := json.Marshal(entry)
+	if err != nil {
+		return toolError(CodeInternalError, "encoding extension: %s", err), nil
+	}
+	return mcpgo.NewToolResultText(string(b)), nil
+}
+
+// handleExtensionRelease hands an instance back: the explicit half of the idle
+// window (issue #183). shell_id names which instance, and leaving it out releases
+// every instance of the extension — which is what a caller that did not keep the
+// handle means by "I am done with this".
+//
+// Releasing something that is not running is an ERROR rather than a quiet success:
+// a caller that thinks it gave an instance back, and did not, is a caller that will
+// not look again.
+func (s *Server) handleExtensionRelease(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	args := request.GetArguments()
+	name := strings.TrimSpace(getString(args, "name", ""))
+	if name == "" {
+		return toolError(CodeInvalidArgument, "%s", "name is required"), nil
+	}
+	shellID := strings.TrimSpace(getString(args, "shell_id", ""))
+	released, err := s.extensions.Release(name, shellID)
+	if err != nil {
+		return toolError(CodeRuleNotFound, "releasing extension %q: %s", name, err), nil
+	}
+	if released == 0 {
+		return toolError(CodeConflict,
+			"extension %q has no instance to release%s", name,
+			" (it was already idle, or another caller's silence closed it)"), nil
+	}
+	b, err := json.Marshal(map[string]any{"name": name, "released": released})
+	if err != nil {
+		return toolError(CodeInternalError, "encoding release: %s", err), nil
+	}
+	return mcpgo.NewToolResultText(string(b)), nil
+}
+
+// extensionUseBudget bounds how long action=use waits for an answer. Long enough
+// for a cold dial to a distant host, short enough that a wedged one is reported
+// as `probing` rather than held open forever.
+const extensionUseBudget = 30 * time.Second
+
 // handleExtensionRetry asks the reconciler to bring an extension up now rather
 // than waiting out its backoff. Both an agent and a human can reach for it, so
 // a stuck extension is one call away from being re-probed.
@@ -300,6 +377,13 @@ func extensionConfigMap(ext *extensions.Extension) map[string]any {
 func extensionStatusWord(name string, st extensions.Status, enabled bool) (word, next string) {
 	word = statusOr(st, extensions.StatusUnavailable)
 	switch {
+	case word == extensions.StatusIdle:
+		// NOT A FAULT, AND THE WORD HAS TO SAY SO. An on-demand extension that
+		// nothing has asked for holds nothing, which is the design rather than a
+		// failure — so it gets its own word and its own instruction instead of
+		// falling into `unavailable` and sending the caller looking for a reason
+		// that does not exist (issue #183).
+		return word, "not running; it starts when something asks for it — `open ext " + name + "` does that and returns its handles"
 	case word == extensions.StatusProbing:
 		// THE RECONCILER'S OWN TRANSITIONAL STATE, and it means the same thing to the
 		// caller as the fallback below: not up, nothing failed, look again. It used to
@@ -337,6 +421,27 @@ func extensionRuntimeFields(entry map[string]any, st extensions.Status, withHist
 	}
 	if st.ShellID != "" {
 		entry["shell_id"] = st.ShellID
+	}
+	if st.Lazy {
+		// HOW LONG IT HAS BEEN IDLE, AND HOW LONG IT HAS LEFT. Both are facts the
+		// caller cannot derive: the clock starts at the last ask, which may have been
+		// another caller's.
+		entry["lazy"] = true
+		if st.IdleTimeoutMs > 0 {
+			entry["idle_timeout_ms"] = st.IdleTimeoutMs
+		}
+		if st.IdleForMs > 0 {
+			entry["idle_for_ms"] = st.IdleForMs
+		}
+	}
+	if st.ClosedSessionID != "" || st.ClosedAt > 0 {
+		// THE INSTANCE THAT WAS TAKEN AWAY, for the caller still holding its handle.
+		entry["closed_session_id"] = st.ClosedSessionID
+		if st.ClosedShellID != "" {
+			entry["closed_shell_id"] = st.ClosedShellID
+		}
+		entry["closed_at"] = st.ClosedAt
+		entry["closed_reason"] = st.ClosedReason
 	}
 	if len(st.Forwards) > 0 {
 		entry["forwards"] = st.Forwards

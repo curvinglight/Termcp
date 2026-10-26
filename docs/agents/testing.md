@@ -1,9 +1,12 @@
 # Writing tests that survive CI
 
 Every test lands in `.github/workflows/test.yml`, which runs
-`go test ./... -count=1 -shuffle=on -race -timeout 600s` on **ubuntu, macos and
-windows** runners, on every PR — byte-for-byte the command `make test` runs, so
-the two must change together. A test that passes on your machine and flakes in
+`go test ./... -count=1 -shuffle=on -race` on **ubuntu, macos and
+windows** runners, on every PR — the same flags `make test` runs, so
+the two must change together. The one exception is `-timeout`: locally it is 600s,
+on CI 1800s, because a shared runner under `-race` is several times slower and a
+run killed by `-timeout` panics with no failing test named. Both are hang
+detectors, not budgets. A test that passes on your machine and flakes in
 CI costs everyone a re-run and teaches people to ignore red. Write for the
 runner, not for your checkout.
 

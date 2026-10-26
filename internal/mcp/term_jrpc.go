@@ -473,14 +473,17 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 		frame, ok := h.ch.Take(waitCtx)
 		cancel()
 		if ok {
-			return s.frameReply(ctx, stmt, h, frame)
+			return s.frameReply(ctx, stmt, h, frame, win)
 		}
+		// A RECV THAT TOOK NOTHING DELIVERED NOTHING, so it is a 204 — and the two
+		// sentences below are not the same news: on HTTP there is nothing to wait for at
+		// all, on a socket the window was simply empty. Each rides in the Hint header,
+		// never the body, for the reason noContentSaying documents.
 		if h.ch.Transport() == jrpc.HTTP {
-			return envelope.Slot{Code: 204, Headers: headers,
-				Body: "no frame. On an HTTP channel every frame is an answer to a call, so there is " +
-					"nothing to wait for; a peer that pushes on its own needs a socket (cdp open ws://…)."}
+			return noContentSaying(headers, "no frame. On an HTTP channel every frame is an answer to a call, so there is "+
+				"nothing to wait for; a peer that pushes on its own needs a socket (cdp open ws://…).")
 		}
-		return envelope.Slot{Code: 204, Headers: headers, Body: "no frame within the window"}
+		return noContentSaying(headers, "no frame within the window")
 	case "call", "send":
 		// A TOOL NAME IS NOT A FRAME, and the two cannot be confused: a frame is a JSON
 		// object and starts with '{', a tool name never does (#159). The test peels the
@@ -490,7 +493,7 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 		// Every other frame — notifications, progress, sampling, anything custom —
 		// keeps the escape hatch unchanged.
 		if op == "mcp" && len(rest) > 1 && !strings.HasPrefix(unquoteWord(strings.TrimSpace(rest[1])), "{") {
-			return s.mcpToolCall(ctx, stmt, h, strings.Join(rest[1:], " "))
+			return s.mcpToolCall(ctx, stmt, h, strings.Join(rest[1:], " "), win)
 		}
 		frame, bad := parseJRPCFrame(stmt, rest[1:])
 		if bad != nil {
@@ -513,7 +516,7 @@ func (s *Server) jrpcChannel(ctx context.Context, stmt directive.Statement, win 
 		if err != nil {
 			return jrpcError(stmt, err)
 		}
-		return s.frameReply(ctx, stmt, h, reply)
+		return s.frameReply(ctx, stmt, h, reply, win)
 	}
 	// NO FALLBACK: the subcommand is not the caller's word here. The verbs that reach
 	// this function (call, write --send, read --frame, close) each name the one

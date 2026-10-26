@@ -122,6 +122,82 @@ function dockSessionTarget(s) {
   return { id: 'sess:' + s.id, _sid: s.id, _parentSid: s.id, _windowless: true };
 }
 
+/* Sessions whose window changed while nobody was looking at it.
+ *
+ *  ONE RULE, and it is about the window: a tab pulses when something happened in it
+ *  and its window does not have the reader's attention. Not "an agent opened this",
+ *  not "nobody has clicked it yet" — those were separate states answering a question
+ *  about the SESSION ("has this page seen it?"), and they had a flaw a reader noticed
+ *  immediately: a tab could sit lit forever because no one ever clicked it, which on
+ *  a bright accent theme reads as a permanently highlighted tab rather than as
+ *  something asking to be looked at.
+ *
+ *  Attention is defined in dockWindowWatched: on screen, top of its layout, page in
+ *  front. Anything less — minimized, buried, collapsed, background tab — is a window
+ *  that can print without a pair of eyes on it, and the mark is what says so.
+ *
+ *  The set is in memory, not in localStorage: a reload is a fresh look. */
+var _dockFresh = Object.create(null);
+
+/** dockMarkFresh flags a session as having output nobody has looked at. */
+function dockMarkFresh(sid) {
+  if (!sid) return;
+  if (_dockFresh[sid]) return;
+  _dockFresh[sid] = true;
+  /* The bar is not rebuilt per output frame — it is rebuilt per sessions frame —
+     so the flag has to reach the DOM on its own or the pulse starts on the next
+     unrelated repaint, which can be minutes away. The tab is looked up rather than
+     repainted: one class is the whole change. */
+  var tab = dockTabForSid(sid);
+  if (tab) tab.classList.add('is-fresh');
+}
+
+/** dockClearFresh drops the mark for a session the human is now looking at. */
+function dockClearFresh(sid) {
+  if (!sid || !_dockFresh[sid]) return;
+  delete _dockFresh[sid];
+  var tab = dockTabForSid(sid);
+  if (tab) tab.classList.remove('is-fresh');
+}
+
+function dockTabForSid(sid) {
+  var strip = document.getElementById('session-tabs-scroll');
+  if (!strip || !sid) return null;
+  var tabs = strip.children;
+  for (var i = 0; i < tabs.length; i++) {
+    var t = tabs[i];
+    if (t && t._entry && t._entry.sid === sid) return t;
+  }
+  return null;
+}
+
+/** Is this window the one the reader is looking at right now?
+ *
+ *  Active means: on screen (not minimized, not hidden, not collapsed to its header),
+ *  the top window in its layout, and the page itself is not in a background tab.
+ *  Anything less is "somewhere else", and a tab for it has something to report. */
+function dockWindowWatched(win) {
+  if (!win || !win.parentNode) return false;
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return false;
+  if (win.classList.contains('win-minimized') || win.classList.contains('win-hidden')) return false;
+  if (win.classList.contains('shell-window-collapsed')) return false;
+  if (isTiledWin(win)) return win.classList.contains('pane-active');
+  return win.classList.contains('win-active');
+}
+
+/** dockNoteOutput is called for every terminal frame that reached a window.
+ *
+ *  The two halves have to be one function: "mark unless watched, clear if watched"
+ *  is what makes the pulse stop on its own for someone already looking at the window,
+ *  without the calling code having to decide either way. Called from the frame path,
+ *  so it early-returns on the steady state (already marked, or already watched and
+ *  unmarked) — a pulse that is already on costs one property read. */
+function dockNoteOutput(win) {
+  if (!win || win._extName || !win._sid) return;
+  if (dockWindowWatched(win)) dockClearFresh(win._sid);
+  else dockMarkFresh(win._sid);
+}
+
 /** One dock entry per RUNNING session, plus one per window that has no session.
  *
  *  The dock used to be built from `allShellWins()` alone, so it listed the windows
@@ -146,43 +222,52 @@ function dockSessionTarget(s) {
  *  (an extension's `ext:` session) belongs to the extension column — the same rule
  *  the plates apply, so one filter keeps both lists honest.
  *
- *  Order: open windows in DOM order, then window-less sessions by creation time.
+ *  Order: windows that carry no session first (a dial in flight is the one thing
+ *  you just did), then every SESSION by creation time, whether or not this page
+ *  holds its window.
  *  The sort matters more than it looks — the snapshot comes from a Go map, so
  *  ListAll order is random, and rendering it as it arrives would reshuffle the tabs
  *  on every frame. A bar that jumps under the pointer is unusable for clicking.
+ *  Which is also why the ORDER does not depend on having a window: pressing a
+ *  window-less tab opens one, and grouping windows ahead of sessions made the whole
+ *  bar shift one place at that moment. The reader presses the third tab and the
+ *  first one appears to stop pulsing, because the first place now holds the tab
+ *  they just pressed. Position follows the session's creation time, full stop.
  */
 function dockEntries() {
   var snapshot = window._lastSessionsSnapshot || [];
   var byId = Object.create(null);
   snapshot.forEach(function (s) { if (s && s.id) byId[s.id] = s; });
+  var bare = [];
   var entries = [];
   var covered = Object.create(null);
   allShellWins().forEach(function (w) {
     /* A status card carries the extension's NAME in `_sid`, so it is not a session
        and must not claim one's tab. */
     var sid = (!w._extName && w._sid) ? w._sid : '';
-    if (!sid) { entries.push({ key: 'win:' + w.id, win: w, sid: '', session: null }); return; }
+    if (!sid) { bare.push({ key: 'win:' + w.id, win: w, sid: '', session: null }); return; }
     covered[sid] = true;
     entries.push({ key: 'sess:' + sid, win: w, sid: sid, session: byId[sid] || null });
   });
-  var extra = [];
   snapshot.forEach(function (s) {
     if (!s || !s.id || s.status !== 'running') return;
     if (covered[s.id]) return;
     /* sessions.js loads AFTER this file, and the page's first paint runs before
        it, so the predicate is asked for by name rather than assumed present. */
     if (typeof isHiddenSession === 'function' && isHiddenSession(s)) return;
-    extra.push(s);
-  });
-  extra.sort(function (a, b) {
-    var ta = Number(a.created_at) || 0, tb = Number(b.created_at) || 0;
-    if (ta !== tb) return ta - tb;
-    return String(a.id) < String(b.id) ? -1 : 1;
-  });
-  extra.forEach(function (s) {
     entries.push({ key: 'sess:' + s.id, win: null, sid: s.id, session: s });
   });
-  return entries;
+  entries.sort(function (a, b) {
+    /* A session the snapshot has not reported yet (the window of a dial in flight)
+       sorts last rather than first: it is the newest thing on the bar, and it will
+       take its place from created_at on the frame after it exists. Sorting it first
+       would shift every other tab one place for one frame. */
+    var ta = a.session ? (Number(a.session.created_at) || 0) : Infinity;
+    var tb = b.session ? (Number(b.session.created_at) || 0) : Infinity;
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    return String(a.sid) < String(b.sid) ? -1 : 1;
+  });
+  return bare.concat(entries);
 }
 
 /** The dock key of an open window, or '' when the dock has no tab for it.
@@ -320,6 +405,10 @@ function refreshSessionTabbar() {
            other way round: it has a session and no window, so its click OPENS
            one (through focusSessionWindow, which opens when none exists). */
         var cur = tab._entry;
+        /* Pressing the tab is the reader looking at it, before the window even
+           exists — so the pulse stops on the press, not on the next frame. */
+        if (cur && cur.sid) dockClearFresh(cur.sid);
+        tab.classList.remove('is-fresh');
         if (!cur || !cur.win) {
           if (cur && cur.session) {
             focusSessionWindow(cur.session.name || '', cur.session.id, windowPositionFromClick(e), null);
@@ -375,6 +464,24 @@ function refreshSessionTabbar() {
     /* A window-less entry is still a session with a state, so the tab says which:
        no window here is a fact about the page, not about the session. */
     tab.classList.toggle('is-windowless', !w);
+    /* The rebuild reads the fresh set rather than trusting the class it left behind:
+       this loop is the one place a tab is created, and a flag set by an output frame
+       while the tab did not exist yet (a session that printed before its first
+       sessions frame) has no class to inherit.
+       The set is CLEARED here rather than only at the click: raising, restoring or
+       un-minimizing a window is also the reader looking at it, and every one of those
+       paths repaints this bar. Deleting the flag (instead of calling
+       dockClearFresh) keeps it out of the strip while the strip is being rebuilt. */
+    if (entry.sid && w && dockWindowWatched(w)) delete _dockFresh[entry.sid];
+    /* NO WINDOW HERE IS THE LOUDEST CASE OF "NOBODY IS WATCHING": the session is
+       running and there is nothing on this page showing it. Marking only on frames
+       missed it entirely — frames reach windows, and a session started over MCP has
+       none, so the tabs that most needed the pulse were the only ones that never got
+       it. The mark is set here rather than at creation for the same reason the rest
+       of the rule lives in this loop: the snapshot is the one thing every session
+       passes through. */
+    if (entry.sid && !w) _dockFresh[entry.sid] = true;
+    tab.classList.toggle('is-fresh', !!(entry.sid && _dockFresh[entry.sid]));
     if (!w) tab.setAttribute('data-sid', entry.sid);
     else tab.removeAttribute('data-sid');
     /* The batch component owns both the mode and the ticked set, and paints the
@@ -1549,7 +1656,7 @@ var _dockBatch = (typeof createBatchBar === 'function') ? createBatchBar({
   splitId: null, mainId: null, caretId: null, menuId: null,
   exportId: null,
   deleteId: 'dock-close-ticked',
-  actionIds: ['dock-close-ticked'],
+  actionIds: ['dock-min-ticked', 'dock-restore-ticked', 'dock-close-ticked'],
   gridId: 'session-tabs-scroll',
   cardSelector: '.session-tab',
   nameAttr: 'data-win-id',
@@ -1592,9 +1699,24 @@ var _dockBatch = (typeof createBatchBar === 'function') ? createBatchBar({
        bound, and the strip is the painted truth anyway — a tab is marked exactly
        when its window is in the set. */
     var ticked = Object.create(null);
+    /* Whether the selection holds anything either key can act on. Read in the same
+       pass: a ticked PLACEHOLDER (still dialling) or a status card has no window,
+       so a row of those leaves both keys dead — and a live key that does nothing is
+       the one thing this bar's own comments forbid. */
+    var minable = 0, restorable = 0;
     Array.prototype.slice.call(document.querySelectorAll('#session-tabs-scroll [data-win-id]')).forEach(function (t) {
-      if (t.classList.contains('batch-selected')) ticked[t.getAttribute('data-win-id')] = 1;
+      if (!t.classList.contains('batch-selected')) return;
+      ticked[t.getAttribute('data-win-id')] = 1;
+      var w = t._entry && t._entry.win;
+      if (!w) return;
+      if (w.classList.contains('win-minimized')) restorable++;
+      else minable++;
     });
+    /* After paintActions, which only knows "nothing ticked". */
+    var minKey = document.getElementById('dock-min-ticked');
+    if (minKey) minKey.disabled = minable === 0;
+    var restoreKey = document.getElementById('dock-restore-ticked');
+    if (restoreKey) restoreKey.disabled = restorable === 0;
     Array.prototype.slice.call(document.querySelectorAll('.shell-header-icon-btn')).forEach(function (b) {
       var key = dockKeyForWindow(b._switchWin);
       var on = !!(key && ticked[key]);
@@ -1604,6 +1726,54 @@ var _dockBatch = (typeof createBatchBar === 'function') ? createBatchBar({
   },
   onDelete: function (ids) { dockCloseEntries(ids); }
 }) : null;
+
+/** MINIMIZE / RESTORE for the ticked tabs.
+ *
+ *  They act on the WINDOW behind a tab, never on the session: a tab with no
+ *  window has nothing to hide, and pretending otherwise would be a lie about a
+ *  session that keeps running either way. Both helpers are the same two calls the
+ *  window's own title-bar key makes, so there is one minimizer in this file, not
+ *  two that can drift.
+ */
+function dockTickedWindows(keys) {
+  var out = [];
+  (keys || []).forEach(function (key) {
+    var entry = dockEntryByKey(key);
+    if (entry && entry.win) out.push(entry.win);
+  });
+  return out;
+}
+function dockMinimizeSelected() {
+  if (!_dockBatch) return;
+  /* Idempotent per window (minimizeShellWindow returns early when already
+     minimized), so a batch that mixes the two states needs no filtering here. */
+  dockTickedWindows(_dockBatch.selected()).forEach(minimizeShellWindow);
+}
+function dockRestoreSelected() {
+  if (!_dockBatch) return;
+  dockTickedWindows(_dockBatch.selected()).forEach(restoreShellWindow);
+  /* restoreShellWindow deliberately does not repaint the strip — a single window's
+     own key is followed by a focus that does it — so a batch has to, or the tabs
+     keep the minimized styling until the next frame. */
+  refreshSessionTabbar();
+}
+
+(function wireDockWindowKeys() {
+  function wire() {
+    var min = document.getElementById('dock-min-ticked');
+    var restore = document.getElementById('dock-restore-ticked');
+    if (min && !min._termcpWired) {
+      min._termcpWired = true;
+      min.addEventListener('click', function (e) { e.preventDefault(); dockMinimizeSelected(); });
+    }
+    if (restore && !restore._termcpWired) {
+      restore._termcpWired = true;
+      restore.addEventListener('click', function (e) { e.preventDefault(); dockRestoreSelected(); });
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire);
+  else wire();
+})();
 
 
 /** The dock keys currently listed, in bar order.

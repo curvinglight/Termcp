@@ -66,6 +66,21 @@ func startReconciler(t *testing.T) *Reconciler {
 	return r
 }
 
+// wantExtension asks for an on-demand extension, which is what any caller does
+// before it can drive one: since issue #183 the reconciler does not dial a
+// template that declares no forward until something asks, and asking is
+// `open ext <name>` (Reconciler.Acquire) or the extension tool's action=use.
+//
+// The wait helpers deliberately do NOT call it. A test that expects an extension
+// up says so in one visible line, and a test that expects it to stay down — or to
+// go down and stay down until asked again — says nothing.
+func wantExtension(t *testing.T, r *Reconciler, name string) {
+	t.Helper()
+	if _, err := r.Acquire(name, 0); err != nil {
+		t.Fatalf("asking for extension %q: %v", name, err)
+	}
+}
+
 // waitForStatus polls until want holds or the deadline passes. Extensions are
 // asynchronous by design — the reconciler proves availability off the caller's
 // thread — so the tests wait on the outcome rather than assuming it.
@@ -133,6 +148,9 @@ func waitForFailureReason(t *testing.T, r *Reconciler, name, substr string) Stat
 	// never record a failure at all.
 	deadline := time.Now().Add(20 * time.Second)
 	for {
+		// The walk is what notices a process that ended; the tick that drives it is
+		// seconds away, so nudge it rather than making the test pay for the interval.
+		r.Sync(t.Context(), "")
 		if st, ok := r.Status(name); ok {
 			for _, f := range st.Failures {
 				if strings.Contains(f.Reason, substr) {
@@ -155,6 +173,7 @@ func waitForFailure(t *testing.T, r *Reconciler, name, stage string) Status {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
 	for {
+		r.Sync(t.Context(), "")
 		st, ok := r.Status(name)
 		if ok {
 			for _, f := range st.Failures {
@@ -182,6 +201,7 @@ func TestReconcilerBringsUpSkillExtension(t *testing.T) {
 	ext.Paths = []string{"/srv/skills/docs/"}
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "docs")
 	st := waitForStatus(t, r, "docs", StatusAvailable)
 	if st.SessionID == "" {
 		t.Fatal("available extension reports no session")
@@ -225,6 +245,7 @@ func TestReconcilerReportsStartupFailure(t *testing.T) {
 	ext.Command, ext.Args = immediateExitCommand()
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "broken")
 	st := waitForFailureReason(t, r, "broken", "exit code")
 	last := st.Failures[len(st.Failures)-1]
 	if last.Stage != "start" && last.Stage != "session" {
@@ -233,13 +254,37 @@ func TestReconcilerReportsStartupFailure(t *testing.T) {
 	if st.ShellID != "" {
 		t.Error("a failed startup should not leave a channel handle behind")
 	}
-	if st.NextRetry == 0 {
-		t.Error("a transient failure should schedule a retry")
+	// NOTHING RETRIES AN ON-DEMAND EXTENSION BUT A CALLER (issue #183). A backoff
+	// timer would be a dial nobody asked for, so none is scheduled — and the
+	// connection goes with the instance, because there is nothing left to carry.
+	if st.NextRetry != 0 {
+		t.Errorf("an on-demand extension should schedule no retry of its own, got %d", st.NextRetry)
 	}
-	// The connection the failure came up on is the group's and is left standing:
-	// the next attempt opens a channel on it rather than dialing the host again.
-	if n := len(r.sessMgr.ListAll()); n != 1 {
-		t.Errorf("the group's session should outlive a failed member start, got %d sessions", n)
+	// THE CONNECTION STAYS (issue #183): it is the install's, not the failed
+	// instance's, and tearing it down would make the next ask pay for a dial to
+	// learn the same thing about the same template.
+	if n := len(r.sessMgr.ListAll()); n > 1 {
+		t.Errorf("a failed instance should leave at most the connection behind, got %d sessions", n)
+	}
+	// Asking again is what tries again, and it fails again for the same reason: the
+	// template, not the attempt, is what is wrong.
+	// The proof that it tried again is a NEW instance that also ended: the failure
+	// list deduplicates a repeated reason, so counting entries would prove nothing.
+	firstGone := st.ClosedShellID
+	wantExtension(t, r, "broken")
+	// The new instance ends too, and the WALK is what notices it; the deadline is a
+	// backstop for a loaded runner, not the thing being measured.
+	retryDeadline := time.Now().Add(20 * time.Second)
+	for {
+		r.Sync(t.Context(), "")
+		again, _ := r.Status("broken")
+		if again.ClosedShellID != "" && again.ClosedShellID != firstGone {
+			break
+		}
+		if time.Now().After(retryDeadline) {
+			t.Fatalf("asking again should try again, got %+v", again)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -253,6 +298,7 @@ func TestReconcilerMissingTarget(t *testing.T) {
 	ext.Paths = []string{"/srv/"}
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "nowhere")
 	st := waitForFailure(t, r, "nowhere", "target")
 	if st.NextRetry != 0 {
 		t.Error("a missing target is not transient; no retry should be scheduled")
@@ -260,10 +306,13 @@ func TestReconcilerMissingTarget(t *testing.T) {
 	if len(r.sessMgr.ListAll()) != 0 {
 		t.Errorf("no session should have been created, got %d", len(r.sessMgr.ListAll()))
 	}
-	// Give the loop a couple of walks to prove a spent, unbuildable template is
-	// stepped over rather than re-probed: the failure line stays the one already
-	// recorded, and nothing dials or builds a session for it.
-	time.Sleep(2 * loopInterval)
+	// Tell it again, twice, and prove a spent, unbuildable template is stepped over
+	// rather than re-probed: the failure line stays the one already recorded, and
+	// nothing dials or builds a session for it.
+	for i := 0; i < 2; i++ {
+		r.Sync(t.Context(), "")
+		time.Sleep(150 * time.Millisecond)
+	}
 	st, _ = r.Status("nowhere")
 	if len(st.Failures) != 1 {
 		t.Errorf("the walk should not re-probe a template it cannot build, got %d: %+v", len(st.Failures), st.Failures)
@@ -286,12 +335,14 @@ func TestReconcilerTargetAppearsLater(t *testing.T) {
 	ext.Paths = []string{"/srv/"}
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "late-target")
 	waitForFailure(t, r, "late-target", "target")
 
 	if err := r.SSHConfigs().Save("arrives", []byte("kind = \"internal\"\n")); err != nil {
 		t.Fatal(err)
 	}
 
+	wantExtension(t, r, "late-target")
 	st := waitForStatus(t, r, "late-target", StatusAvailable)
 	if st.SessionID == "" {
 		t.Error("the extension should run once its profile exists")
@@ -328,6 +379,7 @@ func TestReconcilerRetry(t *testing.T) {
 	ext.Target = "no-such-profile"
 	ext.Paths = []string{"/srv/"}
 	mustSave(t, r.store, &ext)
+	wantExtension(t, r, "late")
 	waitForFailure(t, r, "late", "target")
 
 	ext.Target = "internal"
@@ -335,6 +387,7 @@ func TestReconcilerRetry(t *testing.T) {
 	if err := r.Retry("late"); err != nil {
 		t.Fatal(err)
 	}
+	wantExtension(t, r, "late")
 	waitForStatus(t, r, "late", StatusAvailable)
 }
 
@@ -369,6 +422,7 @@ func TestReconcilerSessionDeathMarksUnavailable(t *testing.T) {
 	ext.Args = nil
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "live")
 	st := waitForStatus(t, r, "live", StatusAvailable)
 	sess := r.sessMgr.Get(st.SessionID)
 	if sess == nil {
@@ -390,6 +444,7 @@ func TestReconcilerSessionDeathMarksUnavailable(t *testing.T) {
 
 	// The backoff is short enough that the loop restores it on its own, on a
 	// connection rebuilt underneath it.
+	wantExtension(t, r, "live")
 	st = waitForStatus(t, r, "live", StatusAvailable)
 	if st.SessionID == sess.ID {
 		t.Error("the extension should be served by a new session after the old one died")
@@ -414,6 +469,7 @@ func TestReconcilerForwardEstablished(t *testing.T) {
 	}}
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "tunnel")
 	st := waitForStatus(t, r, "tunnel", StatusAvailable)
 	if len(st.Forwards) != 1 {
 		t.Fatalf("want 1 established forward, got %+v", st.Forwards)
@@ -457,8 +513,9 @@ func TestReconcilerEditRebuildsTheChannel(t *testing.T) {
 	ext.Command = testShellCommand()
 	ext.Args = nil
 	mustSave(t, r.store, &ext)
+	wantExtension(t, r, "edited")
 	st := waitForStatus(t, r, "edited", StatusAvailable)
-	session, firstShell := st.SessionID, st.ShellID
+	firstShell := st.ShellID
 	if firstShell == "" {
 		t.Fatal("an mcp extension should report the channel it runs on")
 	}
@@ -466,6 +523,9 @@ func TestReconcilerEditRebuildsTheChannel(t *testing.T) {
 	ext.Command = "sort"
 	mustSave(t, r.store, &ext)
 
+	// The edit closed the instance built from the old command, so the caller asks
+	// again and gets one built from the new one (issue #183).
+	wantExtension(t, r, "edited")
 	deadline := time.Now().Add(8 * time.Second)
 	for {
 		st, _ = r.Status("edited")
@@ -477,8 +537,11 @@ func TestReconcilerEditRebuildsTheChannel(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if st.SessionID != session {
-		t.Errorf("an edit that only changes the command must not replace the shared session (%q → %q)", session, st.SessionID)
+	// The new instance runs the new command. It is NOT promised the old connection:
+	// an on-demand extension holds nothing while nobody is using it, so the edit
+	// closes the old instance and the connection with it (issue #183).
+	if st.SessionID == "" {
+		t.Error("the rebuilt instance should report the session it runs on")
 	}
 }
 
@@ -498,7 +561,9 @@ func TestReconcilerSharesOneSessionPerHost(t *testing.T) {
 		mustSave(t, r.store, &ext)
 	}
 
+	wantExtension(t, r, "first")
 	first := waitForStatus(t, r, "first", StatusAvailable)
+	wantExtension(t, r, "second")
 	second := waitForStatus(t, r, "second", StatusAvailable)
 
 	if first.SessionID != second.SessionID {
@@ -526,13 +591,16 @@ func TestReconcilerSharesOneSessionPerHost(t *testing.T) {
 	r.sessMgr.Terminate(sess.ID, true, 0)
 	waitForStatus(t, r, "first", StatusUnavailable)
 	waitForStatus(t, r, "second", StatusUnavailable)
+	wantExtension(t, r, "first")
 	first = waitForStatus(t, r, "first", StatusAvailable)
+	wantExtension(t, r, "second")
 	second = waitForStatus(t, r, "second", StatusAvailable)
 	if first.SessionID == sess.ID {
 		t.Error("the extension should not still report the dead session")
 	}
 	if first.SessionID != second.SessionID {
-		t.Errorf("both extensions should come back on the same rebuilt session: %q vs %q", first.SessionID, second.SessionID)
+		t.Errorf("both extensions should come back on the same rebuilt session: %q vs %q (first=%+v second=%+v)",
+			first.SessionID, second.SessionID, first, second)
 	}
 	if n := len(r.sessMgr.ListAll()); n != 1 {
 		t.Errorf("the rebuilt group should hold one session, got %d", n)
@@ -557,7 +625,9 @@ func TestReconcilerSeparatesByCapability(t *testing.T) {
 	second.Paths = []string{"/srv/skills/b/"}
 	mustSave(t, r.store, &second)
 
+	wantExtension(t, r, "docs-a")
 	a := waitForStatus(t, r, "docs-a", StatusAvailable)
+	wantExtension(t, r, "docs-b")
 	b := waitForStatus(t, r, "docs-b", StatusAvailable)
 	if a.SessionID == b.SessionID {
 		t.Fatal("extensions with different path windows must not share a session")
@@ -601,6 +671,7 @@ func TestReconcilerSessionIsNamespaced(t *testing.T) {
 	ext.Paths = []string{"/srv/"}
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "hidden")
 	st := waitForStatus(t, r, "hidden", StatusAvailable)
 	sess := r.sessMgr.Get(st.SessionID)
 	if sess == nil {
@@ -657,6 +728,7 @@ func TestReconcilerDeleteTearsDown(t *testing.T) {
 	ext.Target = "internal"
 	ext.Paths = []string{"/srv/"}
 	mustSave(t, r.store, &ext)
+	wantExtension(t, r, "gone")
 	st := waitForStatus(t, r, "gone", StatusAvailable)
 	sid := st.SessionID
 
@@ -698,6 +770,7 @@ func TestReconcilerStoreChangeTriggers(t *testing.T) {
 	ext.Paths = []string{"/srv/"}
 	mustSave(t, r.store, &ext)
 	// No Trigger call: the store's own change callback is the path production uses.
+	wantExtension(t, r, "wired")
 	waitForStatus(t, r, "wired", StatusAvailable)
 }
 
@@ -728,12 +801,17 @@ func shortLivedCommand() (string, []string) {
 	return "bash", []string{"-c", "sleep 6"}
 }
 
-// TestReconcilerReopensChannelOfDeadProcess pins what sharing means for a process
-// that dies after it was reported available: the extension goes unavailable with
-// the exit line it left behind, and comes back on a channel opened on the SAME
-// session. The connection was never the problem, so redialing the host — and
-// dropping every other extension on it — would be the wrong repair.
-func TestReconcilerReopensChannelOfDeadProcess(t *testing.T) {
+// TestReconcilerReportsAnInstanceThatEnded pins what an on-demand extension does
+// with a process that exits after it was reported available: the instance is gone,
+// the exit line it left behind is recorded as the reason, and nothing is reopened
+// on its own — the next caller asks, and gets an instance built from the template
+// again (issue #183).
+//
+// The reason is the product here. A handle whose process exited is dead either
+// way, so what the daemon owes the caller is not a repair but the diagnosis: "the
+// process exited with code 7" is the difference between a wrong template and a
+// wrong host.
+func TestReconcilerReportsAnInstanceThatEnded(t *testing.T) {
 	r := startReconciler(t)
 	ext := Preset(KindMCP)
 	ext.Name = "short-lived"
@@ -741,8 +819,9 @@ func TestReconcilerReopensChannelOfDeadProcess(t *testing.T) {
 	ext.Command, ext.Args = shortLivedCommand()
 	mustSave(t, r.store, &ext)
 
+	wantExtension(t, r, "short-lived")
 	st := waitForStatus(t, r, "short-lived", StatusAvailable)
-	session, firstShell := st.SessionID, st.ShellID
+	firstShell := st.ShellID
 	if firstShell == "" {
 		t.Fatal("an mcp extension should report the channel it runs on")
 	}
@@ -752,15 +831,14 @@ func TestReconcilerReopensChannelOfDeadProcess(t *testing.T) {
 	//
 	// 25s, not 12s: the countdown does not start until the process has been reported
 	// available, and it then has to outlive shortLivedCommand (6s) plus however long
-	// a CI runner takes to start PowerShell, notice the exit, and reopen a channel.
-	// 12s left no margin once the first two were slow.
+	// a CI runner takes to start PowerShell and notice the exit.
 	deadline := time.Now().Add(25 * time.Second)
 	for {
-		r.Trigger()
+		r.Sync(t.Context(), "")
 		cur, _ := r.Status("short-lived")
-		if cur.Status == StatusAvailable && cur.ShellID != "" && cur.ShellID != firstShell {
-			if cur.SessionID != session {
-				t.Errorf("the channel was reopened on a new session (%q → %q); the connection was not the problem", session, cur.SessionID)
+		if cur.Instances == 0 {
+			if cur.Status == StatusAvailable {
+				t.Errorf("an extension with no instances should not read as available: %+v", cur)
 			}
 			found := false
 			for _, f := range cur.Failures {
@@ -771,10 +849,19 @@ func TestReconcilerReopensChannelOfDeadProcess(t *testing.T) {
 			if !found {
 				t.Errorf("the process's death should be recorded as a session failure, got %+v", cur.Failures)
 			}
+			if cur.ClosedShellID != firstShell {
+				t.Errorf("the instance that ended should be named in the reply, got %q want %q", cur.ClosedShellID, firstShell)
+			}
+			// Asking again is the repair, and it gets a channel of its own.
+			wantExtension(t, r, "short-lived")
+			again := waitForStatus(t, r, "short-lived", StatusAvailable)
+			if again.ShellID == "" || again.ShellID == firstShell {
+				t.Errorf("a new ask should get a new channel, got %q (first was %q)", again.ShellID, firstShell)
+			}
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the dead process was not replaced on the same session (last: %+v)", cur)
+			t.Fatalf("the ended process was never noticed (last: %+v)", cur)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

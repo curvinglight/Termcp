@@ -79,6 +79,18 @@ func resultText(res *mcpgo.CallToolResult) string {
 	return ""
 }
 
+// useExtension asks for an on-demand extension, which is what an agent does before
+// it can drive one (issue #183): the reconciler does not dial a template that
+// declares no forward until something asks, and asking is action=use — the same
+// thing `open ext <name>` does in the terminal language.
+//
+// The wait helpers deliberately do not call it: a test that expects an extension up
+// says so in one visible line, and a test that expects it to stay down says nothing.
+func useExtension(t *testing.T, s *Server, name string) map[string]any {
+	t.Helper()
+	return callExtension(t, s, map[string]any{"action": "use", "name": name})
+}
+
 // waitForExtensionStatus polls the tool's own list output until name reports
 // want, so the test observes the surface an agent would.
 func waitForExtensionStatus(t *testing.T, s *Server, name, want string) map[string]any {
@@ -155,6 +167,7 @@ func TestExtensionCreateGetList(t *testing.T) {
 		t.Error("the skill preset's notes should reach get")
 	}
 
+	useExtension(t, s, "docs")
 	listed := waitForExtensionStatus(t, s, "docs", extensions.StatusAvailable)
 	if listed["session_id"] == nil || listed["session_id"] == "" {
 		t.Errorf("an available extension should list its session id, got %v", listed)
@@ -330,6 +343,7 @@ func TestExtensionRetryBringsUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	useExtension(t, s, "flaky")
 	st := waitForExtensionFailure(t, s, "flaky", "start", "session")
 	failure, _ := st["last_failure"].(map[string]any)
 	if failure == nil {
@@ -344,6 +358,7 @@ func TestExtensionRetryBringsUp(t *testing.T) {
 		"action": "update", "name": "flaky", "command": blockingCommand(), "args": []any{},
 	})
 	callExtension(t, s, map[string]any{"action": "retry", "name": "flaky"})
+	useExtension(t, s, "flaky")
 	waitForExtensionStatus(t, s, "flaky", extensions.StatusAvailable)
 }
 
@@ -357,6 +372,7 @@ func TestExtensionUpdateRestarts(t *testing.T) {
 		"action": "create", "name": "live", "kind": "prompt", "target": "internal",
 		"command": blockingCommand(), "args": []any{},
 	})
+	useExtension(t, s, "live")
 	before := waitForExtensionStatus(t, s, "live", extensions.StatusAvailable)
 	sid, _ := before["session_id"].(string)
 	shellID, _ := before["shell_id"].(string)
@@ -373,10 +389,16 @@ func TestExtensionUpdateRestarts(t *testing.T) {
 
 	deadline := time.Now().Add(8 * time.Second)
 	for {
+		useExtension(t, s, "live")
 		after := waitForExtensionStatus(t, s, "live", extensions.StatusAvailable)
 		if newShell, _ := after["shell_id"].(string); newShell != "" && newShell != shellID {
-			if newSid, _ := after["session_id"].(string); newSid != sid {
-				t.Errorf("the edit reopened the channel but replaced the shared session (%q → %q)", sid, newSid)
+			// THE CONNECTION IS NOT PROMISED ACROSS AN EDIT (issue #183). An on-demand
+			// extension holds nothing while nobody is using it, so the edit closes the
+			// instance and the connection goes with it; what the test is about is that
+			// the channel the tool hands out afterwards is a NEW one, running what the
+			// template now says.
+			if newSid, _ := after["session_id"].(string); newSid == "" {
+				t.Errorf("the rebuilt channel should report the session it runs on, got %v", after)
 			}
 			return
 		}
@@ -399,6 +421,7 @@ func TestExtensionSessionsStayOutOfSessionList(t *testing.T) {
 		"action": "create", "name": "quiet", "kind": "prompt", "target": "internal",
 		"command": blockingCommand(), "args": []any{},
 	})
+	useExtension(t, s, "quiet")
 	st := waitForExtensionStatus(t, s, "quiet", extensions.StatusAvailable)
 	sid, _ := st["session_id"].(string)
 	if sid == "" {

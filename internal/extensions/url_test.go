@@ -320,6 +320,7 @@ func TestURLTemplateAvailableWithoutAnExternalBinary(t *testing.T) {
 		t.Fatalf("saving the endpoint template: %v", err)
 	}
 
+	wantExtension(t, r, "http-mcp")
 	st := waitForStatus(t, r, "http-mcp", StatusAvailable)
 	if st.ShellID == "" {
 		t.Fatal("an endpoint extension should report the channel its relay runs on")

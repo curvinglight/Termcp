@@ -37,12 +37,20 @@ var _extRows = null;
 
 // Reconciler statuses, in the order the panel lists them: what can be used
 // first, what is being brought up, what needs attention, what was put away.
-var EXT_STATUS_ORDER = ['available', 'probing', 'unavailable', 'disabled'];
+/* Order is the panel's reading order, and it is a claim about what the reader
+   should look at first: something running, then something one ask away, then
+   something trying, then something down, then something parked. */
+var EXT_STATUS_ORDER = ['available', 'idle', 'probing', 'unavailable', 'disabled'];
 
 // The lamp class is keyed on the status, so a status the panel has never seen
 // falls back to the down lamp rather than to no dot at all.
 var EXT_LAMP_CLASSES = {
   available: 'is-online',
+  /* On demand and nothing asked: not broken and not running, so neither the
+     online lamp (which would claim a process) nor the offline one (which would
+     claim a fault). The faint lamp is the honest one, and the word beside it
+     says why. */
+  idle: 'is-disabled',
   probing: 'is-connecting',
   unavailable: 'is-offline',
   disabled: 'is-disabled'
@@ -65,6 +73,7 @@ function extLampClass(status) {
 function extStatusLabel(status) {
   switch (status) {
     case 'available': return t('ext.status.available');
+    case 'idle': return t('ext.status.idle');
     case 'probing': return t('ext.status.probing');
     case 'disabled': return t('ext.status.disabled');
     default: return t('ext.status.unavailable');
@@ -128,6 +137,12 @@ function renderExtensionGrid(rows) {
      disappeared when empty was a panel the author could not open to author
      with. */
   grid.innerHTML = '';
+  /* THE PLATE'S WORDS ARE ITS EMPTY STATE, so they go the moment a card exists —
+     the same rule the archive applies to its own sentence. The element stays in
+     the DOM (it is part of the plate) and is toggled, never re-created: a node
+     that came and went would be another thing the next render has to know about. */
+  var inscription = document.getElementById('ext-inscription');
+  if (inscription) inscription.hidden = list.length > 0;
   if (list.length === 0) {
     grid.appendChild(renderExtensionEmpty());
   } else {
@@ -192,15 +207,20 @@ function paintExtensionStat() {
 function renderExtensionCard(ext) {
   var tile = document.createElement('div');
   var lamp = extLampClass(ext.status);
-  var retryable = ext.status === 'unavailable' || ext.status === 'probing';
+  /* AN ON-DEMAND EXTENSION IS STARTED BY ASKING, AND THIS KEY IS THE ASK. It is
+     the same key for a down extension because it means the same thing to a human
+     either way — bring it up now — and only its tooltip differs: "retry" is a
+     repair, "start" is a first use. */
+  var retryable = ext.status === 'unavailable' || ext.status === 'probing' || ext.status === 'idle';
+  var retryTitle = ext.status === 'idle' ? t('ext.use.title') : t('ext.retry.title');
   var selected = _extBatch.has(ext.name);
   tile.className = 'conn-tile entry-card ext-card' + (selected ? ' batch-selected' : '');
   tile.setAttribute('data-ext-name', ext.name || '');
   tile.setAttribute('data-ext-status', ext.status || '');
   var name = ext.name || '';
   var retryBtn = retryable
-    ? '<button type="button" class="ext-retry-btn" title="' + escapeHtml(t('ext.retry.title')) +
-      '" aria-label="' + escapeHtml(t('ext.retry.title')) + '">' + SVG_EXT_RETRY + '</button>'
+    ? '<button type="button" class="ext-retry-btn" title="' + escapeHtml(retryTitle) +
+      '" aria-label="' + escapeHtml(retryTitle) + '">' + SVG_EXT_RETRY + '</button>'
     : '';
   /* The gear opens the configuration, the way the host cards' own gear does: the
      card is the readout, and the one thing a human reaches for by hand is filed
@@ -693,7 +713,7 @@ function paintExtensionWindow(win, name) {
   }
 
   var retryBtn = win.querySelector('.ext-win-retry');
-  if (retryBtn) retryBtn.disabled = !(row.status === 'unavailable' || row.status === 'probing');
+  if (retryBtn) retryBtn.disabled = !(row.status === 'unavailable' || row.status === 'probing' || row.status === 'idle');
   var toggleBtn = win.querySelector('.ext-win-toggle');
   if (toggleBtn) toggleBtn.textContent = row.enabled ? t('ext.status.disable') : t('ext.status.enable');
   /* A taller readout is still the card the click asked for, in the middle. */

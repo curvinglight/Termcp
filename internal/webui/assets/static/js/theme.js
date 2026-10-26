@@ -394,6 +394,8 @@ function initThemeControls() {
      stacking context (see the rule in base.css). */
   picker.addEventListener('toggle', function () {
     if (document.body) document.body.classList.toggle('header-theme-open', picker.open);
+    /* One header menu at a time — see closeHeaderMenus in i18n.js. */
+    if (picker.open && typeof closeHeaderMenus === 'function') closeHeaderMenus('theme-switch');
     if (picker.open) loadThemeChoices();
   });
   document.addEventListener('click', function (e) { if (!picker.contains(e.target)) picker.open = false; });

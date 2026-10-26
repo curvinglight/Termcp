@@ -43,9 +43,18 @@ jobs:
         # Keep these flags in sync with the Makefile `test` target; the stress
         # variant (make test-stress) perturbs scheduling to flush out lifecycle
         # races that -race cannot see. See docs/agents/testing.md.
-        # 600s is a hang detector, not a budget: internal/mcp alone is ~190s
-        # locally (issue #189 measured 168-196s across three runs).
-        run: go test ./... -count=1 -shuffle=on -race -timeout 600s
+        #
+        # The TIMEOUT is the one flag that deliberately differs from `make test`.
+        # -timeout is a hang detector, not a budget, and 600s was tuned against
+        # this desk (internal/mcp alone measures 168-196s here, issue #189). A
+        # shared runner is several times slower under -race — two vCPUs, a cold
+        # page cache and three OSes' worth of neighbours — so the same package can
+        # cross 600s while still making progress, and the run dies with
+        # "panic: test timed out" that names no failing test. 1800s is still a hang
+        # detector (a real hang sits there doing nothing); the job-level
+        # timeout-minutes is what stops a wedged runner.
+        timeout-minutes: 45
+        run: go test ./... -count=1 -shuffle=on -race -timeout 1800s
 
       - name: Test pure-API build
         run: |

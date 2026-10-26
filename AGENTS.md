@@ -45,8 +45,10 @@ files exactly — the final release is its own PR (`release/v0.2.8`).
 
 Whenever you write or modify a test, remember it must pass in
 `.github/workflows/test.yml` — ubuntu, macos and windows, via
-`go test ./... -count=1 -shuffle=on -race -timeout 600s` (identical to
-`make test`). For races the detector cannot see — filesystem and lifecycle
+`go test ./... -count=1 -shuffle=on -race` (`make test` locally, with a tighter
+`-timeout`: CI widens it because a shared runner is several times slower, and a
+run killed by `-timeout` names no failing test). For races the detector cannot
+see — filesystem and lifecycle
 races — run `make test-stress` locally before pushing. Assume concurrency, a
 fresh runner, and dirty state from other tests or processes. Never hardcode a
 shared absolute path; `t.TempDir()` is the default. See

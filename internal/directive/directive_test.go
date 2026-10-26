@@ -689,6 +689,14 @@ func fillUsageStubs(s string) string {
 		}
 		s = s[:start] + stub + s[start+end+1:]
 	}
+	// A BARE `N` IN AN ADDRESS IS A NUMBER TOO. `read <session> cdp:N --at FRAME`
+	// documents an inline key, and a key is only a key when it parses as a number —
+	// so the un-substituted `cdp:N` is a stray word, and the directives that take an
+	// address now refuse stray words instead of ignoring them (issue #199).
+	for _, kind := range []string{"cdp", "mcp", "jrpc"} {
+		s = strings.ReplaceAll(s, " "+kind+":N", " "+kind+":1")
+	}
+	s = strings.ReplaceAll(s, "<session>:N", "x:1")
 	return strings.Join(strings.Fields(s), " ")
 }
 

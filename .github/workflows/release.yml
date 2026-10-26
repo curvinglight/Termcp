@@ -56,6 +56,24 @@ jobs:
               .
           done
 
+      - name: Compress
+        run: |
+          # A SINGLE-FILE .gz PER PLATFORM, published NEXT TO the raw executables.
+          # The npm wrapper prefers these: `curl -fsSL <asset>.gz | gunzip > termcp`
+          # is one pipe with no tar to unpack, and for a package that is one file a
+          # tarball was only ever tar's header around the same bytes.
+          #
+          # -n keeps the name and timestamp out of the header, so the same build
+          # produces the same bytes on any runner; a release asset that changes
+          # hash between runs is a release asset nobody can verify.
+          for f in dist/termcp-*; do
+            case "$f" in
+              *.gz) continue ;;
+            esac
+            gzip -9 -n -c "$f" > "$f.gz"
+          done
+          ls -l dist
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

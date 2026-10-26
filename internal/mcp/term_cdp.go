@@ -547,9 +547,13 @@ func (s *Server) cdpEvents(ctx context.Context, stmt directive.Statement, h *jrp
 		return re.MatchString(f.Data)
 	}, page)
 	if len(frames) == 0 {
-		return envelope.Slot{Code: 204, Headers: map[string]string{
+		// NOTHING AFTER `--since` IS A 204 THAT DID NOT DELIVER, and Latest is what tells a
+		// caller whether it fell behind or asked past the end. Both facts ride in the
+		// Hint header, because a 204 with a body contradicts its own status line (see
+		// noContentSaying).
+		return noContentSaying(map[string]string{
 			"Path": stmt.Path, "Latest": fmt.Sprint(stats.Seq),
-		}, Body: "no frames after " + fmt.Sprint(since) + " (latest is " + fmt.Sprint(stats.Seq) + ")"}
+		}, "no frames after "+fmt.Sprint(since)+" (latest is "+fmt.Sprint(stats.Seq)+")")
 	}
 	var b strings.Builder
 	for _, f := range frames {
@@ -609,7 +613,7 @@ func (s *Server) cdpSend(ctx context.Context, stmt directive.Statement, h *jrpcH
 // call just uses that session. It is NOT for multi-step work — the
 // domain enablement a page event depends on dies with the session — so the reply
 // says that when the frame looks like a first step.
-func (s *Server) cdpCall(ctx context.Context, stmt directive.Statement, h *jrpcHandle, target string, frame map[string]any) envelope.Slot {
+func (s *Server) cdpCall(ctx context.Context, stmt directive.Statement, h *jrpcHandle, win termArgs, target string, frame map[string]any) envelope.Slot {
 	handle := peerAddress(h.sessionID, h.kind, h.index)
 	if transient := cdpTransientTarget(stmt.Key); transient != "" {
 		sess, slot, ok := s.cdpTransientSession(ctx, stmt, h, transient)
@@ -630,7 +634,7 @@ func (s *Server) cdpCall(ctx context.Context, stmt directive.Statement, h *jrpcH
 		if err != nil {
 			return cdpFailure(stmt, frameMethod(frame), err)
 		}
-		return s.frameReply(ctx, stmt, h, reply)
+		return s.frameReply(ctx, stmt, h, reply, win)
 	}
 	if target != "" {
 		sess, problem := h.cdp.resolve(handle, target)
@@ -652,7 +656,7 @@ func (s *Server) cdpCall(ctx context.Context, stmt directive.Statement, h *jrpcH
 	if err != nil {
 		return cdpFailure(stmt, frameMethod(frame), err)
 	}
-	return s.frameReply(ctx, stmt, h, reply)
+	return s.frameReply(ctx, stmt, h, reply, win)
 }
 
 // cdpTransientTarget returns the targetId in `cdp@ABC123`, or "".
@@ -761,8 +765,8 @@ func truncateForReply(s string) string {
 // frameReply renders one frame as a reply, applying the two transformations every
 // frame deserves on its way out: the peer's JSON escapes become characters, and an
 // oversized payload becomes a receipt.
-func (s *Server) frameReply(ctx context.Context, stmt directive.Statement, h *jrpcHandle, reply string) envelope.Slot {
-	// A BIG PAYLOAD IS A RECEIPT, NOT A WALL OF TEXT.
+func (s *Server) frameReply(ctx context.Context, stmt directive.Statement, h *jrpcHandle, reply string, win termArgs) envelope.Slot {
+	// A PAYLOAD THAT DOES NOT FIT IS A RECEIPT, NOT A WALL OF TEXT.
 	//
 	// The space window would truncate it, and a truncated JSON document is the worst
 	// of both worlds: it is too big to have been worth the tokens and too broken to
@@ -771,9 +775,24 @@ func (s *Server) frameReply(ctx context.Context, stmt directive.Statement, h *jr
 	// out a slice at a time, which is also the only way to look at the middle of a
 	// 46 KB DOM dump.
 	//
-	// The threshold is deliberately below the window: the caller should not have to
-	// discover the window to learn that paging exists.
-	const inlineLimit = 4096
+	// "DOES NOT FIT" MEANS THE CALLER'S WINDOW, NOT A CONSTANT (issue #204).
+	//
+	// This was a hardcoded 4096, and the two doors to a peer each had their own copy of
+	// it. So `call … --bytes 32768` answered with a 512-byte preview and no header
+	// saying why — on a tool whose own documentation promises the opposite ("NEITHER
+	// HAS A HARD CAP … a larger value is honoured", term.go). The size of a reply is
+	// the caller's decision to make: it is the party paying for the tokens and the only
+	// one that knows whether it is reading a title or a DOM dump.
+	//
+	// The receipt is still the fallback for the case it was written for — a frame
+	// larger than the window the caller chose — so no truncated JSON can appear either
+	// way. What changed is who picks the number.
+	inlineLimit := win.BytesLimit
+	if inlineLimit <= 0 {
+		// 0 means "hand back the channel, consume nothing", which cannot also mean
+		// "inline everything": the only window left is the default.
+		inlineLimit = defaultBytesLimit
+	}
 	if body := encoding.UnescapeJSON(reply); len(body) > inlineLimit {
 		if rec, ok := h.ch.LastAnswer(); ok {
 			// Bytes and Decoded-Bytes mean the same thing here as they do in `read --at`:
@@ -782,7 +801,7 @@ func (s *Server) frameReply(ctx context.Context, stmt directive.Statement, h *jr
 			return envelope.Slot{Code: 200, Headers: map[string]string{
 				"Path": stmt.Path, "Frame": fmt.Sprint(rec.N),
 				"Bytes": fmt.Sprint(len(rec.Data)), "Decoded-Bytes": fmt.Sprint(len(body)),
-			}, Body: receiptBody(rec.N, body, len(rec.Data), stmt, h)}
+			}, Body: receiptBody(rec.N, body, len(rec.Data), inlineLimit, stmt, h)}
 		}
 	}
 	// A PEER THAT ANSWERED WITH AN ERROR DID NOT SUCCEED. A 200 whose body happens to
@@ -932,7 +951,7 @@ func frameBelongsTo(data, sessionID string) bool {
 // line or two and making the caller page just to find out what they are holding is a
 // round trip for nothing. The head is cut from the same bytes the pager serves, so it
 // is exactly the start of what `--offset 0` returns.
-func receiptBody(n int64, body string, logBytes int, stmt directive.Statement, h *jrpcHandle) string {
+func receiptBody(n int64, body string, logBytes int, limit int, stmt directive.Statement, h *jrpcHandle) string {
 	const preview = 512
 	head := body
 	if len(head) > preview {
@@ -949,7 +968,14 @@ func receiptBody(n int64, body string, logBytes int, stmt directive.Statement, h
 	// would have been handed; logBytes is the same frame as the log stores it, which is
 	// the coordinate system --offset counts in. They differ only where the peer escaped
 	// non-ASCII, and saying so is what makes the two numbers in the headers add up.
-	b.WriteString(fmt.Sprintf("frame %d is %s of text, too big to inline.\n", n, humanBytes(int64(len(body)))))
+	// NAME THE WINDOW, NOT A MYSTERY. "too big to inline" used to be the whole
+	// explanation, and the number behind it was a constant in this file — so a caller
+	// that had asked for 32 KB read the same sentence as one that had asked for 4 KB,
+	// and could not tell that the limit was its own (issue #204). The size named here
+	// is the one that stopped it.
+	b.WriteString(fmt.Sprintf("frame %d is %s of text; this reply was asked for at most %s, so it is a receipt instead.\n",
+		n, humanBytes(int64(len(body))), humanBytes(int64(limit))))
+	b.WriteString("Ask for a bigger window to get it whole (--bytes N), or page it from the log.\n")
 	if logBytes != len(body) {
 		b.WriteString("It is " + humanBytes(int64(logBytes)) + " in the log, and --offset counts those bytes.\n")
 	}

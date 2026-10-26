@@ -177,8 +177,30 @@ function paintClients(mcpClients, viewers) {
     if (!menu || menu._termcpClientsWired) return;
     menu._termcpClientsWired = true;
     menu.addEventListener('toggle', function () {
-      if (!menu.open || !_clientsLast) return;
+      if (!menu.open) return;
+      /* One header menu at a time — see closeHeaderMenus in i18n.js. */
+      if (typeof closeHeaderMenus === 'function') closeHeaderMenus('clients-menu');
+      if (!_clientsLast) return;
       paintClients(_clientsLast[0], _clientsLast[1]);
+    });
+    /* A header menu closes when the user moves to another one.
+     *
+     *  The theme switch and the language menu already did this; this panel did
+     *  not, and that is the whole reason one menu could cover another: all three
+     *  are children of the header and share one rung of the ladder
+     *  (--z-dropdown), so paint order among them is DOM order — and this panel is
+     *  the LAST of the three in the header, so it won over every menu opened
+     *  after it. The reader saw the trigger they had just pressed render its menu
+     *  underneath this one.
+     *
+     *  Closing the old menu is the fix rather than ranking the new one higher:
+     *  two header menus open at once is a state worth nothing (they do not talk
+     *  to each other, and the second click is always "I meant that one"), so
+     *  removing it leaves nothing for a z-index to arbitrate. It also keeps the
+     *  ladder as it is — no rung is added for a condition that no longer
+     *  happens. */
+    document.addEventListener('click', function (e) {
+      if (menu.open && !menu.contains(e.target)) menu.open = false;
     });
   }
   if (document.readyState === 'loading') {

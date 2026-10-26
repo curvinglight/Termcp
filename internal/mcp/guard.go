@@ -173,6 +173,12 @@ func (g toolGuard) sessionForForwardID(id string) *session.Session {
 // this function does not is a hole straight through the whitelist.
 func (g toolGuard) sessionForShellID(shellID string) *session.Session {
 	if cs := g.server.sessMgr.GetChildShell(shellID); cs != nil {
+		// THE CHANNEL IS THE PRECISE ANSWER, so it is the one renewed: two instances
+		// of one extension share a session, and renewing by session would tell the
+		// daemon that both are in use when only one is.
+		if g.server.extensions != nil {
+			g.server.extensions.Touch(shellID, cs.ParentSessionID())
+		}
 		return g.server.sessMgr.Get(cs.ParentSessionID())
 	}
 	// GetSessionByShellID also searches retained DEAD/restored snapshots, which
@@ -189,6 +195,22 @@ func (g toolGuard) sessionForShellID(shellID string) *session.Session {
 // short `sid:N` handle. The same security note applies: a spelling the resolver
 // misses is a spelling the guard does not gate.
 func (g toolGuard) sessionForSessionID(id string) *session.Session {
+	sess := g.lookupSessionID(id)
+	if sess != nil {
+		// THE DAEMON'S ONLY "STILL IN USE" SIGNAL. Resolving a session by id is
+		// what every tool call that drives one does first, so it is the one place
+		// that learns somebody is still using an on-demand extension — and without
+		// it the idle clock would measure "nobody called open recently" instead of
+		// "nobody is driving it", reaping a channel in the middle of a long read
+		// (issue #183).
+		if g.server.extensions != nil {
+			g.server.extensions.Touch("", sess.ID)
+		}
+	}
+	return sess
+}
+
+func (g toolGuard) lookupSessionID(id string) *session.Session {
 	if sess := g.server.sessMgr.Get(id); sess != nil {
 		return sess
 	}

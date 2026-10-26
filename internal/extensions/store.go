@@ -30,18 +30,22 @@ var ErrExists = errors.New("extension already exists")
 type Store struct {
 	dataDir  string
 	mu       sync.Mutex
-	onChange atomic.Value // func(), fired after Save/Delete/Rename
+	onChange atomic.Value // func(name string), fired after Save/Delete/Rename
 }
 
-// SetOnChange registers a callback fired after a template changes. The
-// reconciler uses it to re-evaluate what should be warm.
-func (s *Store) SetOnChange(fn func()) {
+// SetOnChange registers a callback fired after a template changes, naming it.
+//
+// THE NAME IS THE POINT. Without it the only thing a subscriber can do is list the
+// whole store and compare it against what it holds — a walk, in other words, with
+// a diff in place of a clock. With it, the write says which template moved, and the
+// runtime does exactly that template.
+func (s *Store) SetOnChange(fn func(name string)) {
 	s.onChange.Store(fn)
 }
 
-func (s *Store) notifyChange() {
-	if fn, _ := s.onChange.Load().(func()); fn != nil {
-		fn()
+func (s *Store) notifyChange(name string) {
+	if fn, _ := s.onChange.Load().(func(string)); fn != nil {
+		fn(name)
 	}
 }
 
@@ -198,11 +202,16 @@ func (s *Store) Save(e *Extension) error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.saveLocked(e); err != nil {
+	err := s.saveLocked(e)
+	s.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	s.notifyChange()
+	// ANNOUNCED AFTER THE LOCK IS RELEASED. The subscriber reads the template back
+	// through this same store, so calling it under s.mu was a deadlock waiting for a
+	// subscriber that does more than signal a channel — which is exactly what the
+	// reconciler became when it stopped walking and started syncing by name.
+	s.notifyChange(e.Name)
 	return nil
 }
 
@@ -232,11 +241,12 @@ func (s *Store) Delete(name string) error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.removeLocked(p); err != nil {
+	err = s.removeLocked(p)
+	s.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	s.notifyChange()
+	s.notifyChange(name)
 	return nil
 }
 

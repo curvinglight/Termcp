@@ -133,7 +133,8 @@ func TestAnOversizedFrameIsAReceiptAndPagesBack(t *testing.T) {
 	if !strings.HasPrefix(got, "TERM/1 2") {
 		t.Fatalf("the oversized answer was not accepted:\n%s", got)
 	}
-	if !strings.Contains(got, "too big to inline") {
+	// The receipt names the WINDOW that stopped it now, not a constant (issue #204).
+	if !strings.Contains(got, "so it is a receipt instead") {
 		t.Fatalf("a 36 KB answer was inlined instead of receipted:\n%s", got)
 	}
 	if !strings.Contains(got, "--at") {

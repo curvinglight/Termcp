@@ -186,6 +186,108 @@ type Window struct {
 	// `Content-Range: bytes 0-7/8`, then consumed all eight. The count is what lets the
 	// reply say "eight bytes went past, here is the flag that shows them".
 	StreamOmitted int64
+
+	// Stream names the stream whose numbers Start/End/Total are in: "e", "o", or ""
+	// for the channel itself. When it is set, the four fields above are CHANNEL
+	// coordinates and StreamStart/StreamEnd/StreamTotal are the reply's.
+	//
+	// TWO COORDINATE SYSTEMS, ON PURPOSE, because the two consumers of a window need
+	// different ones. A caller pages with the numbers in the reply, and those have to
+	// address the bytes the reply actually contains — a `--stream e` body is stderr,
+	// and the channel offset of a stderr byte is a number that also counts stdout,
+	// so paging with it lands on the wrong side of the channel (issue #202). The
+	// CURSOR is a channel position: one reader walks one write order, and the bytes
+	// it steps over are the ones StreamOmitted counts.
+	Stream string
+	// StreamStart/StreamEnd/StreamTotal are Start/End/Total renumbered without the
+	// other stream's bytes. StreamEnd-StreamStart is the delivered span in this
+	// stream's bytes.
+	StreamStart int64
+	StreamEnd   int64
+	StreamTotal int64
+}
+
+// streamCoords is one stream's numbering of a channel's bytes.
+//
+// The channel stays the single record — stdout and stderr are interleaved in one
+// write order, which is what makes "what did the process print, in what order"
+// answerable at all — and the stderr RANGES are the index that separates them. A
+// stream's numbering is therefore the channel's with the other stream's bytes
+// dropped, and both directions are a walk over those ranges.
+type streamCoords struct {
+	ranges [][2]int64 // stderr spans, ordered and disjoint, in channel offsets
+	stderr bool
+}
+
+// pos maps a channel byte position into this stream's numbering.
+func (c streamCoords) pos(channel int64) int64 {
+	if channel <= 0 {
+		return 0
+	}
+	n := int64(0)
+	for _, r := range c.ranges {
+		if r[0] >= channel {
+			break
+		}
+		end := r[1]
+		if end > channel {
+			end = channel
+		}
+		if end > r[0] {
+			n += end - r[0]
+		}
+	}
+	if c.stderr {
+		return n
+	}
+	return channel - n
+}
+
+// channel is the inverse: where this stream's n-th byte sits in the channel.
+//
+// A position past the end of the stream answers the channel position of the end,
+// which is what makes `--offset <one past the end>` an empty read rather than an
+// error — the same shape every other out-of-range offset has.
+func (c streamCoords) channel(n int64) int64 {
+	if n <= 0 {
+		if c.stderr {
+			if len(c.ranges) > 0 {
+				return c.ranges[0][0]
+			}
+			return 0
+		}
+		if len(c.ranges) > 0 && c.ranges[0][0] == 0 {
+			return c.ranges[0][1]
+		}
+		return 0
+	}
+	if c.stderr {
+		seen := int64(0)
+		for _, r := range c.ranges {
+			length := r[1] - r[0]
+			if n < seen+length {
+				return r[0] + (n - seen)
+			}
+			seen += length
+		}
+		if len(c.ranges) > 0 {
+			return c.ranges[len(c.ranges)-1][1]
+		}
+		return 0
+	}
+	// stdout: the bytes BETWEEN the stderr ranges.
+	seen, at := int64(0), int64(0)
+	for _, r := range c.ranges {
+		if r[0] < at {
+			continue
+		}
+		if n < seen+(r[0]-at) {
+			return at + (n - seen)
+		}
+		seen += r[0] - at
+		at = r[1]
+	}
+	return at + (n - seen)
 }
 
 // Read produces the window a read asked for. The four forms share a result
@@ -201,6 +303,37 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		return Window{}, errf(ErrInvalid, "reader_id requires a live shell; closed sessions are read with offset/tail_lines")
 	}
 
+	// THE SELECTED STREAM'S OWN NUMBERS (issue #202).
+	//
+	// `--stream e` used to be a VIEW: the body was stderr, the headers were the
+	// channel's. So `read --stream e` on a stdout-only channel answered
+	// `Content-Range: bytes */7` — "7 bytes here" — with an empty body, and a caller
+	// could not tell that from "you have already read all the stderr there is". The
+	// addresses a reply carries have to address the bytes the reply carries, or the
+	// two questions the header exists to answer ("how much is there", "where do I
+	// resume") are both unanswerable.
+	//
+	// The ranges are fetched once and used for both directions: the filter needs
+	// them, and so does the renumbering below.
+	var coords *streamCoords
+	if p.Stream == "e" || p.Stream == "o" {
+		if src.MsgMgr == nil {
+			return Window{}, errf(ErrInvalid, "stream filtering requires a persistent transcript log")
+		}
+		ranges, err := src.MsgMgr.StderrRanges(src.SessID, src.ShellID)
+		if err != nil {
+			return Window{}, errf(ErrOperation, "%s", err.Error())
+		}
+		coords = &streamCoords{ranges: ranges, stderr: p.Stream == "e"}
+		// AN OFFSET IN A STREAM READ IS AN OFFSET IN THAT STREAM. Handing the caller
+		// stream numbers in the reply and taking channel numbers in `--offset` would
+		// make `Next-Offset` unusable — a reply whose resumption point cannot be typed
+		// back in is the bug this fixes, not a different spelling of it.
+		if p.Offset != nil {
+			at := coords.channel(*p.Offset)
+			p.Offset = &at
+		}
+	}
 	var w Window
 	switch {
 	case p.FromLine > 0:
@@ -252,7 +385,7 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 				prev = start + int64(i)
 			}
 		}
-		filtered, omitted, err := filterStream(raw, start, src, p.Stream)
+		filtered, omitted, err := filterStream(raw, start, coords, p.Stream)
 		if err != nil {
 			return Window{}, err
 		}
@@ -287,7 +420,7 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		if err != nil {
 			return Window{}, errf(ErrOperation, "%s", err.Error())
 		}
-		filtered, omitted, err := filterStream(raw, st, src, p.Stream)
+		filtered, omitted, err := filterStream(raw, st, coords, p.Stream)
 		if err != nil {
 			return Window{}, err
 		}
@@ -316,7 +449,7 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		raw, trimmed := trimIncomplete(p.Charset, raw)
 		raw = truncateAtLines(raw, p.MaxLines)
 		end := offset + int64(len(raw))
-		filtered, omitted, err := filterStream(raw, offset, src, p.Stream)
+		filtered, omitted, err := filterStream(raw, offset, coords, p.Stream)
 		if err != nil {
 			return Window{}, err
 		}
@@ -340,6 +473,23 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		pre := src.Live.ReaderCursor(p.ReaderID)
 		if pre < 0 {
 			return Window{}, errf(ErrReader, "reader_id %d is not registered on this shell", p.ReaderID)
+		}
+		// A REFUSAL MUST NOT EAT THE BYTES (issue #200).
+		//
+		// ReadTerminalStream commits — it advances this reader as it hands the window
+		// over — so every check below answers a question about bytes that have ALREADY
+		// moved: can they survive JSON, does the caller's charset decode them. Refusing
+		// after the commit threw away exactly the data whose remedy the refusal named,
+		// and the caller could watch it happen: `read` answered 400 "pass --encoding gbk",
+		// the caller passed it, and got 204 with the byte count still on `get`.
+		//
+		// Putting them back is what makes this a rejection rather than a read whose
+		// answer was discarded. The seek is a no-op when the caller is already at `pre`,
+		// and refusing to fail the call over a failed seek keeps the reply about the
+		// bytes, which is what the caller asked about.
+		refuse := func(err error) (Window, error) {
+			_ = src.Live.SeekReader(p.ReaderID, pre)
+			return Window{}, err
 		}
 		// THE RULE THE BUFFER CANNOT KNOW. A byte window is cut wherever the caller's
 		// budget falls, and a cut inside a character is not the caller's data being
@@ -370,30 +520,57 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		if p.Charset != "" {
 			decoded, derr := encoding.Decode(p.Charset, raw)
 			if derr != nil {
-				return Window{}, errf(ErrInvalid, "%s", derr.Error())
+				return refuse(errf(ErrInvalid, "%s", derr.Error()))
 			}
 			raw = decoded
 			out = clean(raw, p.StripAnsi)
 		}
 		if p.RequireUTF8 {
 			if err := RenderCheck(raw); err != nil {
-				return Window{}, err
+				return refuse(err)
 			}
 		}
 		output := out
+		windowRaw := raw
+		// `=` AND NOT `:=`. A `:=` here declares a NEW omitted inside this if-block —
+		// the one the literal below reads is the outer one, which stays zero — so every
+		// filtered read on the live path reported `stream_omitted_bytes: 0` while the
+		// filter had passed over the whole window. `--offset 0` looked right only
+		// because its `:=` and its literal share a scope, and the two paths are supposed
+		// to be one behaviour (issue #203).
 		var omitted int64
 		if p.Stream != "" && p.Stream != "all" {
-			filtered, omitted, ferr := filterStream(raw, pre, src, p.Stream)
+			var filtered []byte
+			var ferr error
+			filtered, omitted, ferr = filterStream(raw, pre, coords, p.Stream)
 			if ferr != nil {
-				return Window{}, ferr
+				return refuse(ferr)
 			}
-			w.StreamOmitted = omitted
+			// Raw is the bytes Output was rendered FROM, which on a filtered read are the
+			// filtered ones. The other three read paths already store it that way; this one
+			// kept the channel window, so `Raw` and `Output` described different byte runs.
+			windowRaw = filtered
 			output = clean(filtered, p.StripAnsi)
 		}
-		// StreamOmitted goes in the literal, not on the line above: this assignment replaces
-		// the whole struct, so a field set before it is silently thrown away — which is
-		// exactly the shape of the bug the field exists to report.
-		w = Window{Output: output, Raw: raw, StreamOmitted: omitted, Start: pre, End: end, Total: total, HasMore: end < total, PartialTail: partial, Trimmed: trimmed}
+		// StreamOmitted goes in the literal: the assignment replaces the whole struct,
+		// so a field set before it is silently thrown away — which is exactly the shape
+		// of the bug the field exists to report, once by ordering and once by shadowing.
+		w = Window{Output: output, Raw: windowRaw, StreamOmitted: omitted, Start: pre, End: end, Total: total, HasMore: end < total, PartialTail: partial, Trimmed: trimmed}
+	}
+	// THE REPLY'S NUMBERS ARE THE SELECTED STREAM'S.
+	//
+	// Computed from the CHANNEL span [Start, End), not from len(Raw): Raw may have
+	// been re-encoded (a charset read turns GBK bytes into UTF-8 ones), and a window's
+	// address is a position in the stream, not the length of its rendering. HasMore is
+	// the same question asked in the same units — "does this stream hold bytes past
+	// what I just gave you" — because the channel's answer would be about the other
+	// stream's bytes (issue #202).
+	if coords != nil {
+		w.Stream = p.Stream
+		w.StreamStart = coords.pos(w.Start)
+		w.StreamEnd = coords.pos(w.End)
+		w.StreamTotal = coords.pos(w.Total)
+		w.HasMore = w.StreamEnd < w.StreamTotal
 	}
 	return w, nil
 }
@@ -459,22 +636,22 @@ func invalidUTF8Index(b []byte) int {
 	return -1
 }
 
-// filterStream keeps only the bytes of raw (which sits at stream offset start)
-// that stream asks for: "o" keeps everything outside the recorded stderr
-// ranges, "e" the bytes inside them, "" and "all" return raw unchanged. The
-// filter never moves an offset - the window's Start/End describe the raw
-// window whatever it returns; only the returned content changes.
-func filterStream(raw []byte, start int64, src *Source, stream string) (filtered []byte, omitted int64, err error) {
+// filterStream keeps only the bytes of raw (which sits at channel offset start)
+// that stream asks for: "o" keeps everything outside the recorded stderr ranges,
+// "e" the bytes inside them, "" and "all" return raw unchanged.
+//
+// It returns the bytes the selection left behind INSIDE this span, which is how
+// many channel bytes the caller's cursor moves past without being shown them.
+// The window's Start/End stay CHANNEL positions whatever it returns — the cursor
+// walk is a channel walk — and Read renumbers them for the reply (see streamCoords).
+func filterStream(raw []byte, start int64, coords *streamCoords, stream string) (filtered []byte, omitted int64, err error) {
 	if stream == "" || stream == "all" {
 		return raw, 0, nil
 	}
-	if src.MsgMgr == nil {
+	if coords == nil {
 		return nil, 0, errf(ErrInvalid, "stream filtering requires a persistent transcript log")
 	}
-	ranges, err := src.MsgMgr.StderrRanges(src.SessID, src.ShellID)
-	if err != nil {
-		return nil, 0, errf(ErrOperation, "%s", err.Error())
-	}
+	ranges := coords.ranges
 	out := selectBytes(raw, start, ranges, stream == "e")
 	// What the selection left behind, INSIDE this span. Non-zero means the caller's
 	// cursor is about to move past bytes it was not shown.

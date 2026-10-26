@@ -246,7 +246,11 @@ func TestNotchedPlatesKeepContentClearOfTheNotch(t *testing.T) {
 	css := readThemeCSS(t, "cyberpunk")
 	for _, want := range []string{
 		".modal-body { padding: 8px 16px; }",
-		".workspace-sessions .section-body { padding: 8px 16px; min-height: 180px; }",
+		// Two rules, not one: the inset belongs to every sessions body, the floor
+		// only to the hosts column. Collapsing them put a 180px floor under the
+		// extension plate, which grows with its own cards.
+		".workspace-sessions .section-body { padding: 8px 16px; }",
+		".workspace-sessions:not(.workspace-exts) .section-body { min-height: 180px; }",
 	} {
 		if !strings.Contains(css, want) {
 			t.Errorf("app.css has no content inset %q; padding belongs on content, not the "+

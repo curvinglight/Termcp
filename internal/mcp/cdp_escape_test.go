@@ -34,7 +34,8 @@ func TestPagedFrameDecodesJSONEscapes(t *testing.T) {
 	}
 
 	got := termText(t, s, map[string]any{"cmd": `call ` + conn + `@T1 {"method":"Runtime.evaluate"}`})
-	if !strings.Contains(got, "too big to inline") {
+	// The receipt names the WINDOW that stopped it now, not a constant (issue #204).
+	if !strings.Contains(got, "so it is a receipt instead") {
 		t.Fatalf("the answer should have been receipted, not inlined:\n%s", got)
 	}
 	frame, ok := headerValue(t, got, "Frame")

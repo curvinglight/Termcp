@@ -175,6 +175,12 @@ function connectUIWebSocket() {
                  per chunk while output streamed. */
               shellTermScrollToBottomSoon(tm);
             });
+            /* Output the reader was not looking at marks the session's dock tab.
+               Called with the WINDOW, not the frame id: whether this counts as
+               "something new" depends on which window is on top, which is a fact
+               about the page and not about the bytes. Early-returns on both steady
+               states, so a streaming window costs one property read per frame. */
+            if (typeof dockNoteOutput === 'function') dockNoteOutput(win);
           }
         }
       } else if (j.type === 'terminal_done') {
@@ -220,7 +226,15 @@ function connectUIWebSocket() {
            guess racing a server event for the same field. */
         var winA = getShellWindowBySid(j.shell_id);
         if (!winA) winA = findShellWindowByChannelSid(j.shell_id);
-        if (winA) shellStatusOnInput(winA, j.shell_id, j.src, j.submit);
+        if (winA) {
+          shellStatusOnInput(winA, j.shell_id, j.src, j.submit);
+          /* INPUT COUNTS AS A CHANGE. The frame path marks output; a keystroke that
+             reached a window nobody is watching is the same news — it is how an
+             agent driving a session becomes visible without the reader scanning the
+             bar. Same predicate, so a window being typed into while it is on top
+             still says nothing. */
+          if (typeof dockNoteOutput === 'function') dockNoteOutput(winA);
+        }
       } else if (j.type === 'ui_notify') {
         // Pushed by the MCP notify_user tool: toast + system notification +
         // optional session-card highlight.

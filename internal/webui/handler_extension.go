@@ -322,6 +322,17 @@ func (h *Handler) saveExtensionTemplate(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// SAVING FROM THE PANEL IS AN ASK (issue #183). An extension that declares no
+	// forward is not dialled until something asks for it, and a person who has just
+	// filled in the form and pressed save is asking: leaving them with a row that
+	// says `idle` and no button that means "start it" would be a panel that cannot
+	// do the one thing the form is for. A LIST is still passive — the panel polling
+	// the extension table must not dial anything.
+	//
+	// The wait is zero because this is a request handler: the ask is what matters,
+	// and the panel's next poll shows the outcome. A resident template ignores the
+	// ask's timing entirely — the walk brings it up.
+	_, _ = h.Extensions.Acquire(ext.Name, 0)
 	st, _ := h.Extensions.Status(ext.Name)
 	writeJSON(w, status, map[string]any{"extension": summarizeExtension(ext, st)})
 }

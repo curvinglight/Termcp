@@ -69,8 +69,11 @@ endef
 test:
 	$(call race_notice,make test)
 	# -timeout is a HANG detector, not a budget: the heaviest package (internal/mcp)
-	# measures 190s locally and 152-196s on CI, so 240s left ~20% and a slower runner
-	# would have killed a package that was working. A real hang is still caught.
+	# measures 190s locally, so 240s left ~20% and a slower machine would have killed
+	# a package that was working. A real hang is still caught. 600s is tuned for THIS
+	# desk: CI runs the same flags with a wider -timeout (see test.yml), because a
+	# shared runner under -race is several times slower and a timeout there names no
+	# failing test.
 	go test ./... -count=1 -shuffle=on $(race_flag) -timeout 600s
 
 # Scheduling perturbation for the races -race cannot see (filesystem/lifecycle:

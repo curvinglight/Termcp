@@ -148,14 +148,12 @@ func TestEnsureForwardsKeepsWhatCameUpBeforeAFailure(t *testing.T) {
 	}
 	mustSave(t, r.store, &ext)
 
-	// The session and its tunnels come up on the probe goroutine, so the walk is
-	// driven repeatedly until the failure is recorded.
+	// The attempt runs on its own goroutine, so the failure is waited for rather
+	// than driven: the save above already told the reconciler which template moved.
 	st := r.state(ext.Name)
 	deadline := time.Now().Add(8 * time.Second)
 	for {
-		if err := r.reconcileAll(t.Context()); err != nil {
-			t.Fatal(err)
-		}
+		r.Sync(t.Context(), ext.Name)
 		snap := st.snapshot()
 		if len(snap.Failures) > 0 {
 			if len(snap.Forwards) == 0 {
@@ -193,18 +191,15 @@ func TestReconcileWalkRecordsTheFingerprintWhenTheGroupMoves(t *testing.T) {
 	ext.Paths = []string{"/srv/one/"}
 	mustSave(t, r.store, &ext)
 
-	// One walk brings it up and records the template it was built from.
-	if err := r.reconcileAll(t.Context()); err != nil {
-		t.Fatal(err)
-	}
+	// The save armed it; one sync brings it up and records the template it was built
+	// from.
+	r.Sync(t.Context(), ext.Name)
 
-	// The edit moves the group AND changes the fingerprint. One walk must record
+	// The edit moves the group AND changes the fingerprint. One sync must record
 	// both, or the next one calls it a change again.
 	ext.Paths = []string{"/srv/two/"}
 	mustSave(t, r.store, &ext)
-	if err := r.reconcileAll(t.Context()); err != nil {
-		t.Fatal(err)
-	}
+	r.Sync(t.Context(), ext.Name)
 
 	st := r.state(ext.Name)
 	st.mu.Lock()
@@ -260,7 +255,7 @@ func TestWalkReadsTheBackoffWindowUnderTheLock(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < rounds; i++ {
-			_ = r.reconcileAll(t.Context())
+			r.Sync(t.Context(), "raced")
 			runtime.Gosched()
 		}
 	}()

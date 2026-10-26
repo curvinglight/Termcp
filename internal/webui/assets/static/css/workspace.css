@@ -818,6 +818,13 @@
   color: var(--text-faint); opacity: .45;
   letter-spacing: .04em;
 }
+/* HIDDEN AS SOON AS THERE IS A CARD. It is the plate's empty state wearing a
+   watermark's clothes: at zero extensions it prints the panel's words on the
+   paper, and the moment a card exists the card is what the reader came for. Kept
+   in the layout it was text behind text — a slogan showing through a translucent
+   card, which is noise rather than texture. The archive sets this precedent: its
+   sentence appears only while the ledger is empty. */
+.ext-inscription[hidden] { display: none; }
 .ext-inscription-line:first-child {
   font-weight: 700; font-size: .68rem; letter-spacing: .12em;
   text-transform: uppercase; opacity: .75;
@@ -1202,28 +1209,25 @@
   border-bottom: 1px solid var(--border-subtle);
 }
 .archive-keys .ext-key { height: 28px; }
-/* ONE control at each end, not a cluster at the left.
+/* The row reads left to right as one sentence: how many are ticked, what you can
+ * do with them, and last the key that acts on the whole list.
  *
- * The invert key answers the whole list, so it sits at the left edge where a list's
- * own verbs live. Export and delete answer the SELECTION, they are the destructive
- * pair, and they sit at the right edge — furthest from the one key that must never
- * be mistaken for them. They used to be three keys in a row at the left, which put
- * the destructive pair shoulder to shoulder with the invert check and left the
- * whole right half of the bar empty.
+ *     ......... 3 [⤓] [🗑] [✓]
  *
- * THE COUNT LEADS THAT RIGHT-HAND RUN, which is the correction this rule carries.
- * It used to be the last item in the row, so the number sat in the far corner after
- * the trash key — a readout with no visible relation to the two keys it explains,
- * reading as a page total rather than as "three rows are ticked, so these two are
- * live". Leading the run makes the order the sentence the reader needs:
+ * The order is the risk order. Export and delete act on the SELECTION and they are
+ * the destructive pair, so they come first in the run and the invert key — the one
+ * key that must never be mistaken for them — comes last, where the eye arrives
+ * after it has read the two verbs. It used to lead the row, which put a
+ * list-wide check one 6px gap from the trash key for no reason other than that it
+ * had been there before the verbs did.
  *
- *     [✓] ......... 3 [⤓] [🗑]
+ * THE COUNT LEADS THE RUN. It used to be the last item, so the number sat in the
+ * far corner after the trash key — a readout with no visible relation to the keys
+ * it explains, reading as a page total rather than as "three rows are ticked, so
+ * these two are live".
  *
- * `margin-left: auto` is therefore on the COUNT: it is the first item of the
- * right-hand run, so pushing from it opens the gap after the invert key and carries
- * the verbs along. Nothing is ever inserted BEFORE the invert key — that is what
- * keeps it from sliding out from under the pointer on the press that changes the
- * selection.
+ * `margin-left: auto` is therefore on the COUNT: it is the first item of the run,
+ * so pushing from it opens the gap at the left edge and carries the rest along.
  *
  * The count is `hidden` (display: none) while the selection is empty, and an auto
  * margin on a box that is not laid out moves nothing — the same trap the archive
@@ -1416,7 +1420,21 @@
   text-transform: none; color: var(--text-secondary);
 }
 .workspace-sessions .section-header:hover { background-color: var(--bg-card-hover); }
-.workspace-sessions .section-body { padding: 8px 16px; min-height: 180px; }
+/* The padding is the column's, the FLOOR is only the hosts column's.
+ *
+ * The extension plate wears `.workspace-sessions` for its frame, so this rule used
+ * to reach it too — and its `min-height` landed at the same specificity as the
+ * plate's own `min-height: 77px`, winning on source order. One 74px card then sat
+ * in a 180px box with 98px of nothing under it, and a phone showed it worst
+ * because the plate is the whole page there. The floor is what belongs to the
+ * hosts column alone: that one is a full-height column with an add key pinned to
+ * its bottom edge, while the plate grows with its own cards.
+ *
+ * Splitting the two declarations rather than scoping the whole rule is the point:
+ * an earlier form excluded the plate from BOTH, which silently took its 8/16px
+ * inset with it and left every card flush against the plate's border. */
+.workspace-sessions .section-body { padding: 8px 16px; }
+.workspace-sessions:not(.workspace-exts) .section-body { min-height: 180px; }
 .workspace-sessions .conn-grid { gap: 12px; }
 
 /* The resource list is the only scrolling region, and it GROWS ONLY WHEN IT
@@ -1840,7 +1858,21 @@
      the narrow grid never replaced the wide one and the extension key was
      squeezed into the leftover 0px middle track. */
   .workspace-frame,
-  .workspace-frame.ext-on { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 8px 0; }
+  .workspace-frame.ext-on {
+    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start;
+    /* `align-content` IS THE ONE THAT MATTERS HERE, and leaving it at the initial
+       `normal` is what parked the extension plate in the middle of the page. A
+       wrapped flex container with room to spare distributes that room across its
+       LINES: the keys row above and the plate's row below each took half of the
+       leftover height, so the plate started 283px down the page with as much dead
+       space under it. Measured at 390x844: plate top 356 inside a frame that began
+       at 73. `flex-start` packs the lines to the top, which is the only reading
+       order a stack has.
+       `align-items` cannot do this — it aligns items WITHIN their line, and each
+       of these lines was already sized to its content. */
+    align-content: flex-start;
+    gap: 8px 0;
+  }
   /* ONE COLUMN, STACKED, SO THE PAGE SCROLLS AGAIN. The desktop rule makes body
      exactly one viewport tall and clips the workspace to it; here the plate takes a
      full row beneath the two triggers and grows with them, so the page has to be its

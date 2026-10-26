@@ -119,12 +119,13 @@ func TestArchiveToolbarIsAFlatKeyRow(t *testing.T) {
 			t.Errorf("the archive key row is missing %s", want)
 		}
 	}
-	/* The invert key LEADS the row and stays there. An earlier revision nested it
-	   inside the column's trigger to save the 30px; the toolbar is permanent now, so
-	   leading it is where a list-wide verb belongs, and it is also the position that
-	   never moves when the selection changes (nothing is ever inserted before it). */
-	if i, j := strings.Index(body, `id="archive-sel-invert"`), strings.Index(body, `id="archive-batch-export"`); i < 0 || j < 0 || i > j {
-		t.Error("the invert key must lead the toolbar, before the verbs")
+	/* The invert key TRAILS the row, after the two verbs. It acts on the whole list
+	   rather than on the selection, and the two keys it must never be confused with
+	   are the destructive pair — so the eye reaches it after it has read them, not
+	   before. An earlier revision led the row with it, which put a list-wide check
+	   one gap away from the trash key. */
+	if i, j := strings.Index(body, `id="archive-sel-invert"`), strings.Index(body, `id="archive-batch-delete"`); i < 0 || j < 0 || i < j {
+		t.Error("the invert key must trail the toolbar, after the verbs")
 	}
 	/* Nothing may start hidden: a key that is absent cannot be told apart from one
 	   that was never built, and revealing one reflows the row under the pointer. */
@@ -1009,17 +1010,19 @@ func TestTheArchiveCountLeadsTheRightHandRun(t *testing.T) {
 	if countPos < 0 || exportPos < 0 || deletePos < 0 || invertPos < 0 {
 		t.Fatal("the archive toolbar lost one of its controls")
 	}
-	// Invert first (a list-wide verb), then the count, then the two selection verbs.
-	if !(invertPos < countPos && countPos < exportPos && exportPos < deletePos) {
-		t.Error("the order must be invert, count, export, delete: the count leads the verbs it explains, " +
-			"and the destructive key takes the corner")
+	/* Count, then the two selection verbs, then invert: the count leads the keys it
+	   explains, the destructive pair comes before the list-wide check rather than
+	   after it, and the key that acts on the WHOLE list takes the last position. */
+	if !(countPos < exportPos && exportPos < deletePos && deletePos < invertPos) {
+		t.Error("the order must be count, export, delete, invert: the count leads the verbs it explains, " +
+			"the destructive pair comes ahead of the list-wide check, and invert takes the corner")
 	}
 
 	css := readAssetLF(t, "static/css/workspace.css")
 	/* The gap that pushes the run to the right sits on the COUNT (the first item
 	   of the run), and falls back to export while the count is hidden. Without the
 	   fallback, an empty selection has no auto margin at all — the count is
-	   display:none — and the two verbs slide over to the invert key. */
+	   display:none — and the whole run slides to the left edge. */
 	for _, want := range []string{
 		"#archive-toggle-count { margin-left: auto; }",
 		"#archive-toggle-count[hidden] + #archive-batch-export { margin-left: auto; }",

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -56,15 +57,25 @@ const (
 // a runaway write from filling the data directory.
 const MaxConfigSize = 1 << 20
 
+// DefaultIdleTimeout is how long an on-demand extension stays up after its last
+// use. Ten minutes is long enough to cover a run of calls that belong to one
+// task and short enough that a forgotten extension is not a permanent process on
+// the target.
+const DefaultIdleTimeout = 10 * time.Minute
+
 // Extension is one persisted template. Fields are grouped as the reader uses
 // them: identity, the session template, the capability restriction, and the
 // agent-facing note.
 type Extension struct {
 	// Identity. Name is the TOML-encoded file's directory name, not a TOML key,
 	// so it is never stored inside the file it names.
-	Name        string `toml:"-"`
-	Kind        string `toml:"kind"`
-	Target      string `toml:"target"` // an ssh_config profile name, or "internal"
+	Name   string `toml:"-"`
+	Kind   string `toml:"kind"`
+	Target string `toml:"target"` // an ssh_config profile name, or "internal"
+	// Description is the author's one-line summary, shown wherever the extension is
+	// listed. It does NOT reach the model by itself: nothing about the set of
+	// installed extensions goes into the MCP instructions, because the tool surface
+	// must not grow with what is installed (see docs/clients.md).
 	Description string `toml:"description,omitempty"`
 	// Enabled is *bool so that an explicit false survives a TOML round trip; a
 	// nil value means enabled, so a file that omits the key keeps working.
@@ -87,6 +98,17 @@ type Extension struct {
 	Args    []string `toml:"args,omitempty"`
 	Rows    int      `toml:"rows,omitempty"`
 	Cols    int      `toml:"cols,omitempty"`
+
+	// IdleTimeout closes the channel after this long with nothing asked of it.
+	//
+	// IT APPLIES TO THE EXTENSIONS THE RECONCILER STARTS ON DEMAND — every enabled
+	// template that declares no forward — and is ignored for one that does: a
+	// listener has no caller whose absence could mean "idle", so a template with a
+	// tunnel is up from startup and stays up (issue #183).
+	//
+	// A string rather than a time.Duration so the file reads the way the flag does
+	// ("10m", "90s"). Empty means DefaultIdleTimeout.
+	IdleTimeout string `toml:"idle_timeout,omitempty"`
 
 	// Capability restriction. Both are whitelists; an empty value means
 	// unrestricted, so a prompt-kind extension that wants the full terminal
@@ -149,11 +171,38 @@ type ForwardDecl struct {
 	RemotePort int    `toml:"remote_port,omitempty"`
 }
 
+// Lazy reports whether the reconciler waits for a caller before bringing this
+// extension up. It does, unless the template declares a forward: a tunnel is a
+// service with no "use" moment to start it, so it is established at startup and
+// kept (issue #183).
+func (e *Extension) Lazy() bool { return len(e.Forwards) == 0 }
+
+// IdleTimeoutDuration is the configured idle window, or the default when the key
+// is absent. An unparsable or non-positive value is an error rather than a
+// silent fallback: a caller that wrote "10 minutes" meant something, and running
+// with ten minutes instead of what it wrote is the kind of help that hides a
+// typo.
+func (e *Extension) IdleTimeoutDuration() (time.Duration, error) {
+	raw := strings.TrimSpace(e.IdleTimeout)
+	if raw == "" {
+		return DefaultIdleTimeout, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("idle_timeout is not a duration (%q): write it as a Go duration, such as 10m or 90s", e.IdleTimeout)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("idle_timeout must be positive, got %q", e.IdleTimeout)
+	}
+	return d, nil
+}
+
 // Normalize trims whitespace and fills the defaults an author would otherwise
 // have to restate. It is idempotent, so calling it on a loaded extension is
 // safe and keeps hand-edited files tidy after one save.
 func (e *Extension) Normalize() {
 	e.Name = strings.TrimSpace(e.Name)
+	e.IdleTimeout = strings.TrimSpace(e.IdleTimeout)
 	e.Target = strings.TrimSpace(e.Target)
 	e.Kind = strings.TrimSpace(e.Kind)
 	e.Mode = strings.TrimSpace(e.Mode)
@@ -275,6 +324,9 @@ func (e *Extension) Validate() error {
 		if err := e.Forwards[i].Validate(); err != nil {
 			return fmt.Errorf("forward #%d: %w", i+1, err)
 		}
+	}
+	if _, err := e.IdleTimeoutDuration(); err != nil {
+		return err
 	}
 	// Compile the restriction now so a bad pattern is reported to whoever saved
 	// the extension, not to an agent that reaches for a file later.

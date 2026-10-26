@@ -181,6 +181,25 @@ func (cs *ChildShell) ReadTerminalStream(ctx context.Context, readerID int, time
 	return output, data, partial, nil
 }
 
+// SeekReader moves one reader's cursor, backwards included.
+//
+// ReadTerminalStream commits as it hands bytes over: the cursor moves to the end of the
+// window before the caller has decided whether those bytes can be DELIVERED. A caller
+// that cannot use them — a render refusing a window that would not survive JSON, a
+// charset the caller has not named yet — has to put them back, or the refusal destroys
+// exactly the data whose remedy it names: the caller reads `pass --encoding gbk`, passes
+// it, and gets 204 because the bytes are gone (issue #200).
+//
+// Backwards is allowed here and denied in AdvanceDefaultReader for a reason: that one
+// exists so a positional read cannot forget bytes already SHOWN, and this one exists so
+// a refusal cannot lose bytes never shown.
+func (cs *ChildShell) SeekReader(readerID int, pos int64) error {
+	if cs.buf == nil {
+		return fmt.Errorf("output buffer unavailable")
+	}
+	return cs.buf.Seek(readerID, pos)
+}
+
 // HasMoreOutput returns whether the given reader has unread data.
 func (cs *ChildShell) HasMoreOutput(readerID int) bool {
 	return cs.buf.HasMore(readerID)

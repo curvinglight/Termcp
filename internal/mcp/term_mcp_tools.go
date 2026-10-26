@@ -28,7 +28,7 @@ import (
 
 // mcpToolCall builds the tools/call envelope for `call <session> mcp:1 <tool> <json>`
 // and renders the answer as the TEXT the tool returned.
-func (s *Server) mcpToolCall(ctx context.Context, stmt directive.Statement, h *jrpcHandle, payload string) envelope.Slot {
+func (s *Server) mcpToolCall(ctx context.Context, stmt directive.Statement, h *jrpcHandle, payload string, win termArgs) envelope.Slot {
 	name, args, bad := splitToolCall(stmt, payload)
 	if bad != nil {
 		return *bad
@@ -58,9 +58,9 @@ func (s *Server) mcpToolCall(ctx context.Context, stmt directive.Statement, h *j
 		// --json is the escape hatch back to the frame: the content items, the
 		// isError flag and any structuredContent the peer attached are all still
 		// there, in the shape the peer sent them.
-		return s.frameReply(ctx, stmt, h, reply)
+		return s.frameReply(ctx, stmt, h, reply, win)
 	}
-	return s.mcpResultText(ctx, stmt, h, reply)
+	return s.mcpResultText(ctx, stmt, h, reply, win)
 }
 
 // splitToolCall reads the tool name and its arguments out of the payload.
@@ -96,7 +96,7 @@ func splitToolCall(stmt directive.Statement, payload string) (string, map[string
 // "text":"…"}],"isError":false}}, and every caller that asked for a tool's text had
 // to walk that structure itself — in a shell, with no JSON parser. The text is the
 // answer; the envelope is transport.
-func (s *Server) mcpResultText(ctx context.Context, stmt directive.Statement, h *jrpcHandle, reply string) envelope.Slot {
+func (s *Server) mcpResultText(ctx context.Context, stmt directive.Statement, h *jrpcHandle, reply string, win termArgs) envelope.Slot {
 	var doc struct {
 		Error  json.RawMessage `json:"error"`
 		Result *struct {
@@ -114,7 +114,7 @@ func (s *Server) mcpResultText(ctx context.Context, stmt directive.Statement, h 
 	// and any method whose result is not a tool result.
 	if err := json.Unmarshal([]byte(reply), &doc); err != nil || doc.Error != nil ||
 		doc.Result == nil || doc.Result.Content == nil {
-		return s.frameReply(ctx, stmt, h, reply)
+		return s.frameReply(ctx, stmt, h, reply, win)
 	}
 
 	var parts []string
@@ -139,12 +139,21 @@ func (s *Server) mcpResultText(ctx context.Context, stmt directive.Statement, h 
 			"Path": stmt.Path, "Error-Code": "tool_error",
 		}, Body: "ERROR: " + body}
 	}
-	if len(body) > 4096 {
+	// THE SAME THRESHOLD AS THE OTHER DOOR, and for the same reason (issue #204): this
+	// was a second hardcoded 4096, so `call <peer> mcp:1 <tool> --bytes 32768` and
+	// `call <peer> cdp:1 …` would have disagreed about whether the same frame fits.
+	// A receipt is for "it does not fit the window the caller chose", not for "it is
+	// bigger than a number this file picked".
+	inlineLimit := win.BytesLimit
+	if inlineLimit <= 0 {
+		inlineLimit = defaultBytesLimit
+	}
+	if len(body) > inlineLimit {
 		if rec, ok := h.ch.LastAnswer(); ok {
 			return envelope.Slot{Code: 200, Headers: map[string]string{
 				"Path": stmt.Path, "Frame": fmt.Sprint(rec.N),
 				"Bytes": fmt.Sprint(len(rec.Data)), "Decoded-Bytes": fmt.Sprint(len(body)),
-			}, Body: receiptBody(rec.N, body, len(rec.Data), stmt, h)}
+			}, Body: receiptBody(rec.N, body, len(rec.Data), inlineLimit, stmt, h)}
 		}
 	}
 	return envelope.Slot{Code: 200, Headers: map[string]string{"Path": stmt.Path}, Body: body}
@@ -181,10 +190,10 @@ func (s *Server) mcpToolList(ctx context.Context, stmt directive.Statement, h *j
 		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(reply), &doc); err != nil {
-		return s.frameReply(ctx, stmt, h, reply)
+		return s.frameReply(ctx, stmt, h, reply, win)
 	}
 	if doc.Error != nil || doc.Result == nil {
-		return s.frameReply(ctx, stmt, h, reply)
+		return s.frameReply(ctx, stmt, h, reply, win)
 	}
 
 	addr := peerAddress(h.sessionID, h.kind, h.index)

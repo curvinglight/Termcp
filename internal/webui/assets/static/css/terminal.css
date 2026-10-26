@@ -21,6 +21,33 @@
   .session-tab.is-windowless { border-style: dashed; }
   .session-tab.is-windowless .session-tab-label { color: var(--term-fg-muted); }
   .session-tab.is-windowless:hover .session-tab-label { color: var(--term-fg-white); }
+  /* A TAB ASKING TO BE LOOKED AT: something happened in its window while the
+     reader's attention was elsewhere (minimized, behind another window, collapsed,
+     or the browser tab in the background — see dockWindowWatched). It BLINKS, twice
+     and then rests, until the tab is pressed or its window is brought to the front.
+        Blinking is the only signal here that survives the corner of an eye. A dashed
+        edge among a dozen dashed edges is a footnote, and a slow fade reads as
+        ambience — "twice, then a pause" is the one rhythm the eye reports as
+        something asking to be looked at, and the pause is what makes it repeat
+        instead of becoming the tab's appearance.
+        It fills the WHOLE tab rather than tinting its edge, because a 1px border on a
+        28px chip is two pixels of colour at arm's length. The label flips to the
+        page's background colour on the lit half so it stays readable — the pulse must
+        never cost the one thing the tab is for, which is reading the name.
+        The cycle is ONE SECOND and the rest is exactly half of it: two flashes of
+        166ms with 166ms between them, then 500ms of quiet. The rest is what makes
+        this a signal instead of the tab's appearance — long enough to read as "it
+        stopped", short enough that a glance two seconds later still catches a flash.
+        A longer pause (an early version rested for two seconds) read as a tab that
+        blinked once and then never again. */
+  .session-tab.is-fresh { animation: sessionTabPulse 1s steps(1, end) infinite; }
+  .session-tab.is-fresh .session-tab-label { color: inherit; }
+  @keyframes sessionTabPulse {
+    0%, 16.6%     { background: var(--term-accent); border-color: var(--term-accent); color: var(--term-bg); }
+    16.61%, 33.3% { background: var(--term-surface); border-color: var(--term-border-2); color: var(--term-fg); }
+    33.31%, 50%   { background: var(--term-accent); border-color: var(--term-accent); color: var(--term-bg); }
+    50.01%, 100%  { background: var(--term-surface); border-color: var(--term-border-2); color: var(--term-fg); }
+  }
   .session-tab .session-tab-label { overflow: hidden; text-overflow: ellipsis; min-width: 0; font-family: var(--font-mono); }
   .session-tab .session-tab-close { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: none; border-radius: 4px; background: transparent; color: var(--term-fg-soft); cursor: pointer; padding: 0; flex-shrink: 0; }
   .session-tab .session-tab-close:hover { background: var(--term-danger); color: var(--term-fg-white); }

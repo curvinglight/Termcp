@@ -99,6 +99,13 @@ func ApplyArgs(ext *Extension, args map[string]any, update bool) error {
 	if hasOpt(args, "notes") {
 		ext.Notes = optString(args, "notes", "")
 	}
+	if hasOpt(args, "idle_timeout") {
+		// THE ZERO VALUE IS "BACK TO THE DEFAULT", not "never": an empty string is
+		// how an author says "I am no longer choosing", and the default is the
+		// documented behaviour. "Never reap" is not on offer — an instance nobody
+		// ever closes is the thing this field exists to prevent.
+		ext.IdleTimeout = strings.TrimSpace(optString(args, "idle_timeout", ""))
+	}
 	if hasOpt(args, "enabled") {
 		if _, ok := args["enabled"].(bool); !ok {
 			return fmt.Errorf("enabled must be true or false, got %v", args["enabled"])

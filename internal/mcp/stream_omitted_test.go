@@ -27,24 +27,32 @@ func TestAStreamFilteredReadSaysWhatItPassedOver(t *testing.T) {
 	s, _, shellID := startPipeStdioSession(t, script)
 	waitForOutput(t, s, shellID, "OUT-2")
 
-	// The filter is a view, and the view reports the size of what it is a view OF.
-	//
-	// The unit is the caller's cursor (raw bytes), not bytes_returned, which is the
-	// RENDERED length: an assertion relating the two would be comparing a filtered raw
-	// count with a post-strip character count. The invariant that holds in one unit is
-	// that the two views of the same span pass over each other's bytes, so what stdout
-	// omitted plus what stderr omitted is the whole span.
+	// Each reply has TWO spans, and they are both facts about the same window: the
+	// bytes of the stream the caller asked for (stream_raw_bytes) and the bytes of the
+	// other stream it stepped over (stream_omitted_bytes). Together they are the
+	// channel window the read covered, in the one unit where the two are comparable —
+	// raw bytes, not bytes_returned, which is the RENDERED length and would compare a
+	// filtered raw count with a post-strip character count.
 	o := readStream(t, s, shellID, "o", nil)
 	e := readStream(t, s, shellID, "e", nil)
-	raw := int64(o["raw_bytes"].(float64))
+	for _, m := range []map[string]any{o, e} {
+		span := int64(m["stream_raw_bytes"].(float64))
+		omitted := int64(m["stream_omitted_bytes"].(float64))
+		raw := int64(m["raw_bytes"].(float64))
+		if span+omitted != raw {
+			t.Fatalf("%s: the %d bytes of the stream plus the %d it passed over is not the %d byte channel window",
+				m["stream"], span, omitted, raw)
+		}
+	}
 	omittedOut := int64(o["stream_omitted_bytes"].(float64))
 	omittedErr := int64(e["stream_omitted_bytes"].(float64))
 	if omittedOut <= 0 || omittedErr <= 0 {
 		t.Fatalf("a filtered read passed over nothing: stdout omitted %d, stderr omitted %d", omittedOut, omittedErr)
 	}
-	if omittedOut+omittedErr != raw {
-		t.Fatalf("the two views of a %d byte span passed over %d and %d: the counts do not describe the span",
-			raw, omittedOut, omittedErr)
+	// And the two streams together are the channel: no byte is in both and none in
+	// neither, which is what makes paging in either numbering safe.
+	if sum := int64(o["stream_raw_bytes"].(float64)) + int64(e["stream_raw_bytes"].(float64)); sum != int64(o["total_bytes"].(float64)) {
+		t.Fatalf("stdout and stderr hold %d bytes together but the channel holds %d", sum, int64(o["total_bytes"].(float64)))
 	}
 
 	// And the term-level reply, which is what a caller reads, names them and the flag that
@@ -84,11 +92,18 @@ func TestAStreamFilterThatSelectsNothingIsNotAnEmptyChannel(t *testing.T) {
 		t.Fatal("a filtered read that returned nothing must still say how much it passed over")
 	}
 
-	got := termText(t, s, map[string]any{
-		"cmd": "read " + shellID + " --stream e --offset 0", "timeout": 1,
-	})
-	if !strings.Contains(got, "Omitted:") {
-		t.Fatalf("an empty body under a full Content-Range must explain itself:\n%s", got)
+	// BOTH SPELLINGS. `--offset 0` and the default cursor are two paths into the same
+	// question, and only one of them used to answer: the live cursor path shadowed the
+	// count inside its own if-block, so `stream_omitted_bytes` came back 0 for every
+	// filtered read that did not name an offset (issue #202). A test that pins one
+	// spelling cannot see that.
+	for _, suffix := range []string{" --offset 0", ""} {
+		got := termText(t, s, map[string]any{
+			"cmd": "read " + shellID + " --stream e" + suffix, "timeout": 1,
+		})
+		if !strings.Contains(got, "Omitted:") {
+			t.Fatalf("an empty body under a full Content-Range must explain itself (suffix %q):\n%s", suffix, got)
+		}
 	}
 }
 

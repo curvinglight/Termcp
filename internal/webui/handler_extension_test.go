@@ -72,6 +72,18 @@ func saveTestExtension(t *testing.T, h *Handler, ext *extensions.Extension) {
 	}
 }
 
+// askTestExtension asks for an on-demand extension, which is what the panel's own
+// create route does (issue #183): a template that declares no forward is not
+// dialled until something asks. Tests that save straight to the store — bypassing
+// the route — say the ask themselves, and a test about a template that must STAY
+// down simply does not call this.
+func askTestExtension(t *testing.T, h *Handler, name string) {
+	t.Helper()
+	if _, err := h.Extensions.Acquire(name, 0); err != nil {
+		t.Fatalf("asking for %s: %v", name, err)
+	}
+}
+
 // TestExtensionsEndpointEmpty pins that a handler with no reconciler still
 // answers, with an empty list rather than an error: the panel renders nothing.
 func TestExtensionsEndpointEmpty(t *testing.T) {
@@ -92,6 +104,7 @@ func TestExtensionsEndpointListsStatus(t *testing.T) {
 	ext.Paths = []string{"/srv/"}
 	ext.Description = "docs window"
 	saveTestExtension(t, h, &ext)
+	askTestExtension(t, h, "docs")
 
 	// An extension starts unavailable and is pushed toward available; wait for
 	// the reconciler to prove the session before asserting on the handles.
@@ -162,6 +175,7 @@ func TestExtensionsEndpointFailure(t *testing.T) {
 	ext.Target = "no-such-profile"
 	ext.Paths = []string{"/srv/"}
 	saveTestExtension(t, h, &ext)
+	askTestExtension(t, h, "nowhere")
 
 	deadline := time.Now().Add(8 * time.Second)
 	for {
@@ -234,7 +248,12 @@ func TestExtensionsWSFrame(t *testing.T) {
 	rows := summarizeExtensions(h.Extensions)
 	if row := findExtension(rows, "docs"); row == nil {
 		t.Fatalf("WS frame misses the extension, got %+v", rows)
-	} else if row.Status != extensions.StatusUnavailable && row.Status != extensions.StatusProbing && row.Status != extensions.StatusAvailable {
+	} else if row.Status != extensions.StatusIdle && row.Status != extensions.StatusUnavailable && row.Status != extensions.StatusProbing && row.Status != extensions.StatusAvailable {
+		/* IDLE belongs in this set: an on-demand extension that nothing has asked
+		   for yet is reported as idle rather than unavailable, and this assertion
+		   is the one place the frame's status vocabulary is written down. Leaving
+		   it out made the test a race — green once the reconciler had started
+		   probing, red on the frames before that. */
 		t.Errorf("WS row status %q is not one the reconciler reports", row.Status)
 	}
 }

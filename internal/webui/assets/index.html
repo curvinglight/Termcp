@@ -393,31 +393,27 @@
                Export and delete appear only while something is ticked: an archive
                is consulted rarely, and two dead keys parked on a rarely-used
                toolbar are two keys that look broken. -->
-          <!-- The toolbar is ALWAYS THERE. Left to right: invert, then the two
-               verbs, then the count.
+          <!-- The toolbar is ALWAYS THERE. Left to right: the count, the two
+               verbs, then invert.
                *
-               * It used to appear only once something was ticked — the two verbs
-               carried `hidden` and the component unhid them — which meant the row
-               was absent exactly when a reader was deciding what to do with the
-               ledger, and appeared under the pointer only after a tick. Worse, the
-               invert key it now leads with was parked inside the column's own
-               trigger, a second control surface for one list.
+               * It used to appear only once something was ticked, so the row was
+               absent exactly when a reader was deciding what to do with the ledger.
+               The verbs are now DISABLED instead: "not now" rather than "not here",
+               and the count beside them says why they are dim.
                *
-               * The verbs are DISABLED rather than hidden when nothing is ticked,
-               which is the difference between "not now" and "not here": a key that
-               fades to a shadow still tells you it exists and what it acts on, and
-               the count beside it says why it is dim. -->
+               * Invert TRAILS. It acts on the list, not on the selection, so it sits
+               after the pair whose target it must never be mistaken for. -->
           <div class="archive-keys" role="toolbar">
-            <button type="button" class="ext-key ext-key-icon" id="archive-sel-invert" title="Invert selection" data-i18n-title="section.batch.invert" aria-label="Invert selection" data-i18n-aria="section.batch.invert">
-              <svg class="ic-hollow" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.4l4.6 4.6L19 7.2"/></svg>
-              <svg class="ic-solid" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M20.3 6.9L9.4 17.8l-5.7-5.7 1.4-1.4 4.3 4.3 9.5-9.5z" fill="currentColor"/></svg>
-            </button>
             <span class="archive-tick-count" id="archive-toggle-count">0</span>
             <button type="button" class="ext-key ext-key-icon" id="archive-batch-export" title="Export transcripts" data-i18n-title="archive.batch.exportTitle" aria-label="Export selected transcripts" data-i18n-aria="archive.batch.exportTitle">
               <svg viewBox="0 0 14 14" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 1.5v7"/><path d="M4 5.5l3 3 3-3"/><path d="M1.5 10.5v1a1 1 0 001 1h9a1 1 0 001-1v-1"/></svg>
             </button>
             <button type="button" class="ext-key ext-key-icon ext-key-danger" id="archive-batch-delete" title="Delete selected" data-i18n-title="section.batch.deleteSelected" aria-label="Delete selected archived sessions" data-i18n-aria="section.batch.deleteSelectedAria">
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 01-1-1h-4a1 1 0 01-1 1v3M4 7h16"/></svg>
+            </button>
+            <button type="button" class="ext-key ext-key-icon" id="archive-sel-invert" title="Invert selection" data-i18n-title="section.batch.invert" aria-label="Invert selection" data-i18n-aria="section.batch.invert">
+              <svg class="ic-hollow" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.4l4.6 4.6L19 7.2"/></svg>
+              <svg class="ic-solid" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M20.3 6.9L9.4 17.8l-5.7-5.7 1.4-1.4 4.3 4.3 9.5-9.5z" fill="currentColor"/></svg>
             </button>
           </div>
           <div id="archive-grid" class="conn-grid"></div>
@@ -464,6 +460,9 @@
           <svg class="ic-hollow" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.4l4.6 4.6L19 7.2"/></svg>
           <svg class="ic-solid" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20.3 6.9L9.4 17.8l-5.7-5.7 1.4-1.4 4.3 4.3 9.5-9.5z" fill="currentColor"/></svg>
         </button>
+        <!-- MINIMIZE / RESTORE act on the WINDOW, not the session: see shell-windows.js. -->
+        <button type="button" class="ext-key ext-key-icon" id="dock-min-ticked" title="Minimize selected windows" data-i18n-title="dock.minimize.title" aria-label="Minimize selected windows" data-i18n-aria="dock.minimize.title" disabled><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+        <button type="button" class="ext-key ext-key-icon" id="dock-restore-ticked" title="Restore selected windows" data-i18n-title="dock.restore.title" aria-label="Restore selected windows" data-i18n-aria="dock.restore.title" disabled><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="5" y="5" width="14" height="14"/></svg></button>
         <!-- CLOSE, not delete. The page offers no way to erase a session: closing
              stops and archives it, and erasing lives in the archive column, where
              the record being destroyed is the thing on screen. Shown only once

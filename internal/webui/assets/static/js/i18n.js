@@ -181,10 +181,27 @@ function setLangMenuOpen(open) {
   menu.classList.toggle('hidden', !_langMenuOpen);
   btn.setAttribute('aria-expanded', _langMenuOpen ? 'true' : 'false');
   if (document.body) document.body.classList.toggle('header-lang-open', _langMenuOpen);
+  if (_langMenuOpen && typeof closeHeaderMenus === 'function') closeHeaderMenus('lang');
 }
 
 function toggleLangMenu() { setLangMenuOpen(!_langMenuOpen); }
 function closeLangMenu() { setLangMenuOpen(false); }
+
+/* Only one header menu is ever open.
+ *
+ *  All three (theme, language, clients) hang off the same header and share one
+ *  rung of the ladder, so their order among themselves is DOM order and a menu
+ *  opened later could land under one opened earlier. Ranking them would be a
+ *  ladder that encodes a mistake; the mistake is having two open. Opening one
+ *  closes the rest, which is also what the reader meant by the second click. */
+function closeHeaderMenus(except) {
+  if (except !== 'lang') closeLangMenu();
+  ['theme-switch', 'clients-menu'].forEach(function (id) {
+    if (except === id) return;
+    var d = document.getElementById(id);
+    if (d && d.open) d.open = false;
+  });
+}
 
 /** A menu item: switch the language, close, and leave the focus where it was. */
 function chooseLang(value) {

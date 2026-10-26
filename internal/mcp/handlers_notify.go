@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -20,8 +21,17 @@ func (s *Server) handleNotifyUser(ctx context.Context, request mcpgo.CallToolReq
 	if message == "" {
 		return toolError(CodeInvalidArgument, "%s", "message is required"), nil
 	}
+	// A TRUNCATED TOAST SAYS IT WAS TRUNCATED (issue #204).
+	//
+	// The cap is legitimate — this is a toast, not a document, and the value is a
+	// protection on the browser's side rather than a decision about the caller's work.
+	// What was not legitimate is that the cut was silent: a caller who sent a long
+	// message got "ok" and the human read a sentence that stopped mid-word with no
+	// indication that anything was missing.
 	if r := []rune(message); len(r) > maxNotifyMessageLen {
-		message = string(r[:maxNotifyMessageLen])
+		message = string(r[:maxNotifyMessageLen]) +
+			" … (" + strconv.Itoa(len(r)-maxNotifyMessageLen) + " more characters were not shown: the toast is capped at " +
+			strconv.Itoa(maxNotifyMessageLen) + ")"
 	}
 
 	level := strings.TrimSpace(getString(args, "level", "info"))

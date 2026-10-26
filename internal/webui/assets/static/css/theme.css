@@ -64,6 +64,13 @@
   /* A breathing backdrop is decoration: at rest it simply stays at its brighter
      value, so nothing about the page's contrast changes. */
   .page-backdrop { animation: none; opacity: 1; }
+  /* Every rule above is decoration, and at rest it stays at its readable value.
+     `.session-tab.is-fresh` is deliberately NOT here. Holding its lit state instead
+     of blinking was the bug: on a bright accent theme (matrix) that made the tab a
+     permanent block of the theme's own colour, which reads as styling, not as "come
+     look" — and it hid the signal from exactly the readers it was meant for. The
+     pulse is a hard cut between two colours the page already uses: no fade, no
+     movement, no size change, so this query does not target it. */
 }
 
 /* ---- Inputs and overlays ---------------------------------------------- */

@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -184,6 +185,24 @@ function eq(label, got, want) {
   eq('agent session: click opens its terminal', f.openRequests.map(r => r.sid), ['agent1']);
 }
 
+// A session with no window here does NOT pulse on its own.
+//
+// It used to: "nobody has opened this session yet" was its own state, and the tab
+// stayed lit until a human clicked it once. That reads wrong on a bright accent
+// theme — an unclicked tab sat highlighted forever, which looks like a permanently
+// selected tab rather than like something asking to be looked at. The rule is about
+// the WINDOW now (see dockNoteOutput): a tab pulses when its window changed while
+// nobody was watching, and a session with no window has no window to watch.
+{
+  const f = fixture();
+  f.snapshot([{ id: 'agent2', name: 'agent-work', status: 'running', created_at: 2 }]);
+  eq('a session with no window here pulses', f.tabs()[0].classList.contains('is-fresh'), true);
+  // Opening it is the look, so the pulse stops — and stays stopped when the window
+  // is closed again, because the human has now seen this session.
+  f.tabs()[0].listeners.click({ target: { closest() { return null; } }, clientX: 10, clientY: 20 });
+  eq('opening it clears the pulse', f.tabs()[0].classList.contains('is-fresh'), false);
+}
+
 // A window and its session are ONE tab, and the tab outlives the window.
 {
   const f = fixture();
@@ -242,6 +261,78 @@ function eq(label, got, want) {
   eq('a reordered frame renders the same bar', f.keys(), ['sess:a', 'sess:b', 'sess:c']);
 }
 
+// A tab does NOT MOVE when its window is opened.
+//
+// Grouping windows ahead of window-less sessions made pressing a tab shift the whole
+// bar one place: the reader pressed the third tab and watched the FIRST one go quiet,
+// because the first place now held the tab they had just pressed. Position has to
+// follow the session's creation time and nothing else.
+{
+  const f = fixture();
+  f.snapshot([
+    { id: 'a', name: 'a', status: 'running', created_at: 10 },
+    { id: 'b', name: 'b', status: 'running', created_at: 20 },
+    { id: 'c', name: 'c', status: 'running', created_at: 30 }
+  ]);
+  eq('precondition: three window-less tabs in creation order', f.keys(), ['sess:a', 'sess:b', 'sess:c']);
+  // Press the LAST one. It opens a window; every tab must keep its place.
+  f.tabs()[2].listeners.click({ target: { closest() { return null; } }, clientX: 10, clientY: 20 });
+  eq('pressing the third tab opens its window', f.openRequests.map(r => r.sid), ['c']);
+  f.win(3, 'c');   // the window that press asked for
+  f.snapshot([
+    { id: 'a', name: 'a', status: 'running', created_at: 10 },
+    { id: 'b', name: 'b', status: 'running', created_at: 20 },
+    { id: 'c', name: 'c', status: 'running', created_at: 30 }
+  ]);
+  eq('opening a window does not move its tab', f.keys(), ['sess:a', 'sess:b', 'sess:c']);
+  eq('the pressed tab keeps its own mark cleared', f.tabs()[2].classList.contains('is-fresh'), false);
+  eq('the other two still pulse', [f.tabs()[0].classList.contains('is-fresh'), f.tabs()[1].classList.contains('is-fresh')], [true, true]);
+}
+
+// OUTPUT NOBODY LOOKED AT also marks the tab, and looking clears it.
+//
+// The first pulse answers "nobody has opened this session yet". A session that IS
+// open here could still print for ten minutes in a minimized window, or behind
+// another one, and the bar said nothing — the reader had to remember which of eight
+// tabs was the busy one. Same pulse, second reason, cleared by the two things that
+// mean "I have looked": pressing the tab, and output arriving while its window is
+// the one on top.
+{
+  const f = fixture();
+  const lower = f.win(1, 's1');
+  const upper = f.win(2, 's2');
+  f.snapshot([
+    { id: 's1', name: 'a', status: 'running', created_at: 1 },
+    { id: 's2', name: 'b', status: 'running', created_at: 2 }
+  ]);
+  const tabOf = sid => f.tabs().find(t => t.getAttribute('data-win-id') === 'sess:' + sid);
+  eq('precondition: the raised window is the watched one', upper.classList.contains('win-active'), true);
+  // The top window printing is the reader reading: no mark.
+  f.ctx.dockNoteOutput(upper);
+  eq('a watched window does not pulse on output', tabOf('s2').classList.contains('is-fresh'), false);
+  // The window underneath printing has no witness.
+  f.ctx.dockNoteOutput(lower);
+  eq('output in a window nobody is watching pulses its tab', tabOf('s1').classList.contains('is-fresh'), true);
+  // The mark survives a repaint of the bar: a sessions frame can arrive mid-burst.
+  f.snapshot([
+    { id: 's1', name: 'a', status: 'running', created_at: 1 },
+    { id: 's2', name: 'b', status: 'running', created_at: 2 }
+  ]);
+  eq('a repaint keeps the mark', f.tabs().find(t => t.getAttribute('data-win-id') === 'sess:s1').classList.contains('is-fresh'), true);
+  // Raising it is the other way a human says "show me", so the repaint that follows
+  // clears the mark rather than leaving a tab pulsing at its own window.
+  f.ctx.bringShellWindowToFront(lower);
+  f.ctx.refreshSessionTabbar();
+  eq('raising the window clears the mark', f.tabs().find(t => t.getAttribute('data-win-id') === 'sess:s1').classList.contains('is-fresh'), false);
+  // A minimized window is not a witness, whatever its z-index says.
+  lower.classList.add('win-minimized');
+  f.ctx.dockNoteOutput(lower);
+  eq('a minimized window is not a witness', f.tabs().find(t => t.getAttribute('data-win-id') === 'sess:s1').classList.contains('is-fresh'), true);
+  // The press clears it, and is a look for the output already on screen.
+  f.tabs().find(t => t.getAttribute('data-win-id') === 'sess:s1').listeners.click({ target: { closest() { return null; } }, clientX: 10, clientY: 20 });
+  eq('the press clears the output mark too', f.tabs().find(t => t.getAttribute('data-win-id') === 'sess:s1').classList.contains('is-fresh'), false);
+}
+
 // The empty note follows the ENTRY count, not the window count: a page with no
 // windows but a live agent session is not empty.
 {
@@ -261,5 +352,74 @@ console.log('PASS dock lists sessions, not just windows');
 	}
 	if out, err := exec.Command(node, probe).CombinedOutput(); err != nil {
 		t.Fatalf("dock session composition: %v\n%s", err, out)
+	}
+}
+
+// TestTheDockIsToldWhenOutputArrives pins the wiring side of the output pulse.
+//
+// The behaviour above lives in shell-windows.js and is exercised directly. What that
+// could not catch is the frame path forgetting to call it at all: the set, the
+// repaint, the clear — all correct, and nothing ever marking a session, which looks
+// exactly like "the feature was never needed". The terminal frame in ui-socket.js is
+// the only place output reaches a window, so the call belongs there and only there.
+func TestTheDockIsToldWhenOutputArrives(t *testing.T) {
+	sock := readAssetLF(t, "static/js/ui-socket.js")
+	if !strings.Contains(sock, "dockNoteOutput(win)") {
+		t.Fatal("the terminal frame path does not tell the dock about output: a session " +
+			"printing in a window nobody is watching would never mark its tab")
+	}
+	/* INPUT TOO. An agent driving a session is a change in its window exactly like
+	   output is, and it is the one an operator most needs to see: the window looks
+	   idle while somebody types into it. */
+	if !strings.Contains(sock, "dockNoteOutput(winA)") {
+		t.Error("the shell_activity path does not tell the dock about input: a window " +
+			"being driven from elsewhere would stay quiet in the bar")
+	}
+	// Guarded, because the frame handler is also reached on pages that load
+	// ui-socket.js before shell-windows.js.
+	if !strings.Contains(sock, "typeof dockNoteOutput === 'function'") {
+		t.Error("the call must be feature-detected: this module also loads on pages " +
+			"that never load the dock")
+	}
+	shell := readAssetLF(t, "static/js/shell-windows.js")
+	if !strings.Contains(shell, "function dockWindowWatched(") {
+		t.Error("the output pulse must have a definition of \"the reader is looking at " +
+			"it\", or a window that is already on screen would pulse at its own output")
+	}
+	/* ONE rule, and it is about the window. "This page has never opened this
+	   session" was a second state, and a tab wearing it stayed lit until someone
+	   clicked it — on a bright accent theme that is a permanently highlighted tab,
+	   not something asking to be looked at. It is gone; a leftover class, a
+	   leftover set or a leftover keyframe would bring it back without the rule. */
+	for _, dead := range []string{"is-unseen", "sessionTabUnseen", "dockUnseen", "_dockSeen", "dockMarkSeen"} {
+		if strings.Contains(shell, dead) {
+			t.Errorf("shell-windows.js still carries %q: the unread-session state was "+
+				"replaced by \"its window changed while nobody was watching\"", dead)
+		}
+		if strings.Contains(readAppCSS(t), dead) || strings.Contains(readAssetLF(t, "static/css/theme.css"), dead) {
+			t.Errorf("the stylesheets still carry %q", dead)
+		}
+	}
+	css := readAppCSS(t)
+	for _, want := range []string{".session-tab.is-fresh {", ".session-tab.is-fresh .session-tab-label {"} {
+		if !strings.Contains(css, want) {
+			t.Errorf("the stylesheet carries no %q: the mark would be invisible", want)
+		}
+	}
+	theme := readAssetLF(t, "static/css/theme.css")
+	/* The pulse must survive prefers-reduced-motion. The old rule held the lit state
+	   instead, and on a bright accent theme that turned the tab into a permanent
+	   block of the theme's own colour: the readers who asked for less motion got a
+	   tab that looked styled rather than a tab asking to be looked at, so the signal
+	   was gone on exactly those machines. A hard cut between two colours is not the
+	   motion this query targets. */
+	reduced := between(t, theme, "@media (prefers-reduced-motion: reduce) {", "\n}")
+	if strings.Contains(reduced, "is-fresh {") || strings.Contains(reduced, "is-fresh .session-tab-label") {
+		t.Errorf("prefers-reduced-motion still touches the fresh mark; the pulse is the "+
+			"one signal that must reach every reader. Block was:\n%s", reduced)
+	}
+	if !strings.Contains(readAppCSS(t), "animation: sessionTabPulse 1s steps(1, end) infinite") {
+		t.Error("the fresh mark no longer animates: it is a hard cut, so it needs no " +
+			"reduced-motion exemption")
 	}
 }

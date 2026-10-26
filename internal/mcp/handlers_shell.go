@@ -627,10 +627,23 @@ func windowResult(w transcript.Window, src *transcript.Source) map[string]any {
 		// raw_bytes is the cursor-safe quantity: raw window bytes, so
 		// start_offset + raw_bytes == end_offset holds whatever stripping did.
 		// Cursors advance by end_offset (or raw_bytes), never bytes_returned.
-		"raw_bytes":          w.End - w.Start,
-		"start_offset":       w.Start,
-		"end_offset":         w.End,
-		"total_bytes":        w.Total,
+		"raw_bytes":    w.End - w.Start,
+		"start_offset": w.Start,
+		"end_offset":   w.End,
+		"total_bytes":  w.Total,
+		// THE REPLY'S OWN ADDRESSES (issue #202).
+		//
+		// start/end/total above are CHANNEL positions, because the cursor is a channel
+		// walk. On a `--stream e` read they count stdout too, so paging with them lands
+		// on the other side of the channel — and `total` described the channel while the
+		// body was one stream, which is how an empty stderr read came back as
+		// `bytes */7`. These three are the same window numbered in the stream the caller
+		// asked for; the channel group is kept for the cursor and named as such.
+		"stream":             w.Stream,
+		"stream_start":       w.StreamStart,
+		"stream_end":         w.StreamEnd,
+		"stream_total_bytes": w.StreamTotal,
+		"stream_raw_bytes":   w.StreamEnd - w.StreamStart,
 		"partial_tail_bytes": w.PartialTail,
 		// Non-zero only when the window was rolled back to avoid ending inside a
 		// character. The bytes are still in the stream (the window stops before them),

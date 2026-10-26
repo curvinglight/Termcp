@@ -1643,11 +1643,42 @@ paths above.
 
 An extension is a stored template for a session whose capabilities are trimmed to
 what the template's author decided (an MCP server over a pipe shell, a read-only
-file window, an interactive terminal). termcp keeps every enabled extension's
-session warm; extensions that dial the same profile with the same whitelist share
-one session and each drives its own shell channel in it. The same templates are
-authorable over MCP with the `extension` tool — these routes are its REST twin,
-writing the same files in `<data>/extensions/<name>/config.toml`.
+file window, an interactive terminal). Extensions that dial the same profile with
+the same whitelist share one session and each drives its own shell channel in it.
+The same templates are authorable over MCP with the `extension` tool — these
+routes are its REST twin, writing the same files in
+`<data>/extensions/<name>/config.toml`.
+
+**A template that declares no `forwards` is started on demand.** Nothing is
+dialled until a caller asks, and the ask is the MCP tool's `action=use` (or
+`open ext <name>` on the terminal surface); it answers with the
+`session_id`/`shell_id` to drive the extension through. Until then the row reads
+`idle`, which is the design rather than a fault: nothing is running because
+nothing asked.
+
+Each ask is answered with its OWN channel — never one somebody else may still be
+driving, because two callers on one channel share a cursor. A channel nothing
+touches for the whole `idle_timeout` (default `10m`, overridable per template) is
+closed, and `action=release` (or `close ext <name> [<channel>]`) hands one back at
+once.
+
+**The connection is the install's, not the caller's.** Closing a channel leaves
+the connection up, so the next ask forks again on the same SSH session instead of
+paying for a handshake; it goes away only when the template is disabled or
+deleted, or when the connection itself ends.
+
+**Nothing is polled.** The idle window is kept by a timer per extension, and a
+failed automatic retry is kept by the backoff's own timer, so both happen at the
+moment the status printed rather than at the next sweep. Two consequences are worth
+knowing: a channel whose process ended is noticed by whoever reads it next (reading
+a status asks the connection whether the channel is still there), and a
+`config.toml` edited outside termcp is read at the next start or the next ask —
+saving through the tool or the panel stops what is running and rebuilds it from
+what the file now says.
+
+**A template that declares a forward is not on demand.** A listener has no caller
+whose absence could mean "idle", so it is established at startup and kept, and its
+connection is not a caller's to close.
 
 ### `GET /api/extensions`
 
@@ -1666,7 +1697,13 @@ Response 200:
 A row carries `session_id`/`shell_id` when the extension is available (the channels
 to drive it through), `forwards` with the address each declared tunnel bound, and
 `failure` + `next_retry_ms` when it is not. `status` is one of `available`,
-`probing`, `unavailable`, `disabled`.
+`idle`, `probing`, `unavailable`, `disabled`. An on-demand row also carries
+`lazy`, `idle_timeout_ms` (the window in force) and `idle_for_ms` (how long ago
+anything last asked for or drove it), so "how long have I got" is a fact rather
+than a guess. When an instance is taken away — idled out, released, or its
+process exited — the row carries `closed_session_id`, `closed_shell_id`,
+`closed_at` and `closed_reason`, and the id that named it answers with the same
+explanation instead of reading as a typo.
 
 ### `GET /api/extensions/{name}`
 
@@ -1695,8 +1732,9 @@ name in the path is refused (`400`), because the name is the directory.
 
 ### `DELETE /api/extensions/{name}`
 
-Removes the template (`204`). The session kept warm for it is closed once no other
-extension is served by it.
+Removes the template (`204`). The connection it was served by is closed once no
+other extension resolves to it, and the instances it handed out go with it —
+their ids then say the template is gone rather than reading as a typo.
 
 `{name}` may be a comma-separated batch (`a,b,c`) like the session and profile
 routes: every name is removed independently, the answer is `200` with a per-name
@@ -1705,8 +1743,10 @@ routes: every name is removed independently, the answer is `200` with a per-name
 
 ### `POST /api/extensions/{name}/retry`
 
-Reconnects an unavailable extension now instead of waiting out its backoff.
-Answers 200 with `{ "ok": true }` or `{ "ok": false, "error": ... }`.
+Brings the extension up now instead of waiting. For an unavailable one that means
+reconnecting rather than waiting out its backoff; for an `idle` on-demand template
+it **is** the ask, so the panel's one key serves both and only its tooltip
+differs. Answers 200 with `{ "ok": true }` or `{ "ok": false, "error": ... }`.
 
 ### `GET /api/extensions/batch`
 

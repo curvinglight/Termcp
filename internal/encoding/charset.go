@@ -31,16 +31,31 @@ var charsets = map[string]encoding.Encoding{
 	"utf8":    nil,
 	"cp65001": nil,
 
-	"gbk":          simplifiedchinese.GBK,
-	"gb2312":       simplifiedchinese.HZGB2312, // the encoding name callers use for it
-	"gb18030":      simplifiedchinese.GB18030,
-	"cp936":        simplifiedchinese.GBK,
-	"big5":         traditionalchinese.Big5,
-	"cp950":        traditionalchinese.Big5,
-	"shift_jis":    japanese.ShiftJIS,
-	"shift-jis":    japanese.ShiftJIS,
-	"sjis":         japanese.ShiftJIS,
+	"gbk": simplifiedchinese.GBK,
+	// GB2312 IS A CHARACTER SET, NOT THIS ENCODING. What a caller means by
+	// "--encoding gb2312" is the code page their zh-CN console writes, which is
+	// CP936 — and GBK is CP936's superset, so every GB2312 byte decodes the same
+	// way. It used to map to HZGB2312, which is the 7-bit ESCAPE encoding from
+	// mail: fed a console's bytes it returned plausible-looking garbage with no
+	// error at all, which is the one failure this package exists to prevent.
+	"gb2312":     simplifiedchinese.GBK,
+	"euc-cn":     simplifiedchinese.GBK,
+	"hz-gb-2312": simplifiedchinese.HZGB2312, // the escape form, under its own name
+	"hzgb2312":   simplifiedchinese.HZGB2312,
+	"gb18030":    simplifiedchinese.GB18030,
+	"cp936":      simplifiedchinese.GBK,
+	"big5":       traditionalchinese.Big5,
+	"cp950":      traditionalchinese.Big5,
+	"shift_jis":  japanese.ShiftJIS,
+	"shift-jis":  japanese.ShiftJIS,
+	"sjis":       japanese.ShiftJIS,
+	// CP932 IS NOT SHIFT_JIS, and this is the closest thing in the standard library:
+	// Windows-31J adds vendor extensions and fills some of the 0x80-0xA0 and
+	// 0xFD-0xFF ranges, which decode here as replacement characters. The name is
+	// kept because it is what a Windows caller writes and refusing it would leave
+	// them with nothing; the difference is stated rather than hidden.
 	"cp932":        japanese.ShiftJIS,
+	"windows-31j":  japanese.ShiftJIS,
 	"euc-jp":       japanese.EUCJP,
 	"euc-kr":       korean.EUCKR,
 	"cp949":        korean.EUCKR,
@@ -162,8 +177,27 @@ func (e *UnknownCharsetError) Error() string {
 	if e.Detail != "" {
 		return e.Detail
 	}
-	return "unknown charset " + e.Name + "; use utf-8, gbk (cp936), gb18030, big5, shift_jis, euc-kr or utf-16 (utf-16le / utf-16be)"
+	return "unknown charset " + e.Name + "; this build reads " + SupportedCharsets()
 }
+
+// advertised is what the refusal offers: ONE NAME PER ENCODING, spelled the way a
+// caller is most likely to have it. It is a curated list rather than a dump of the
+// table, because the table holds six spellings of GBK and a caller reading a
+// refusal needs to know which encodings exist, not which aliases do.
+//
+// IT CANNOT DRIFT, and that is the point of the test next to it: every name here is
+// resolved against the table, and every entry in the table must share its encoder
+// with one of them. The hand-written sentence this replaces had already gone stale —
+// it named big5, shift_jis and euc-kr while silently leaving out gb2312, cp950,
+// cp949, euc-jp, latin-1 and utf-16le, every one of them accepted.
+var advertised = []string{
+	"utf-8", "gbk", "gb18030", "hz-gb-2312", "big5", "shift_jis", "euc-jp",
+	"euc-kr", "windows-1252", "latin-1", "utf-16", "utf-16le", "utf-16be",
+}
+
+// SupportedCharsets lists the encodings this build can decode, as the refusal
+// offers them.
+func SupportedCharsets() string { return strings.Join(advertised, ", ") }
 
 func normaliseCharset(name string) string {
 	return strings.ToLower(strings.TrimSpace(name))

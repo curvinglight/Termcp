@@ -284,7 +284,10 @@ func TestBigAnswerIsAReceiptAndPagesBack(t *testing.T) {
 	defer termText(t, s, map[string]any{"cmd": "close " + h})
 
 	out := termText(t, s, map[string]any{"cmd": `call ` + h + ` {"method":"Runtime.evaluate","params":{"expression":"x"}}`})
-	if !strings.Contains(out, "too big to inline") {
+	// The receipt now names the WINDOW that stopped it rather than saying "too big"
+	// about a constant (issue #204). What this test is about is unchanged: the frame
+	// is not inlined, it is named and pageable.
+	if !strings.Contains(out, "so it is a receipt instead") {
 		t.Fatalf("an oversized answer was inlined:\n%s", out)
 	}
 	frame, ok := headerValue(t, out, "Frame")

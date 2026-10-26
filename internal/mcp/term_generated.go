@@ -997,6 +997,10 @@ func (s *Server) directiveExtension(ctx context.Context, stmt directive.Statemen
 		[2]string{"url", "url"},
 		[2]string{"mode", "mode"},
 		[2]string{"notes", "notes"},
+		// The idle window of an on-demand extension. A string, not a number: it is a
+		// duration the caller reads and writes the way it thinks about it ("10m"),
+		// and the template stores exactly what was written.
+		[2]string{"idle-timeout", "idle_timeout"},
 	); bad {
 		return slot
 	}
@@ -1048,6 +1052,82 @@ func (s *Server) directiveExtension(ctx context.Context, stmt directive.Statemen
 	return generatedSlot(stmt, win, compactDocument(doc))
 }
 
+// directiveExtensionUse is `open ext <name>`: the ask that starts an on-demand
+// extension and hands back its handles (issue #183).
+//
+// It renders the same document `ext get` does — template plus runtime — because
+// the caller that just started an extension needs both halves in one reply: the
+// notes are the operating instructions, and the handles are what they are for.
+// The handle is also a header, which is how `open` answers everywhere else.
+func (s *Server) directiveExtensionUse(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+	name := strings.TrimSpace(stmt.Key)
+	if name == "" {
+		return badRequest(stmt, "open ext needs a name: open ext <name>")
+	}
+	// WORDS THIS FORM CANNOT HONOR ARE REFUSED, NOT IGNORED. `open ext boxfs extra`
+	// and `open a1f3 ext boxfs` parse (the kind word is taken first, so what looks
+	// like a target becomes one), and an extension's container is the reconciler's —
+	// a caller cannot name it. Reading past either word would answer a question the
+	// caller did not ask.
+	if stmt.Target != "" {
+		return badRequest(stmt, "open ext names no session: the extension's connection belongs to the reconciler. "+
+			"Write `open ext "+name+"`, and drive the handles it returns.")
+	}
+	if len(stmt.Args) > 0 {
+		return badRequest(stmt, "open ext takes one name, got extra word "+quoteOrDash(stmt.Args[0]))
+	}
+	if slot, refused := s.refuseAction(ctx, stmt, capability.ExtGet); refused {
+		return slot
+	}
+	res, fail := s.callTool(ctx, "extension", map[string]any{"action": "use", "name": name})
+	if fail != nil {
+		return s.slotFromFailure(ctx, stmt, fail)
+	}
+	doc, _ := toolResultMap(res)
+	slot := generatedSlot(stmt, win, compactDocument(doc))
+	if handle := shortHandle(doc); handle != "" {
+		slot.Headers["Handle"] = handle
+	}
+	return slot
+}
+
+// directiveExtensionRelease is `close ext <name> [<channel>]`: the caller giving an
+// instance back (issue #183).
+//
+// It exists because the idle window is a backstop, not the plan. A caller that has
+// finished with an MCP server or a prompt extension knows that a moment after the
+// daemon could infer it, and saying so stops the process on the target now instead
+// of ten minutes from now.
+func (s *Server) directiveExtensionRelease(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+	name := strings.TrimSpace(stmt.Key)
+	if name == "" {
+		return badRequest(stmt, "close ext needs a name: close ext <name> [<shell_id>]")
+	}
+	if slot, refused := s.refuseAction(ctx, stmt, capability.ExtGet); refused {
+		return slot
+	}
+	args := map[string]any{"action": "release", "name": name}
+	// The channel id arrives in the key position after the name, or as --channel:
+	// both are spellings of the same thing, and the second exists for a caller that
+	// pasted a long id.
+	handle := stmt.Target
+	if v, ok := stmt.Flag("channel"); ok && v != "" {
+		handle = v
+	}
+	if len(stmt.Args) > 0 && handle == "" {
+		handle = stmt.Args[0]
+	}
+	if handle != "" {
+		args["shell_id"] = handle
+	}
+	res, fail := s.callTool(ctx, "extension", args)
+	if fail != nil {
+		return s.slotFromFailure(ctx, stmt, fail)
+	}
+	doc, _ := toolResultMap(res)
+	return generatedSlot(stmt, win, compactDocument(doc))
+}
+
 // extensionCapability maps an extension action onto its capability.
 func extensionCapability(action string) (string, bool) {
 	switch action {
@@ -1063,6 +1143,11 @@ func extensionCapability(action string) (string, bool) {
 		return capability.ExtDelete, true
 	case "retry", "restart":
 		return capability.ExtRetry, true
+	case "use":
+		// Starting an extension is the way to reach it, so the capability that
+		// already governs reaching it is the one that governs starting it. A
+		// separate bit would be a second place to grant the same access.
+		return capability.ExtGet, true
 	}
 	return "", false
 }
