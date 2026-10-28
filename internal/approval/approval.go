@@ -230,6 +230,7 @@ var AllKinds = []Kind{
 	KindForwardOpen, KindForwardClose,
 	KindExtensionCreate, KindExtensionUpdate,
 	KindProfileCreate, KindProfileEdit,
+	KindSerialCtl,
 }
 
 // ValidKind reports whether kind is one this build gates.

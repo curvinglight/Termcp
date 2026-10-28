@@ -137,7 +137,7 @@ func TestEveryFlagOpRefusesAReferenceWhereAKindGoes(t *testing.T) {
 // positional word. That list is the whole DSL boundary: growing it is a decision about
 // what a caller's data may decide, so it should not be possible to grow it by accident.
 func TestTheDataWhitelistIsExplicit(t *testing.T) {
-	want := map[string]int{"get": 1, "key": 1, "resize": 2}
+	want := map[string]int{"get": 1, "key": 1, "resize": 2, "set": 2}
 	for _, op := range Ops() {
 		if got := op.DataArgs; got != want[op.Name] {
 			t.Errorf("%s DataArgs = %d, want %d (the whitelist is a decision, not a default)",

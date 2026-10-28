@@ -37,7 +37,7 @@ func TestNoSpecDriftBetweenDirectivesAndSkill(t *testing.T) {
 	want := []string{
 		"call", "close", "connect", "create", "edit", "get", "help", "input",
 		"key", "ls", "notify", "open", "read", "reader", "resize", "rm", "run",
-		"span", "write",
+		"set", "span", "write",
 	}
 	for _, name := range want {
 		if !declared[name] {
