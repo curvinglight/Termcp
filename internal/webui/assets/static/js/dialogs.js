@@ -219,12 +219,22 @@ function nodeSessionInfo(name) {
  *  question this column answers. The loopback profile is SSH too — it just dials
  *  this machine over Termcp's own server — so it says so rather than claiming a
  *  protocol of its own. */
-function nodeProtocol(c) { return c.kind === 'internal' ? t('nethub.proto.loopback') : 'SSH'; }
+function nodeProtocol(c) {
+  if (c.kind === 'internal') return t('nethub.proto.loopback');
+  if (c.kind === 'serial') return 'Serial';
+  return 'SSH';
+}
 
 /** The address line: user@host:port, or the loopback note for the internal
  *  profile. Never a secret — the profile's password and key stay in the editor. */
 function nodeAddress(c) {
   if (c.kind === 'internal') return t('nethub.internal');
+  if (c.kind === 'serial') {
+    // The device path IS the address; the baud is what a misconfigured card
+    // hides, so it belongs next to the path.
+    var d = String(c.device || '');
+    return d ? d + ' @ ' + (c.baud || '?') : '';
+  }
   var host = String(c.host || '');
   if (!host) return '';
   var user = String(c.user || '');

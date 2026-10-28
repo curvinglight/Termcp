@@ -54,6 +54,53 @@ func (h *Handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A SERIAL PROFILE OPENS A DEVICE, not a connection: no command, no shell
+	// mode, no size. The refusals name the field so the dialog can hide exactly
+	// what the profile cannot take.
+	if ent.Kind == sshconfig.KindSerial {
+		if strings.TrimSpace(body.Command) != "" || len(body.Args) > 0 {
+			http.Error(w, "a serial session has no process to run; command/args are not supported", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(body.Mode) != "" {
+			http.Error(w, "a serial session has no shell mode; the device is one stream", http.StatusBadRequest)
+			return
+		}
+		spec, err := sshconfig.SerialFromEntry(ent)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		sessName := strings.TrimSpace(body.Name)
+		if sessName == "" {
+			sessName = cfgName
+		}
+		sess, err := h.Sessions.Create(session.Config{
+			Name:      sessName,
+			SSHConfig: cfgName,
+			Serial: &session.SerialConfig{
+				ProfileName: cfgName,
+				Spec:        spec,
+			},
+			Approval: ent.DefaultApproval,
+			Ctx:      r.Context(),
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_id": sess.ID,
+			"shell_id":   sess.PrimaryShellID(),
+			"ssh_config": cfgName,
+			"index":      sess.PrimaryShellIndex(),
+			"kind":       string(api.KindSerial),
+			"device":     spec.Device,
+			"baud":       spec.Baud,
+		})
+		return
+	}
+
 	cmd, args := sshconfig.EffectiveCommand(ent, body.Command, body.Args)
 	if strings.TrimSpace(cmd) == "" && len(args) > 0 {
 		http.Error(w, "command is required when args are provided", http.StatusBadRequest)

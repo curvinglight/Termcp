@@ -51,6 +51,42 @@ var _connTemplateRemote = [
   ''
 ].join('\n');
 
+// TOML shown when creating a serial profile. A serial profile names a device on
+// this machine, not a host: device and baud are required, and there is no
+// credential to carry. tx_eol=cr is the default because most bootloaders want a
+// bare CR — crlf makes Enter do nothing on GRUB/U-Boot while single keys still
+// work, which reads exactly like a dead cable.
+var _connTemplateSerial = [
+  '# termcp serial config (TOML)',
+  'kind = "serial"',
+  'description = ""',
+  '',
+  '# Required: the device path and the line speed.',
+  '# device = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"   # by-id survives re-plugging',
+  '# device = "/dev/ttyUSB0"                                      # plain path, may renumber',
+  '# device = "COM3"                                              # Windows',
+  '# baud = 115200',
+  '',
+  '# Line framing (defaults: 8N1).',
+  '# data_bits = 8',
+  '# parity = "none"        # none|even|odd|mark|space',
+  '# stop_bits = "1"',
+  '',
+  '# What Enter sends. cr is the safe default for bootloaders; "none" sends a',
+  '# bare CR with no conversion, NOT no line ending at all.',
+  '# tx_eol = "cr"          # cr|crlf|lf|none',
+  '',
+  '# How bytes are presented: auto escapes undecodable bytes as \\xHH, text',
+  '# prints them raw, hex/b64 render the stream as ASCII. Choose hex/b64 for a',
+  '# binary protocol, auto/text for a console.',
+  '# display = "auto"',
+  '',
+  '# local_echo = true      # ONLY for devices that do not echo their input;',
+  '#                        # doubling it writes a login password to the transcript in clear',
+  '# rx_normalize = true    # fold CR/CRLF to LF before storing',
+  ''
+].join('\n');
+
 function _tomlEscape(v) { return v.replace(/\\/g,'\\\\').replace(/"/g,'\\"'); }
 function _tomlVal(s) { return s ? ('"'+_tomlEscape(s)+'"') : '""'; }
 function _hesc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -107,6 +143,7 @@ function _jumpsFromSections(sections) {
 }
 
 var jumpCards = [];
+var editingKind = 'remote';
 var jumpEditingIdx = -1; // index of the jump currently expanded in editor mode; -1 = none
 var jumpEditingNew = false; // the editing jump is a brand-new, unsaved one (cancel removes it)
 var connEntries = null;
@@ -188,11 +225,109 @@ function _jumpToLines(c, depth) {
   return lines;
 }
 
+// The serial half of the profile form. The device fields are the profile: there
+// is no host, no credential and no shell, so the SSH sections hide and the
+// serial section shows. The port chips come from /api/serial/ports and prefer
+// the stable by-id path — a ttyUSB number changes with plug order, the by-id
+// name does not.
+function _serialFormToTOML() {
+  var lines = ['kind = "serial"'];
+  var d = document.getElementById('conn-f-device').value.trim();
+  lines.push('device = ' + _tomlVal(d));
+  var b = parseInt(document.getElementById('conn-f-baud').value, 10);
+  if (b > 0) lines.push('baud = ' + b);
+  var eol = document.getElementById('conn-f-txeol').value;
+  if (eol && eol !== 'cr') lines.push('tx_eol = ' + _tomlVal(eol));
+  var disp = document.getElementById('conn-f-display').value;
+  if (disp && disp !== 'auto') lines.push('display = ' + _tomlVal(disp));
+  if (document.getElementById('conn-f-localecho').checked) lines.push('local_echo = true');
+  if (document.getElementById('conn-f-approval').checked) lines.push('default_approval = true');
+  return lines.join('\n') + '\n';
+}
+
+function _serialTOMLToForm(o) {
+  ensureSerialFields();
+  document.getElementById('conn-f-device').value = o.device || '';
+  document.getElementById('conn-f-baud').value = o.baud || 115200;
+  document.getElementById('conn-f-txeol').value = o.tx_eol || 'cr';
+  document.getElementById('conn-f-display').value = o.display || 'auto';
+  document.getElementById('conn-f-localecho').checked = o.local_echo === true;
+  document.getElementById('conn-f-approval').checked = o.default_approval === true;
+  loadSerialPortChips();
+}
+
+// ensureSerialFields builds the serial fieldset into the form on first use. It
+// lives here rather than in index.html because it is the one kind whose fields
+// most pages never show, and the page has a byte budget the markup pays for.
+function ensureSerialFields() {
+  if (document.getElementById('conn-f-device')) return;
+  var shellRow = document.getElementById('conn-f-shell').closest('.conn-field');
+  var wrap = document.createElement('div');
+  wrap.id = 'conn-f-serial-fields';
+  wrap.style.display = 'none';
+  wrap.innerHTML =
+    '<div class="conn-field">' +
+    '<label for="conn-f-device">' + _hesc(t('modal.conn.field.device')) + '</label>' +
+    '<input type="text" id="conn-f-device" placeholder="/dev/ttyUSB0 · COM3" autocomplete="off">' +
+    '<div id="conn-f-port-chips" class="conn-port-chips" style="display:none"></div>' +
+    '</div>' +
+    '<div class="conn-field">' +
+    '<label for="conn-f-baud">' + _hesc(t('modal.conn.field.baud')) + '</label>' +
+    '<input type="number" id="conn-f-baud" value="115200" min="50" max="4000000" autocomplete="off">' +
+    '</div>' +
+    '<div class="conn-field">' +
+    '<label for="conn-f-txeol">' + _hesc(t('modal.conn.field.txeol')) + '</label>' +
+    '<select id="conn-f-txeol">' +
+    '<option value="cr">CR</option><option value="crlf">CRLF</option><option value="lf">LF</option><option value="none">raw</option>' +
+    '</select>' +
+    '</div>' +
+    '<div class="conn-field">' +
+    '<label for="conn-f-display">' + _hesc(t('modal.conn.field.display')) + '</label>' +
+    '<select id="conn-f-display">' +
+    '<option value="auto">auto</option><option value="text">text</option><option value="hex">hex</option><option value="b64">b64</option>' +
+    '</select>' +
+    '</div>' +
+    '<div class="conn-field">' +
+    '<label><input type="checkbox" id="conn-f-localecho"> ' + _hesc(t('modal.conn.field.localecho')) + '</label>' +
+    '</div>';
+  shellRow.parentNode.insertBefore(wrap, shellRow);
+}
+
+
+function loadSerialPortChips() {
+  var box = document.getElementById('conn-f-port-chips');
+  if (!box) return;
+  fetch(apiPath('/api/serial/ports')).then(function (r) {
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+  }).then(function (j) {
+    var ports = (j && j.ports) || [];
+    if (!ports.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.innerHTML = '';
+    ports.forEach(function (p) {
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'conn-port-chip';
+      var path = p.stable_name || p.name;
+      chip.textContent = p.name + (p.product ? ' · ' + p.product : '');
+      chip.title = path + (p.usb ? ' · USB ' + (p.vid || '') + ':' + (p.pid || '') : '');
+      chip.addEventListener('click', function () {
+        document.getElementById('conn-f-device').value = path;
+      });
+      box.appendChild(chip);
+    });
+    box.style.display = '';
+  }).catch(function () { box.style.display = 'none'; });
+}
+
 function _connFormToTOML() {
   // The internal profile's override carries only the settings it actually uses.
   // Emitting host/credentials for it would either be ignored on load (confusing)
   // or, worse, make a loopback profile look like it dials somewhere.
   var isInternal = editingConnName === 'internal';
+  if (editingKind === 'serial') {
+    return _serialFormToTOML();
+  }
   var lines = [isInternal ? 'kind = "internal"' : 'kind = "remote"'];
   if (!isInternal) {
     var h = document.getElementById('conn-f-host').value.trim(); lines.push('host = ' + _tomlVal(h));
@@ -223,6 +358,20 @@ function _connFormToTOML() {
 function _connTOMLToForm(toml) {
   var parsed = _parseConnTOML(toml);
   var o = parsed.root;
+  // The document's kind wins: it is what the server will validate, so the form
+  // follows it rather than the stale kind the dialog was opened with.
+  editingKind = (o.kind === 'serial' || o.kind === 'internal' || o.kind === 'remote') ? o.kind : editingKind;
+  var isSerial = editingKind === 'serial';
+  if (isSerial) ensureSerialFields();
+  var serialFields = document.getElementById('conn-f-serial-fields');
+  var remoteFields = document.getElementById('conn-f-remote-fields');
+  var remoteExtra = document.getElementById('conn-f-remote-extra');
+  var shellRow = document.getElementById('conn-f-shell') ? document.getElementById('conn-f-shell').closest('.conn-field') : null;
+  if (serialFields) serialFields.style.display = isSerial ? '' : 'none';
+  if (remoteFields) remoteFields.style.display = isSerial ? 'none' : (editingConnName === 'internal' ? 'none' : '');
+  if (remoteExtra) remoteExtra.style.display = isSerial ? 'none' : (editingConnName === 'internal' ? 'none' : '');
+  if (shellRow) shellRow.style.display = isSerial ? 'none' : '';
+  if (isSerial) { _serialTOMLToForm(o); return; }
   document.getElementById('conn-f-host').value = o.host || '';
   document.getElementById('conn-f-port').value = o.port || 22;
   document.getElementById('conn-f-user').value = o.user || '';
@@ -278,6 +427,11 @@ function openConnModal(edit, name, kind) {
   // built-in connection is addressed), and the form hides those two controls
   // for it below.
   editingConnName = edit ? name : '';
+  // The kind decides which fields the form shows and which the TOML writer
+  // emits. For an edit it comes from the caller (the card knows); for a new
+  // profile it is remote until the user picks serial, and the fetched TOML's
+  // kind overrides both.
+  editingKind = kind || 'remote';
   connEntries = null; // refresh import dropdown options
   /* The dialog is ONE singleton element reused by every open, so anything it
      carries that the next open does not overwrite is residue the user reads as
@@ -817,6 +971,15 @@ function openStartModal(connName) {
   document.getElementById('start-title').textContent = t('modal.start.titleConnect', { name: connName });
   document.getElementById('start-cmd').value = '';
   document.getElementById('start-mode').value = 'pty';
+  // A SERIAL PROFILE TAKES NO COMMAND AND NO MODE: the device is one stream,
+  // and the launch options a host dialog shows would be refused by the server.
+  // Hiding them is the honest form — the same fields, greyed, would invite an
+  // edit that cannot be honoured.
+  var isSerial = !!(window._lastConnections || []).find(function (c) { return c.name === connName && c.kind === 'serial'; });
+  var cmdEl = document.getElementById('start-cmd');
+  var modeEl = document.getElementById('start-mode');
+  if (cmdEl) cmdEl.parentElement.style.display = isSerial ? 'none' : '';
+  if (modeEl) modeEl.parentElement.style.display = isSerial ? 'none' : '';
   showModal('modal-start');
 }
 document.getElementById('modal-start-close').onclick = function () { hideModal('modal-start'); };
@@ -829,11 +992,21 @@ document.getElementById('start-run').onclick = function () {
   // connection progress (spinner). On failure the dialog reopens with the
   // error so inputs stay editable for a retry.
   hideModal('modal-start');
-  startSessionAndOpenShell(document.getElementById('start-ssh-config').value, null, {
+  var launchTarget = document.getElementById('start-ssh-config').value;
+  var launchIsSerial = !!(window._lastConnections || []).find(function (c) { return c.name === launchTarget && c.kind === 'serial'; });
+  var launchOpt = {
     command: cmd,
     mode: document.getElementById('start-mode').value,
     name: sname || undefined
-  })
+  };
+  // A serial profile takes no command and no mode; sending the dialog's
+  // default 'pty' would be refused, and the refusal would be about a field the
+  // user never saw.
+  if (launchIsSerial) {
+    launchOpt.command = '';
+    launchOpt.mode = '';
+  }
+  startSessionAndOpenShell(launchTarget, null, launchOpt)
     .catch(function (e) {
       err.textContent = String(e.message || e);
       err.style.display = 'block';

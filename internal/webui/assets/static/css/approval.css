@@ -101,3 +101,15 @@
   .psw-wrap .psw-input { width: 100%; padding: 4px 28px 4px 8px; margin-bottom: 0; box-sizing: border-box; }
   .psw-eye { position: absolute; right: 2px; top: 0; bottom: 0; width: 26px; padding: 0; border: none; background: transparent; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; }
 
+
+/* Serial profile form: the device picker's port chips. One chip per port the
+   machine offers; clicking one fills the device field with the stable path
+   (by-id where the OS provides it). The chips wrap because a bus with several
+   adapters is the ordinary case, not the exception. */
+.conn-port-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.conn-port-chip {
+  font: inherit; font-size: 12px; padding: 2px 8px; cursor: pointer;
+  border: 1px solid var(--border, #444); border-radius: 10px; background: transparent;
+  color: inherit;
+}
+.conn-port-chip:hover { border-color: var(--accent, #7aa); }

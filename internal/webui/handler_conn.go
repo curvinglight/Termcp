@@ -12,6 +12,7 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/configcrypt"
 	"github.com/open-mcp-ai/termcp/internal/locator"
 	"github.com/open-mcp-ai/termcp/internal/session"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
 
@@ -22,6 +23,11 @@ type connectionSummary struct {
 	Host        string `json:"host,omitempty"`
 	User        string `json:"user,omitempty"`
 	Port        int    `json:"port,omitempty"`
+	// Device and Baud are the serial fields of kind = "serial": the card prints
+	// "device @baud" where a host card prints "user@host:port", and the create
+	// dialog needs the same fields to know a serial profile takes no command.
+	Device string `json:"device,omitempty"`
+	Baud   int    `json:"baud,omitempty"`
 	// DefaultApproval is the profile's review default for new sessions. It is
 	// served on the list so the card can show the flag without a second fetch.
 	DefaultApproval bool `json:"default_approval"`
@@ -67,13 +73,17 @@ func summarizeConnection(name string, ent *sshconfig.Entry) connectionSummary {
 		Description:     ent.Description,
 		DefaultApproval: ent.DefaultApproval,
 	}
-	if ent.Kind == sshconfig.KindRemote {
+	switch ent.Kind {
+	case sshconfig.KindRemote:
 		cs.Host = strings.TrimSpace(ent.Host)
 		cs.User = strings.TrimSpace(ent.User)
 		cs.Port = ent.Port
 		if cs.Port == 0 {
 			cs.Port = 22
 		}
+	case sshconfig.KindSerial:
+		cs.Device = strings.TrimSpace(ent.Device)
+		cs.Baud = ent.Baud
 	}
 	return cs
 }
@@ -341,6 +351,26 @@ func (h *Handler) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 	ent, err := sshconfig.ParseAndValidate(body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if ent.Kind == sshconfig.KindSerial {
+		// A serial profile tests by OPENING the device: reachability is not a
+		// dial but a claim, and the failure that matters (port busy, permission,
+		// device gone) only surfaces at open. The port is closed again
+		// immediately; a test that left it open would block the session it was
+		// testing for.
+		spec, err := sshconfig.SerialFromEntry(ent)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ch, err := serial.Open(spec, "", 0)
+		if err != nil {
+			writeJSON(w, http.StatusOK, &session.TestResult{OK: false, Error: err.Error()})
+			return
+		}
+		_ = ch.Close()
+		writeJSON(w, http.StatusOK, &session.TestResult{OK: true})
 		return
 	}
 	if ent.Kind != sshconfig.KindRemote {

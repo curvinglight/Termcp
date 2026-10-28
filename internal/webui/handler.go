@@ -157,6 +157,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/daemon/stop", h.handleDaemonStop)
 
 	// Connection profiles
+	mux.HandleFunc("GET /api/serial/ports", h.handleSerialPorts)
 	mux.HandleFunc("GET /api/connections", h.handleListConnections)
 	mux.HandleFunc("GET /api/connections/batch", h.handleExportConnections)
 	mux.HandleFunc("POST /api/connections/batch", h.handleImportConnections)
