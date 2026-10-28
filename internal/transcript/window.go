@@ -543,6 +543,19 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		// rendered form and `raw` is what it was rendered from. Checking the RAW
 		// bytes is what makes the refusal honest: a stripped string could pass
 		// utf8.Valid while the stream it came from was binary.
+		//
+		// The display choice is applied to the LIVE path exactly as render() does
+		// on the positional ones, and for the same reason: a profile that says
+		// hex says it everywhere, and one path speaking raw while the others
+		// speak hex is how two reads of the same bytes disagree. The conversion
+		// runs BEFORE the fidelity check — the whole point of hex/b64/auto is
+		// that the rendered form is JSON-safe, so a byte-exact window is a 200,
+		// not the refusal the raw bytes would have earned.
+		if p.Display == encoding.Hex || p.Display == encoding.B64 {
+			out = encoding.EncodeForDisplay(raw, p.Display)
+		} else if p.Display == encoding.Auto && !utf8.Valid(raw) {
+			out = encoding.EncodeForDisplay(raw, encoding.Auto)
+		}
 		if p.Charset != "" {
 			decoded, derr := encoding.Decode(p.Charset, raw)
 			if derr != nil {
@@ -551,7 +564,13 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 			raw = decoded
 			out = clean(raw, p.StripAnsi)
 		}
-		if p.RequireUTF8 {
+		// THE FIDELITY CHECK READS WHAT THE CALLER WILL SEE. With a display
+		// choice set, that is the converted form — hex/b64/auto are ASCII by
+		// construction, so a binary window is a 200, not the refusal the raw
+		// bytes would have earned (the raw refusal is exactly what display
+		// exists to answer). The windowRaw the reply carries stays the raw
+		// bytes: offsets count the stream either way.
+		if p.RequireUTF8 && p.Display != encoding.Hex && p.Display != encoding.B64 && p.Display != encoding.Auto {
 			if err := RenderCheck(raw); err != nil {
 				return refuse(err)
 			}

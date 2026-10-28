@@ -265,11 +265,14 @@ func (s *Server) listPeers(stmt directive.Statement) envelope.Slot {
 // one serial_ctl call whose arguments are checked twice (here for shape, in
 // the handler for meaning) because the two layers refuse different mistakes.
 func (s *Server) directiveSet(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
-	attr := strings.ToLower(strings.TrimSpace(stmt.Key))
-	value := ""
-	if len(stmt.Args) > 0 {
-		value = strings.TrimSpace(stmt.Args[0])
+	// THE PROPERTY AND ITS VALUE ARE DATA, not grammar: DataArgs 2 puts both in
+	// Args (the same place `key`'s key name lands), so a value that happens to
+	// spell a kind word still reaches the handler as a value.
+	if len(stmt.Args) < 2 {
+		return badRequest(stmt, "set needs a property and a value: "+`set <channel> dtr|rts high|low | set <channel> break <ms> | set <channel> flush <in|out|both>`)
 	}
+	attr := strings.ToLower(strings.TrimSpace(stmt.Args[0]))
+	value := strings.TrimSpace(stmt.Args[1])
 	args := map[string]any{"shell_id": stmt.Target}
 	switch attr {
 	case "dtr", "rts":
@@ -291,8 +294,6 @@ func (s *Server) directiveSet(ctx context.Context, stmt directive.Statement, win
 		}
 		args["action"] = "flush"
 		args["direction"] = value
-	case "":
-		return badRequest(stmt, "set needs a property: "+`set <channel> dtr|rts high|low | set <channel> break <ms> | set <channel> flush <in|out|both>`)
 	default:
 		return badRequest(stmt, "unknown property "+quoteOrDash(attr)+": a serial channel has dtr, rts, break and flush")
 	}

@@ -237,6 +237,14 @@ func (s *Server) sshClientForSession(sessionID string) (*session.Session, *ssh.C
 	if bad != nil {
 		return nil, nil, bad
 	}
+	// A session whose transport is not SSH is a different failure from one that
+	// is not running: the session is up and usable, it simply has no SSH
+	// features. Reporting "not running" for it sent the caller looking for a
+	// dead session instead of at the transport, so the two cases are separated.
+	if !sess.SupportsSSH() {
+		return nil, nil, toolError(CodeSerialUnsupported, "%s",
+			fmt.Sprintf("Session '%s' is a serial session; this operation needs an SSH connection", sessionID))
+	}
 	cli := sess.SSHClient()
 	if cli == nil {
 		return nil, nil, toolError(CodeSessionNotRunning, "%s", fmt.Sprintf("Session '%s' is not running or has no active SSH connection", sessionID))

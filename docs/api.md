@@ -160,10 +160,36 @@ Lists summaries of all connection profiles.
 Response 200:
 {
   "connections": [
-    { "name": "pi", "kind": "remote", "host": "192.168.1.100", "user": "pi", "port": 22, "default_approval": false }
+    { "name": "pi", "kind": "remote", "host": "192.168.1.100", "user": "pi", "port": 22, "default_approval": false },
+    { "name": "tty0", "kind": "serial", "device": "/dev/serial/by-id/usb-1a86_X-if00-port0", "baud": 115200, "default_approval": false }
   ]
 }
 ```
+
+A profile with `kind = "serial"` names a local serial device rather than an
+SSH host. `device` and `baud` are required; `tx_eol` (default `cr`) is the
+byte sequence Enter sends; `display` (`auto`, default) is how the device's
+bytes are presented — `hex`/`b64` render the raw stream as ASCII. A serial
+session carries one channel: command, args and mode do not apply, and
+SSH-only operations (forwards, SFTP) answer `serial_unsupported`.
+
+### `GET /api/serial/ports`
+
+Lists this machine's serial ports for the profile form's device picker.
+
+```
+Response 200:
+{
+  "ports": [
+    { "name": "/dev/ttyUSB0", "stable_name": "/dev/serial/by-id/usb-1a86_X-if00-port0",
+      "usb": true, "vid": "1a86", "pid": "7523", "product": "USB Serial" }
+  ]
+}
+```
+
+`stable_name` is the path a profile should store: a `ttyUSB` number changes
+with plug order, the by-id name does not. Empty when the platform cannot
+offer one.
 
 `default_approval` is the profile's **review default**: with it on, every
 session created from this profile starts with review mode enabled, so each AI
