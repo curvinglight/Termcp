@@ -180,6 +180,15 @@ func (s *Server) directiveInfo(ctx context.Context, stmt directive.Statement, wi
 	writeKV(&b, "status", string(info.Status))
 	writeKV(&b, "ssh_config", dash(info.SSHConfig))
 	writeKV(&b, "endpoint", dash(info.SSHEndpoint))
+	if info.Kind == api.KindSerial && info.Serial != nil {
+		// A serial session has no endpoint: the device IS the answer, and the
+		// card says what was opened rather than leaving an empty line.
+		writeKV(&b, "kind", "serial")
+		writeKV(&b, "device", fmt.Sprintf("%s @ %d baud", info.Serial.Device, info.Serial.Baud))
+		if info.Display != "" && info.Display != "text" {
+			writeKV(&b, "display", info.Display)
+		}
+	}
 	if info.ExitCode != nil {
 		writeKV(&b, "exit_code", fmt.Sprint(*info.ExitCode))
 	}
@@ -237,6 +246,21 @@ func (s *Server) channelSlot(stmt directive.Statement, win termArgs, cs *session
 	// address cannot describe a stream two ways.
 	writeKV(&b, "bytes", fmt.Sprint(s.streamLen(cs)))
 	writeKV(&b, "created", ageOf(info.CreatedAt))
+	// A SERIAL CHANNEL SAYS SO, and answers the questions only a device can:
+	// the open input lines (the modem side a bootloader listens to). An SSH
+	// channel has no lines, so the block is silent there — the absence is the
+	//SSH reading, not a missing field.
+	if ctrl := cs.Controller(); ctrl != nil {
+		writeKV(&b, "kind", "serial")
+		if lineOpen := cs.LineOpen(); lineOpen {
+			writeKV(&b, "line_open", "true (input written without a line-ending write)")
+		}
+		if cts, dsr, ri, dcd, err := ctrl.ModemStatus(); err == nil {
+			writeKV(&b, "lines", fmt.Sprintf("cts=%t dsr=%t ri=%t dcd=%t", cts, dsr, ri, dcd))
+		} else {
+			writeKV(&b, "lines", "unavailable: "+err.Error())
+		}
+	}
 	body, code, cut, total := capGeneratedCounted(b.String(), win)
 	headers := map[string]string{"Path": stmt.Path}
 	noteTruncated(headers, code, cut, total, win)

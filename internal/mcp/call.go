@@ -102,6 +102,10 @@ func (s *Server) handlerFor(tool string) toolHandler {
 		return s.handleFileGetwd
 	case "ssh_config":
 		return s.handleSSHConfigOps
+	case "serial_ports":
+		return s.handleSerialPorts
+	case "serial_ctl":
+		return s.handleSerialCtl
 	case "extension":
 		return s.handleExtensionOps
 	default:

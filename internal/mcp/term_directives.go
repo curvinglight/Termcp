@@ -167,6 +167,10 @@ func (s *Server) runDirective(ctx context.Context, stmt directive.Statement, win
 	case "help":
 		return []envelope.Slot{s.directiveHelp(stmt, win)}
 
+	// --- set: a channel's stateful property (serial modem lines) ---
+	case "set":
+		return []envelope.Slot{s.directiveSet(ctx, stmt, win)}
+
 	// --- connect: a new SSH link ---
 	case "connect":
 		return s.directiveOpen(ctx, stmt, win, wantPTY(stmt))

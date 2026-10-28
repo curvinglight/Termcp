@@ -126,6 +126,11 @@ var table = []Capability{
 	{ID: "forward.close", Kind: approval.KindForwardClose, Gate: GateReview},
 	{ID: "forward.list", Gate: GateOperator, Idempotent: true},
 
+	// Serial: listing the machine's ports is a read; driving a modem line
+	// changes device state (DTR resets a board), so it is reviewed.
+	{ID: "serial.port.list", Gate: GateOperator, Idempotent: true},
+	{ID: "serial.ctl", Kind: approval.KindSerialCtl, Gate: GateReview},
+
 	// --- Files ---
 	{ID: "file.read", PathArgs: []string{"remote_path", "local_path"}, Gate: GateOperator, Idempotent: true},
 	{ID: "file.write", PathArgs: []string{"remote_path", "local_path"}, Kind: approval.KindFileWrite, Gate: GateReview},
@@ -282,6 +287,8 @@ const (
 
 	ProfileList   = "profile.list"
 	ProfileCreate = "profile.create"
+	SerialPortList = "serial.port.list"
+	SerialCtl      = "serial.ctl"
 	ProfileEdit   = "profile.edit"
 	ProfileCopy   = "profile.copy"
 	ProfileDelete = "profile.delete"

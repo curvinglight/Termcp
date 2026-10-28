@@ -27,6 +27,26 @@ func (s *Server) directiveLS(ctx context.Context, stmt directive.Statement, win 
 				stmt.Key+"` (pass a `timeout` on the call and it waits).")}
 		}
 		return []envelope.Slot{s.directiveLsTask(stmt)}
+	case "port":
+		// THE MACHINE'S SERIAL PORTS. Read-only and not tied to any session, so
+		// the shape is `ls host`: a bare listing a caller copies a device path
+		// out of. The by-id path is preferred in the row because ttyUSB numbers
+		// change with plug order and the by-id name does not.
+		if stmt.Key != "" {
+			return []envelope.Slot{badRequest(stmt, "`ls port` lists every port; ports are not named. Copy a device path from the listing.")}
+		}
+		res, fail := s.callTool(ctx, "serial_ports", map[string]any{})
+		if fail != nil {
+			return []envelope.Slot{s.slotFromFailure(ctx, stmt, fail)}
+		}
+		doc, ok := toolResultMap(res)
+		if !ok {
+			return []envelope.Slot{s.slotFromFailure(ctx, stmt, &toolFailure{code: CodeOperationFailed, msg: toolResultText(res)})}
+		}
+		if ports, _ := doc["ports"].([]any); len(ports) == 0 {
+			return []envelope.Slot{generatedSlot(stmt, win, "no serial ports found\n")}
+		}
+		return []envelope.Slot{generatedSlot(stmt, win, serialPortsListTextFromDoc(doc))}
 	case "host":
 		// A NAME HERE WOULD BE SILENTLY DROPPED: the handler lists every entry, so
 		// `ls host prod` answered the whole table and the caller believed it had been
@@ -237,3 +257,70 @@ func (s *Server) listPeers(stmt directive.Statement) envelope.Slot {
 }
 
 // --- task: the receipt side of an asynchronous transfer (#158) ---
+
+
+// directiveSet implements `set <channel> <attr> <value>`: today, a serial
+// device's modem lines and buffers. The verb is deliberately narrow — it
+// changes one named property of one channel, and each combination maps onto
+// one serial_ctl call whose arguments are checked twice (here for shape, in
+// the handler for meaning) because the two layers refuse different mistakes.
+func (s *Server) directiveSet(ctx context.Context, stmt directive.Statement, win termArgs) envelope.Slot {
+	attr := strings.ToLower(strings.TrimSpace(stmt.Key))
+	value := ""
+	if len(stmt.Args) > 0 {
+		value = strings.TrimSpace(stmt.Args[0])
+	}
+	args := map[string]any{"shell_id": stmt.Target}
+	switch attr {
+	case "dtr", "rts":
+		if value != "high" && value != "low" {
+			return badRequest(stmt, "set "+stmt.Target+" "+attr+" takes high or low, got "+quoteOrDash(value))
+		}
+		args["action"] = attr
+		args["level"] = value
+	case "break":
+		ms, err := strconv.Atoi(value)
+		if err != nil || ms < 0 || ms > 10000 {
+			return badRequest(stmt, "set "+stmt.Target+" break takes a duration in milliseconds (0-10000), got "+quoteOrDash(value))
+		}
+		args["action"] = "break"
+		args["duration_ms"] = float64(ms)
+	case "flush":
+		if value != "in" && value != "out" && value != "both" {
+			return badRequest(stmt, "set "+stmt.Target+" flush takes in, out or both, got "+quoteOrDash(value))
+		}
+		args["action"] = "flush"
+		args["direction"] = value
+	case "":
+		return badRequest(stmt, "set needs a property: "+`set <channel> dtr|rts high|low | set <channel> break <ms> | set <channel> flush <in|out|both>`)
+	default:
+		return badRequest(stmt, "unknown property "+quoteOrDash(attr)+": a serial channel has dtr, rts, break and flush")
+	}
+	res, fail := s.callTool(ctx, "serial_ctl", args)
+	if fail != nil {
+		return s.slotFromFailure(ctx, stmt, fail)
+	}
+	if held := reviewPendingFrom(res); held != nil {
+		return envelope.Slot{Code: 202, Headers: map[string]string{"Path": stmt.Path}, Body: *held}
+	}
+	doc, ok := toolResultMap(res)
+	if !ok {
+		return s.slotFromFailure(ctx, stmt, &toolFailure{code: CodeOperationFailed, msg: toolResultText(res)})
+	}
+	headers := map[string]string{"Path": stmt.Path}
+	s.addUsage(&termReply{win: win}, stmt, headers)
+	return envelope.Slot{Code: 200, Headers: headers, Body: compactDocument(doc)}
+}
+
+// serialPortsListTextFromDoc flattens the serial_ports reply into one row per
+// port for `ls port`.
+func serialPortsListTextFromDoc(doc map[string]any) string {
+	ports, _ := doc["ports"].([]any)
+	rows := make([]map[string]any, 0, len(ports))
+	for _, p := range ports {
+		if m, ok := p.(map[string]any); ok {
+			rows = append(rows, m)
+		}
+	}
+	return serialPortsListText(rows)
+}

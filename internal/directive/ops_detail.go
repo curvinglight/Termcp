@@ -95,7 +95,7 @@ var ops = []Op{
 		Usage:     "open <session> [--argv <cmd> [--pty]]   |   open <session> forward …   |   open <session> mcp|cdp|jrpc <url>   |   open ext <name>   |   open <session> cdp:N --target <targetId>",
 		Detail:    openDetail},
 	{Name: "ls", Core: true, Kind: KindFlags, Target: true, TargetOptional: true, NoPositional: true,
-		Kinds:     []string{"forward", "file", "host", "ext", "alias", "cdp", "mcp", "jrpc", "task"},
+		Kinds:     []string{"forward", "file", "host", "ext", "alias", "cdp", "mcp", "jrpc", "task", "port"},
 		Flags:     []string{"all"},
 		Valueless: []string{"all"},
 		Usage:     "ls   |   ls host   |   ls ext   |   ls alias   |   ls task   |   ls <session> [forward|file]",
@@ -132,7 +132,7 @@ var ops = []Op{
 
 	{Name: "run", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChain,
 		PayloadType: PayloadVar,
-		Flags:       []string{"tail:number", "grep", "grep-limit:number", "encoding"},
+		Flags:       []string{"tail:number", "grep", "grep-limit:number", "encoding", "display"},
 		Usage:       "run <channel> [--tail N] [--grep RE] $1   |   run <session> <index> $1",
 		Detail:      runDetail},
 	{Name: "input", Core: true, Kind: KindPayload, Target: true, MinArgs: 1, TargetKind: TargetChain,
@@ -151,6 +151,13 @@ var ops = []Op{
 		Detail: spanDetail},
 	{Name: "reader", Kind: KindFlags, Target: true, Flags: []string{"drop"}, TargetKind: TargetChain,
 		Usage: "reader <session> <index>   |   reader <session> <index> --drop <id>"},
+	// set changes a STATEFUL PROPERTY of the channel node. The only properties
+	// a channel has are its terminal size (resize) and, on a serial device, the
+	// modem lines and buffers — hardware state a caller cannot reach any other
+	// way, and exactly the kind of write review mode exists for.
+	{Name: "set", Kind: KindFlags, Target: true, MinArgs: 2, MaxArgs: 2, DataArgs: 2, TargetKind: TargetChain,
+		Usage:  "set <channel> dtr|rts high|low   |   set <channel> break <ms>   |   set <channel> flush <in|out|both>",
+		Detail: setDetail},
 
 	// --- bytes in and out of a node ---
 
@@ -158,7 +165,7 @@ var ops = []Op{
 		Kinds: []string{"file", "cdp", "mcp", "jrpc"},
 		Flags: []string{"cursor:number", "since:number", "at:number", "offset:number", "bytes:number",
 			"from-line:number", "tail:number", "stream:enum=o,e,all", "raw", "grep", "grep-limit:number",
-			"frame", "encoding"},
+			"frame", "encoding", "display"},
 		Valueless: []string{"raw", "frame"},
 		Usage: "read <session> <index> [--tail N|--from-line N|--cursor N] [--grep RE]   |   " +
 			"read <session> file <path>   |   read <session> cdp|mcp|jrpc[:N][@target] [--since N] [--grep RE]   |   " +
@@ -256,6 +263,21 @@ A session SHARED WITH A HUMAN is normal, not an anomaly: a person can type into
 the same channel between your calls, from the Web UI, at any time. Read the index
 when "whose state is this?" matters; run and read also lift the same fact into a
 Typed-By: api header for the window they just returned.`
+
+const setDetail = `Changes a stateful property of a channel. Today that means a serial device's
+modem lines and buffers — the pins a bootloader listens to.
+
+  set <channel> dtr high|low     drive DTR (dropping and raising it resets many
+                                 boards into their bootloader)
+  set <channel> rts high|low     drive RTS
+  set <channel> break <ms>       hold the line in break state (ms defaults 250)
+  set <channel> flush in|out|both
+                                 discard buffered bytes
+
+These change DEVICE state, so under review mode each one waits for a human.
+Read the input lines with get <channel> (cts/dsr/ri/dcd). An SSH channel has
+no modem lines: set against one is refused, not ignored.
+`
 
 const notifyDetail = `Toasts + a system notification on every open Web UI page; --on highlights that
 session's card. Call it BEFORE asking the human for anything — password, sudo,

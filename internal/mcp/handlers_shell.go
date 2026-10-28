@@ -36,6 +36,14 @@ func (s *Server) handleStartSession(ctx context.Context, request mcpgo.CallToolR
 		return toolError(sshConfigErrCode(err), "%s", err.Error()), nil
 	}
 
+	// A SERIAL PROFILE IS A DEVICE, NOT A CONNECTION: the session's transport
+	// is the port, there is no process to run, and the reply says what was
+	// opened. Everything SSH-specific below (shell families, sizes, stderr
+	// semantics) means nothing here, so the branch leaves before any of it.
+	if ent.Kind == sshconfig.KindSerial {
+		return s.startSerialSession(ctx, args, cfgName, ent)
+	}
+
 	cmd, execArgs := sshconfig.EffectiveCommand(ent, command, toolArgs)
 	if strings.TrimSpace(cmd) == "" && len(execArgs) > 0 {
 		return toolError(CodeInvalidArgument, "%s", "command is required when args are provided"), nil
@@ -492,6 +500,16 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 	if bad != nil {
 		return bad, nil
 	}
+	// THE SESSION'S DISPLAY CHOICE IS THE DEFAULT, not the caller's burden: a
+	// profile that says hex says it once, and every read of that device speaks
+	// hex until a call overrides it with --display. Only a serial session sets
+	// one — DisplayEncoding is empty for every other kind, and injecting "text"
+	// would bypass the UTF-8 refusal the model-facing read owes its caller.
+	if p.Display == "" {
+		if d := s.sessMgr.DisplayEncodingFor(id); d != "" {
+			p.Display = d
+		}
+	}
 
 	// A CLOSED CHANNEL KEEPS ITS OWN POSITION (#159 C1).
 	//
@@ -591,6 +609,7 @@ func parseReadParams(args map[string]any) (readParams, *mcpgo.CallToolResult) {
 		// UTF-8 device: a zh-CN Windows console writes GBK, and without this the
 		// reply was a refusal the caller could not act on (issue #149).
 		Charset:   getString(args, "charset", ""),
+		Display:   getString(args, "display", ""),
 		TailLines: intPtrFromArgs(args, "tail_lines"),
 		FromLine:  int64(getFloat64(args, "from_line", 0)),
 		Stream:    getString(args, "stream", ""),

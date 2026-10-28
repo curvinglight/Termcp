@@ -10,6 +10,7 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/capability"
 	"github.com/open-mcp-ai/termcp/internal/directive"
+	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 	"github.com/open-mcp-ai/termcp/internal/envelope"
 	"github.com/open-mcp-ai/termcp/internal/transcript"
 )
@@ -103,6 +104,24 @@ func (s *Server) directiveOpen(ctx context.Context, stmt directive.Statement, wi
 	var fail *toolFailure
 	if capID == capability.SessionStart {
 		args["ssh_config"] = stmt.Target
+		// A SERIAL PROFILE IS A DEVICE: the flags a connection can mean are
+		// refused here, where the statement is still in hand, rather than in
+		// the handler where only parsed arguments survive.
+		if ent, lerr := s.sshConfigs.Load(stmt.Target); lerr == nil && ent.Kind == sshconfig.KindSerial {
+			if argv != "" {
+				return []envelope.Slot{badRequest(stmt,
+					"a serial session has no process to run; --argv is not supported")}
+			}
+			if boolFlag(stmt, "pty") || boolFlag(stmt, "pipe") {
+				return []envelope.Slot{badRequest(stmt,
+					"a serial session has no pty/pipe distinction: the device is one stream. Drop the flag")}
+			}
+			if _, ok := stmt.Flag("size"); ok {
+				return []envelope.Slot{badRequest(stmt,
+					"a serial device has no terminal to size; --size is not supported")}
+			}
+			delete(args, "mode")
+		}
 		res, fail = s.callTool(ctx, "session_start", args)
 	} else {
 		args["session_id"] = stmt.Target

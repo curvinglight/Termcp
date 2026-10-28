@@ -110,6 +110,12 @@ func (s *Server) directiveReadOne(ctx context.Context, stmt directive.Statement,
 	if v, ok := stmt.Flag("encoding"); ok {
 		args["charset"] = v
 	}
+	// --display IS THE CALLER'S OVERRIDE of the session's presentation choice:
+	// a device that usually reads as text can show one window hexed without a
+	// second profile.
+	if v, ok := stmt.Flag("display"); ok {
+		args["display"] = v
+	}
 	slot, _ := s.readSlot(ctx, stmt, win, args, 0)
 	return slot
 }
@@ -151,6 +157,11 @@ func (s *Server) awaitRunOutput(ctx context.Context, stmt directive.Statement, w
 // `timeout` bounds both and defaults to two seconds.
 func (s *Server) readSlotAfter(ctx context.Context, stmt directive.Statement, win termArgs, start int64) envelope.Slot {
 	args := argsOf("shell_id", stmt.Target, "offset", float64(start))
+	// run --display rides the same window the plain path reads: one flag, one
+	// conversion, wherever the read happens.
+	if v, ok := stmt.Flag("display"); ok {
+		args["display"] = v
+	}
 	// WHERE THIS COMMAND'S OUTPUT BEGINS (issue #194).
 	//
 	// The reply is a SAMPLE of the channel's stream, and the one number that turns the

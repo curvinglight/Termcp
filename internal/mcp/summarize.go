@@ -74,6 +74,29 @@ func kindFor(tool string, args map[string]any) approval.Kind {
 	return approval.Kind(tool)
 }
 
+// summarizeSerialCtl is the reviewer's one line for a modem-line change: the
+// action, its argument, and the channel whose device it is — nothing else on
+// the card identifies the hardware.
+func summarizeSerialCtl(args map[string]any) string {
+	s := func(k string) string { return strings.TrimSpace(getString(args, k, "")) }
+	n := func(k string, def float64) float64 { return getFloat64(args, k, def) }
+	shell := s("shell_id")
+	switch s("action") {
+	case "dtr", "rts":
+		return fmt.Sprintf("%s %s on %s", s("action"), s("level"), shell)
+	case "break":
+		return fmt.Sprintf("line break for %dms on %s", int(n("duration_ms", 250)), shell)
+	case "flush":
+		dir := s("direction")
+		if dir == "" {
+			dir = "both"
+		}
+		return fmt.Sprintf("flush %s buffers of %s", dir, shell)
+	default:
+		return "serial control on " + shell
+	}
+}
+
 // summarizeOperation renders one line a reviewer can decide on.
 //
 // This is the whole value of the feature: a reviewer who cannot tell what they
@@ -157,6 +180,9 @@ func summarizeOperation(tool string, args map[string]any) string {
 
 	case "ssh_config":
 		return summarizeProfile(s("action"), args)
+
+	case "serial_ctl":
+		return summarizeSerialCtl(args)
 	}
 	return tool
 }

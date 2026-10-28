@@ -113,6 +113,10 @@ const (
 	KindProfileCreate Kind = "profile_create"
 	// KindProfileEdit changes where an existing profile points.
 	KindProfileEdit Kind = "profile_edit"
+	// KindSerialCtl changes a serial device's state: DTR, RTS, line break, or a
+	// buffer flush. At least as dangerous as text input — DTR resets a board
+	// into its bootloader — so it rides the same queue.
+	KindSerialCtl Kind = "serial_ctl"
 )
 
 // Request is one submitted operation awaiting a decision, plus its outcome.

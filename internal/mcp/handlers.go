@@ -480,6 +480,12 @@ func (s *Server) resolveSSHFromArgs(args map[string]any) (string, *sshconfig.Ent
 		}
 		return name, ent, nil, nil
 	}
+	if ent.Kind == sshconfig.KindSerial {
+		// A serial profile has nothing to dial: the caller branches on the kind
+		// before any SSH-specific work, and RemoteFromEntry would happily build
+		// a hostless dial spec from it.
+		return name, ent, nil, nil
+	}
 	r, err := sshconfig.RemoteFromEntry(ent, s.sshConfigs.ConfigDir(name))
 	if err != nil {
 		return "", nil, nil, err

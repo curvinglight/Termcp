@@ -11,6 +11,7 @@ import (
 	"github.com/BurntSushi/toml"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/open-mcp-ai/termcp/internal/serial/port"
 	"github.com/open-mcp-ai/termcp/internal/shell"
 	"github.com/open-mcp-ai/termcp/internal/sshconfig"
 )
@@ -23,6 +24,13 @@ func (s *Server) handleCreateSSHConfig(ctx context.Context, request mcpgo.CallTo
 	name := strings.TrimSpace(getString(args, "name", ""))
 	if name == "" {
 		return toolError(CodeInvalidArgument, "%s", "name is required"), nil
+	}
+	// A serial profile is a different shape, not different fields on the same
+	// shape: device and baud instead of host and credential. Building it here —
+	// rather than letting kind flow through the remote builder — is what keeps
+	// a serial profile from carrying SSH defaults it never asked for.
+	if strings.EqualFold(strings.TrimSpace(getString(args, "kind", "")), "serial") {
+		return s.handleCreateSerialConfig(ctx, request)
 	}
 	host := strings.TrimSpace(getString(args, "host", ""))
 	user := strings.TrimSpace(getString(args, "user", ""))
@@ -114,6 +122,120 @@ func (s *Server) handleCreateSSHConfig(ctx context.Context, request mcpgo.CallTo
 	return successResult(), nil
 }
 
+// handleCreateSerialConfig builds a kind = "serial" profile from the serial
+// fields. The device fields are the caller's arguments; the TOML round trip
+// through ParseAndValidate is the same one every profile goes through, so the
+// validation rules (device and baud required, no SSH fields, no flow control)
+// live in exactly one place.
+func (s *Server) handleCreateSerialConfig(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	args := request.GetArguments()
+	name := strings.TrimSpace(getString(args, "name", ""))
+	if name == "" {
+		return toolError(CodeInvalidArgument, "%s", "name is required"), nil
+	}
+	entry := &sshconfig.Entry{Kind: sshconfig.KindSerial}
+	applySerialArgs(entry, args, false)
+
+	if err := refuseMixedinSerialFields(args); err != nil {
+		return toolError(CodeInvalidArgument, "%s", err.Error()), nil
+	}
+
+	// Refuse to overwrite an existing profile — use edit for that.
+	if names, err := s.sshConfigs.List(); err == nil {
+		for _, n := range names {
+			if strings.EqualFold(n, name) {
+				return toolError(CodeConflict, "%s", fmt.Sprintf("ssh config %q already exists (use edit to change it)", name)), nil
+			}
+		}
+	}
+
+	body, err := toml.Marshal(entry)
+	if err != nil {
+		return toolError(CodeOperationFailed, "%s", err.Error()), nil
+	}
+	if _, err := sshconfig.ParseAndValidate(body); err != nil {
+		return toolError(sshConfigErrCode(err), "%s", err.Error()), nil
+	}
+	if err := s.sshConfigs.Save(name, body); err != nil {
+		return toolError(sshConfigErrCode(err), "%s", err.Error()), nil
+	}
+	return successResult(), nil
+}
+
+// applySerialArgs copies the serial device arguments onto the entry. set means
+// "the caller named this field"; for edit, only the fields present in args are
+// written, so an unrelated edit cannot clear a setting it never mentioned.
+func applySerialArgs(e *sshconfig.Entry, args map[string]any, edit bool) {
+	set := func(dst *string, key string) {
+		if _, ok := args[key]; ok || !edit {
+			*dst = strings.TrimSpace(getString(args, key, *dst))
+		}
+	}
+	set(&e.Device, "device")
+	if _, ok := args["baud"]; ok || !edit {
+		e.Baud = int(getFloat64(args, "baud", float64(e.Baud)))
+	}
+	if _, ok := args["data_bits"]; ok || !edit {
+		e.DataBits = int(getFloat64(args, "data_bits", float64(e.DataBits)))
+	}
+	set(&e.Parity, "parity")
+	e.Parity = strings.ToLower(e.Parity)
+	if _, ok := args["stop_bits"]; ok || !edit {
+		e.StopBits = port.StopBits(strings.TrimSpace(strings.ToLower(getString(args, "stop_bits", string(e.StopBits)))))
+	}
+	set(&e.TxEOL, "tx_eol")
+	e.TxEOL = strings.ToLower(e.TxEOL)
+	set(&e.Display, "display")
+	e.Display = strings.ToLower(e.Display)
+	set(&e.FlowControl, "flow_control")
+	e.FlowControl = strings.ToLower(e.FlowControl)
+	if _, ok := args["local_echo"]; ok || !edit {
+		e.LocalEcho = getBool(args, "local_echo", e.LocalEcho)
+	}
+	if _, ok := args["rx_normalize"]; ok || !edit {
+		e.RxNormalize = boolPtrFromArgs(args, "rx_normalize", e.RxNormalize)
+	}
+	if _, ok := args["default_approval"]; ok || !edit {
+		e.DefaultApproval = getBool(args, "default_approval", e.DefaultApproval)
+	}
+	if v := strings.TrimSpace(getString(args, "description", "")); v != "" {
+		e.Description = v
+	}
+}
+
+// refuseMixedinSerialFields names the SSH fields a serial create carries — the
+// same refusal the TOML validator gives, available before the round trip so
+// the message can also say which fields WOULD have been accepted.
+func refuseMixedinSerialFields(args map[string]any) error {
+	var found []string
+	for _, k := range []string{"host", "user", "password", "private_key", "key_passphrase", "jump_host", "proxy"} {
+		if strings.TrimSpace(getString(args, k, "")) != "" {
+			found = append(found, k)
+		}
+	}
+	if _, ok := args["trust_unknown_host"]; ok {
+		found = append(found, "trust_unknown_host")
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("a serial profile dials no host: remove %s", strings.Join(found, ", "))
+}
+
+// boolPtrFromArgs reads an optional boolean that must distinguish "absent"
+// from "false": the tri-state the serial profile's rx_normalize needs.
+func boolPtrFromArgs(args map[string]any, key string, current *bool) *bool {
+	v, ok := args[key]
+	if !ok {
+		return current
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return current
+	}
+	return &b
+}
+
 func (s *Server) handleDeleteSSHConfig(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	if s.sshConfigs == nil {
 		return toolError(CodeNotConfigured, "%s", "ssh config store not configured"), nil
@@ -178,6 +300,13 @@ func (s *Server) handleEditSSHConfig(ctx context.Context, request mcpgo.CallTool
 	}
 
 	applyEntryEdits(existing, args)
+
+	if existing.Kind == sshconfig.KindSerial {
+		applySerialArgs(existing, args, true)
+		if err := refuseMixedinSerialFields(args); err != nil {
+			return toolError(CodeInvalidArgument, "%s", err.Error()), nil
+		}
+	}
 
 	applyJumpEdits(existing, args)
 
@@ -371,6 +500,38 @@ func (s *Server) handleGetSSHConfig(ctx context.Context, request mcpgo.CallToolR
 		"name":        name,
 		"kind":        ent.Kind,
 		"description": ent.Description,
+	}
+	if ent.Kind == sshconfig.KindSerial {
+		// A serial profile has no dial spec: the device fields ARE the answer,
+		// and printing an empty host block would invent a connection that is
+		// not there.
+		out["device"] = ent.Device
+		out["baud"] = ent.Baud
+		if ent.DataBits != 0 {
+			out["data_bits"] = ent.DataBits
+		}
+		if ent.StopBits != "" {
+			out["stop_bits"] = string(ent.StopBits)
+		}
+		if ent.Parity != "" {
+			out["parity"] = ent.Parity
+		}
+		if ent.TxEOL != "" {
+			out["tx_eol"] = ent.TxEOL
+		}
+		if ent.Display != "" {
+			out["display"] = ent.Display
+		}
+		if ent.LocalEcho {
+			out["local_echo"] = true
+		}
+		if ent.RxNormalize != nil && !*ent.RxNormalize {
+			out["rx_normalize"] = false
+		}
+		if ent.DefaultApproval {
+			out["default_approval"] = true
+		}
+		return jsonResult(out), nil
 	}
 	for k, v := range dial(ent.DialSpec) {
 		out[k] = v

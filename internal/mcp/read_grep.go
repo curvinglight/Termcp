@@ -112,6 +112,11 @@ func (s *Server) readGrepFrom(ctx context.Context, stmt directive.Statement, win
 	if v, ok := stmt.Flag("encoding"); ok {
 		args["charset"] = v
 	}
+	// THE SAME PRESENTATION RULE APPLIES TO A SEARCH: a hex window greped as
+	// text would search bytes the caller never saw.
+	if v, ok := stmt.Flag("display"); ok {
+		args["display"] = v
+	}
 	// A GREP DOES NOT CONSUME THE TRANSCRIPT: it uses a positional read (from_line 1),
 	// which is stateless and never touches the caller's live cursor. An ordinary read
 	// is a cursor and moves it; a search is a look, and moving the cursor on a look

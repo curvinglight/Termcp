@@ -55,6 +55,17 @@ type Params struct {
 	// there; refusing its window would take the terminal down over output it can
 	// display perfectly well.
 	RequireUTF8 bool
+	// Display is how the bytes are PRESENTED once decoded: "hex" or "b64" render
+	// the raw window as ASCII so a binary device's traffic stays byte-exact,
+	// "auto" escapes bytes no UTF-8 decoder accepts. Empty or "text" means the
+	// pre-existing rendering (strip, then the surface's own rules).
+	//
+	// It is a presentation step, not a storage one: offsets count the raw
+	// stream either way, so paging with --cursor and converting are orthogonal.
+	// A serial profile carries the default; a read can override it with
+	// --display. The terminal repaint path (the Web UI's live stream) does not
+	// set it — a terminal is drawn the bytes it is given.
+	Display string
 	// Charset is the encoding the session's bytes are in, for output that is not
 	// UTF-8 at all. Empty means UTF-8.
 	//
@@ -92,6 +103,21 @@ func trimIncomplete(charset string, raw []byte) ([]byte, int64) {
 // render turns this read's bytes into its output string, enforcing the
 // byte-fidelity contract only where the caller asked for it (see RequireUTF8).
 func (p Params) render(raw []byte) (string, error) {
+	// HEX AND B64 ARE THE BYTE-EXACT ROUTES: the rendered string is pure ASCII,
+	// so there is nothing for the UTF-8 refusal or the ANSI stripper to do, and
+	// running the window through them would only risk mangling what the caller
+	// asked to see verbatim.
+	if p.Display == encoding.Hex || p.Display == encoding.B64 {
+		return encoding.EncodeForDisplay(raw, p.Display), nil
+	}
+	if p.Display == encoding.Auto {
+		// Auto escapes bytes no UTF-8 decoder accepts, then the ordinary rules
+		// run: the escape keeps the line structure readable, and a caller that
+		// asked for auto asked to see \xHH rather than a refusal.
+		if !utf8.Valid(raw) {
+			raw = []byte(encoding.EncodeForDisplay(raw, encoding.Auto))
+		}
+	}
 	if p.Charset != "" {
 		// DECODE FIRST, THEN RENDER, so everything downstream — the UTF-8 refusal,
 		// ANSI stripping, the caller's `--grep` — sees characters. The escape rule is

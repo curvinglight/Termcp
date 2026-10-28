@@ -73,6 +73,16 @@ const (
 	// is simply not one this session was created to serve.
 	CodeForbidden       = "forbidden"
 	CodeOperationFailed = "operation_failed"
+	// CodeSerialUnsupported is what an SSH-only operation returns when the
+	// session's transport is a serial device. It is a different fact from
+	// session_not_running: the session is up and usable, it simply has no
+	// SSH features, and the caller should look at the transport rather than
+	// wonder whether the session died.
+	CodeSerialUnsupported = "serial_unsupported"
+	// CodeSerialDisabled is what the serial surface returns on an instance
+	// started with --no-serial: the capability was refused before any device
+	// was named.
+	CodeSerialDisabled = "serial_disabled"
 	CodeInternalError   = "internal_error"
 )
 
