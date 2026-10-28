@@ -505,8 +505,12 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 	// hex until a call overrides it with --display. Only a serial session sets
 	// one — DisplayEncoding is empty for every other kind, and injecting "text"
 	// would bypass the UTF-8 refusal the model-facing read owes its caller.
+	//
+	// The lookup goes through the RESOLVED source, not the raw id: the id may
+	// be a locator or a short handle, and a manager lookup on a handle misses
+	// — which is exactly how a profile's hex read as raw text on the live path.
 	if p.Display == "" {
-		if d := s.sessMgr.DisplayEncodingFor(id); d != "" {
+		if d := s.sessMgr.DisplayEncodingFor(src.SessID); d != "" {
 			p.Display = d
 		}
 	}

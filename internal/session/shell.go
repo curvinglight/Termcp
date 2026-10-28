@@ -399,6 +399,12 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 // a terminal: a pipe shell has no TTY, so this reports an error instead of
 // forwarding a meaningless window-change to the transport.
 func (cs *ChildShell) ResizePty(rows, cols int) error {
+	if cs.serial {
+		// A device has no terminal to size. Named here rather than at the mode
+		// check below, which would answer "pty mode" about a shell that has no
+		// mode at all — the same question, answered with the wrong fact.
+		return fmt.Errorf("%w: a serial device has no terminal size", ErrUnsupported)
+	}
 	if cs.mode != api.ModePTY {
 		return fmt.Errorf("PTY resize only available in pty mode (shell mode %q)", cs.mode)
 	}

@@ -932,6 +932,37 @@ func (s *Server) directiveHost(ctx context.Context, stmt directive.Statement, wi
 	); bad {
 		return slot
 	}
+	// THE KIND IS THE DISPATCH: `--kind serial` sends the create down the serial
+	// builder, and without forwarding it every serial flag below would be
+	// dropped on the floor.
+	if slot, bad := stringFlags(args, stmt, [2]string{"kind", "kind"}); bad {
+		return slot
+	}
+	// The serial device fields. They only mean something when kind = serial;
+	// the handler refuses them beside an SSH kind, the same way the TOML
+	// validator does.
+	if slot, bad := stringFlags(args, stmt,
+		[2]string{"device", "device"},
+		[2]string{"parity", "parity"},
+		[2]string{"stop-bits", "stop_bits"},
+		[2]string{"tx-eol", "tx_eol"},
+		[2]string{"display", "display"},
+		[2]string{"flow-control", "flow_control"},
+	); bad {
+		return slot
+	}
+	if slot, bad := numericFlags(args, stmt,
+		[2]string{"baud", "baud"},
+		[2]string{"data-bits", "data_bits"},
+	); bad {
+		return slot
+	}
+	if boolFlag(stmt, "local-echo") {
+		args["local_echo"] = true
+	}
+	if boolFlag(stmt, "rx-normalize") {
+		args["rx_normalize"] = true
+	}
 	// COPY SPEAKS `--source`, THE HANDLER SPEAKS `source_name`/`target_name`.
 	//
 	// The directive used to forward `--source` verbatim and the handler read
