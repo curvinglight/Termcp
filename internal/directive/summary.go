@@ -29,6 +29,7 @@ var flagSummaries = map[string]map[string]string{
 		"grep-limit": "cap the matches (default 200); the reply reports the true total",
 		"stream":     "o = stdout only, e = stderr only; default is both, and the other is reported as omitted",
 		"encoding":   "the charset of these bytes; without it a non-UTF-8 window is refused rather than guessed",
+		"display":    "presentation of the window: hex or b64 render the raw bytes as ASCII, auto escapes undecodable bytes; overrides the session's profile",
 		"raw":        "the bytes as they arrived: no ANSI stripping on a window, no escape-decoding on --at (valueless)",
 		"frame":      "read one JSON-RPC frame; advances only when the frame was complete (valueless)",
 		"since":      "on a peer: the frame history after N — does not consume",
