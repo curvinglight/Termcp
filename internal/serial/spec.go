@@ -58,6 +58,14 @@ type Spec struct {
 	// different axis — a GBK device still needs a display choice for the bytes
 	// its protocol emits. The transcript keeps raw bytes either way.
 	Display string `toml:"display,omitempty"`
+	// Charset is the character set the DEVICE speaks: the decode step that
+	// turns GBK bytes into text before any presentation choice runs. "auto"
+	// (the default) sniffs each window — BOM first, then a round-trip probe —
+	// and falls back to UTF-8 when nothing matches; a firmware's encoding is
+	// usually a known fact, so naming it explicitly is the reliable choice.
+	// Validated against the encoding package's table, so a profile with
+	// "gbkrate" is refused rather than silently undecoded.
+	Charset string `toml:"charset,omitempty"`
 }
 
 // TxEOL values. "none" means the Enter key sends a bare CR — the same byte the
@@ -81,12 +89,19 @@ const (
 	DisplayB64  = encoding.B64
 )
 
+// CharsetAuto is the profile value that sniffs each window instead of naming
+// the encoding. It shares the literal with the display layer's auto on
+// purpose: both mean "decide from the bytes", and a profile that says auto in
+// either field is making the same kind of statement.
+const CharsetAuto = encoding.CharsetAuto
+
 // Defaults applied when a field is absent. Baud has none: it is required,
 // because there is no rate that is safe to assume for an unknown device.
 const (
 	DefaultDataBits = 8
 	DefaultTxEOL    = TxEOLCR
 	DefaultDisplay  = DisplayAuto
+	DefaultCharset  = CharsetAuto
 )
 
 func flowControlError(got string) error {
@@ -118,6 +133,7 @@ func (s *Spec) applyDefaults() {
 	s.FlowControl = trimSpace(lower(s.FlowControl))
 	s.TxEOL = trimSpace(lower(s.TxEOL))
 	s.Display = trimSpace(lower(s.Display))
+	s.Charset = trimSpace(lower(s.Charset))
 	s.StopBits = port.StopBits(trimSpace(string(s.StopBits)))
 
 	if s.DataBits == 0 {
@@ -140,6 +156,9 @@ func (s *Spec) applyDefaults() {
 	}
 	if s.Display == "" {
 		s.Display = DefaultDisplay
+	}
+	if s.Charset == "" {
+		s.Charset = DefaultCharset
 	}
 }
 
@@ -169,6 +188,11 @@ func (s *Spec) Validate() error {
 
 	if !encoding.DisplayValid(s.Display) {
 		return errf("display must be auto, text, hex or b64, got %q", s.Display)
+	}
+
+	if !encoding.CharsetValid(s.Charset) {
+		return errf("charset must be %q or one of: %s (got %q)",
+			"auto", encoding.SupportedCharsets(), s.Charset)
 	}
 
 	return nil

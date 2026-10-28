@@ -53,6 +53,7 @@ function openPendingShellWindow(connName, pos, abortCtl) {
         '<button type="button" class="shell-tab-btn" data-stab="fw" title="Forwardings" data-i18n-title="win.fw.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3.5" y="3.5" width="7" height="7" rx="1"/><path d="M1 7h3.5M9.5 7h3.5M7 1v3.5M7 9.5v3.5" stroke-linecap="round"/></svg></button>' +
         '<button type="button" class="shell-tab-btn" data-stab="file" title="Files" data-i18n-title="win.files.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 3v9a1 1 0 001 1h10a1 1 0 001-1V4.5a1 1 0 00-1-1h-5L5.5 2H2a1 1 0 00-1 1z"/></svg></button>' +
         '</div>' +
+      '<select class="term-charset-select" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip"><option value="auto">Auto</option><option value="utf-8">UTF-8</option><option value="gbk">GBK</option><option value="gb18030">GB18030</option><option value="big5">Big5</option><option value="shift_jis">Shift JIS</option><option value="euc-kr">EUC-KR</option><option value="utf-16le">UTF-16LE</option><option value="utf-16be">UTF-16BE</option><option value="windows-1252">Windows-1252</option><option value="latin-1">Latin-1</option></select>' +
       '<div class="shell-window-header-btns">' +
         SHELL_WINDOW_MAX_HTML + '<button type="button" class="shell-window-collapse-btn" title="Collapse" data-i18n-title="win.collapse">' +
           '<svg class="ic-d" viewBox="0 0 12 8" width="12" height="8"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1 2l5 4 5-4"/></svg>' +
@@ -129,6 +130,99 @@ SHELL_WINDOW_PANELS_HTML +
   return win;
 }
 
+// The per-window charset selector. One per terminal window: a serial device's
+// encoding is a fact about the session on that window, not about the page.
+// The options are the charsets the server's table maps (see
+// internal/encoding/charset.go) plus the sniff ("auto") — changing one PATCHes
+// the session and repaints the window from the transcript.
+var CHARSET_OPTIONS = [
+  ['auto', 'Auto'],
+  ['utf-8', 'UTF-8'],
+  ['gbk', 'GBK'],
+  ['gb18030', 'GB18030'],
+  ['big5', 'Big5'],
+  ['shift_jis', 'Shift JIS'],
+  ['euc-kr', 'EUC-KR'],
+  ['utf-16le', 'UTF-16LE'],
+  ['utf-16be', 'UTF-16BE'],
+  ['windows-1252', 'Windows-1252'],
+  ['latin-1', 'Latin-1']
+];
+
+function charsetSelectHTML() {
+  var opts = '';
+  for (var i = 0; i < CHARSET_OPTIONS.length; i++) {
+    opts += '<option value="' + CHARSET_OPTIONS[i][0] + '">' + CHARSET_OPTIONS[i][1] + '</option>';
+  }
+  return '<select class="term-charset-select" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip">' + opts + '</select>';
+}
+
+// wireCharsetSelect wires one window's selector: the current value comes from
+// the session info (the effective charset, override included), a change
+// PATCHes the session and repaints the window, because the bytes already on
+// screen were decoded under the old choice and leaving them there would show
+// two encodings in one terminal.
+function wireCharsetSelect(win, sessionId) {
+  var sel = win.querySelector('.term-charset-select');
+  if (!sel || !sessionId) return;
+  fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId)).then(function (r) {
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+  }).then(function (j) {
+    var cs = j && j.charset ? j.charset : 'utf-8';
+    sel.value = cs;
+    if (sel.value !== cs) { sel.value = 'utf-8'; } // an unknown name falls back visibly
+  }).catch(function () { sel.value = 'utf-8'; });
+  sel.addEventListener('change', function () {
+    var cs = sel.value;
+    fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId) + '/charset', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ charset: cs })
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.status); });
+      // The switch is server-side session state: every later frame and every
+      // history fetch decodes under it. What is already painted was decoded
+      // under the old one, so the window starts over.
+      repaintShellWithCharset(win, sessionId);
+    }).catch(function (e) {
+      console.error('charset switch failed', e);
+    });
+  });
+}
+
+// repaintShellWithCharset clears the terminal and reloads the window's history
+// under the charset now in force. The scrollback re-reads the transcript — the
+// bytes never moved; only their decoding did.
+//
+// The watches come OFF first: a live frame arriving between the reset and the
+// re-bootstrap would paint old-decoded bytes over the reload and desync the
+// scroll. watch_add resumes the stream from the live end, which is exactly
+// where the re-bootstrap finishes.
+function repaintShellWithCharset(win, sessionId) {
+  var ids = [win._primaryShellId || sessionId];
+  if (win._channels) {
+    Object.keys(win._channels).forEach(function (cid) { if (ids.indexOf(cid) < 0) ids.push(cid); });
+  }
+  var seq = Promise.resolve();
+  ids.forEach(function (cid) {
+    var ch = win._channels && win._channels[cid];
+    var tm = ch ? ch.term : win._term;
+    if (!tm) return;
+    wsUiSend({ type: 'watch_remove', id: cid });
+    try { tm.reset(); } catch (e) {}
+    if (ch) ch.streamDone = false;
+    seq = seq.then(function () {
+      return bootstrapShellFullHistory(cid, tm);
+    }).then(function () {
+      wsUiSend({ type: 'watch_add', id: cid });
+    }).catch(function (e) {
+      console.error('charset repaint failed', e);
+      wsUiSend({ type: 'watch_add', id: cid });
+    });
+  });
+}
+
 function finalizePendingShellWindow(win, connLabel, sessionId, shellId, pos, opt) {
   opt = opt || {};
   if (!win || !win.parentNode || !sessionId) return;
@@ -152,6 +246,7 @@ function finalizePendingShellWindow(win, connLabel, sessionId, shellId, pos, opt
   // session created in this tab takes, and without it _approvalMode stays
   // undefined, so typing is forwarded and the server silently drops it.
   applyApprovalModeFromSnapshot(win, sessionId);
+  wireCharsetSelect(win, sessionId);
   createChannelTab(win, win._primaryShellId, { index: opt.index > 0 ? opt.index : 1 });
   refreshSessionTabbar();
   // The placeholder that made this profile read "connecting" is gone; repaint so
@@ -285,6 +380,7 @@ function openShellWindow(connLabel, sessionId, pos, opts) {
         '<button type="button" class="shell-tab-btn" data-stab="fw" title="Forwardings" data-i18n-title="win.fw.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3.5" y="3.5" width="7" height="7" rx="1"/><path d="M1 7h3.5M9.5 7h3.5M7 1v3.5M7 9.5v3.5" stroke-linecap="round"/></svg></button>' +
         '<button type="button" class="shell-tab-btn" data-stab="file" title="Files" data-i18n-title="win.files.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 3v9a1 1 0 001 1h10a1 1 0 001-1V4.5a1 1 0 00-1-1h-5L5.5 2H2a1 1 0 00-1 1z"/></svg></button>' +
         '</div>' +
+      '<select class="term-charset-select" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip"><option value="auto">Auto</option><option value="utf-8">UTF-8</option><option value="gbk">GBK</option><option value="gb18030">GB18030</option><option value="big5">Big5</option><option value="shift_jis">Shift JIS</option><option value="euc-kr">EUC-KR</option><option value="utf-16le">UTF-16LE</option><option value="utf-16be">UTF-16BE</option><option value="windows-1252">Windows-1252</option><option value="latin-1">Latin-1</option></select>' +
       '<div class="shell-window-header-btns">' +
         SHELL_WINDOW_MAX_HTML + '<button type="button" class="shell-window-collapse-btn" title="Collapse" data-i18n-title="win.collapse">' +
           '<svg class="ic-d" viewBox="0 0 12 8" width="12" height="8"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1 2l5 4 5-4"/></svg>' +
@@ -343,6 +439,7 @@ SHELL_WINDOW_PANELS_HTML +
   // Approve button stays hidden until the next session-list frame arrives, which
   // can be a long time after the window opens.
   applyApprovalModeFromSnapshot(win, sessionId);
+  wireCharsetSelect(win, sessionId);
   _initShellWindowUI(win, connLabel, sessionId);
   // _initShellWindowUI resets the input gate; enforce read-only DEAD mode after.
   win._inputClosed = readOnly;

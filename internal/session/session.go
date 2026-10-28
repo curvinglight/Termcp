@@ -146,6 +146,15 @@ type Session struct {
 	// is kept alongside transport because the device-claim release needs the
 	// serial-specific detail that the interfaces deliberately do not carry.
 	serialChannel *serial.Channel
+	// charsetOverride is the runtime charset a caller switched to (the Web UI's
+	// per-window selector, or a REST PATCH). Empty means "no override": the
+	// profile's charset answers, and its default for a serial session is auto.
+	// Not persisted — a restarted session returns to the profile's choice.
+	charsetOverride atomic.Value // string
+	// charsetLatched is the charset a previous auto sniff decided on. The sniff
+	// is per window and a stream must not change encoding mid-flow, so the
+	// first non-ASCII verdict sticks until an override replaces it.
+	charsetLatched atomic.Value // string
 	buf           *buffer.Buffer
 	readerID      int
 	msgMgr        *message.Manager
@@ -291,6 +300,7 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	if serialChannel != nil {
 		record.Kind = api.KindSerial
 		record.Display = serialChannel.Spec().Display
+		record.Charset = serialChannel.Spec().Charset
 		record.Serial = &api.SerialInfo{
 			Profile: cfg.Serial.ProfileName,
 			Device:  serialChannel.Device(),
@@ -934,6 +944,10 @@ func (s *Session) Info() api.Session {
 		cp.ApprovalNeed = 0
 		cp.ApprovalScopes = nil
 	}
+	// THE charset THE REPLY NAMES IS THE ONE IN FORCE: the override a caller
+	// switched to, not the profile value the override may have replaced. The
+	// selector reads this field to render its current selection.
+	cp.Charset = s.EffectiveCharset()
 	return cp
 }
 
@@ -990,6 +1004,62 @@ func (s *Session) DisplayEncoding() string {
 		return s.Session.Display
 	}
 	return encoding.Text
+}
+
+// EffectiveCharset resolves the charset this session's bytes decode from, in
+// override → profile → default order.
+//
+// The default is the profile's own choice for a serial session — whose zero
+// value is "auto", the sniff — and empty (UTF-8, no decoding) for everything
+// else. An SSH session keeping the UTF-8 default is deliberate: the
+// model-facing read owes its callers a refusal on undecodable bytes, and a
+// silent sniff would turn that contract into a guess.
+func (s *Session) EffectiveCharset() string {
+	if s == nil {
+		return ""
+	}
+	if v, ok := s.charsetOverride.Load().(string); ok && v != "" {
+		return v
+	}
+	s.mu.RLock()
+	profile := s.Session.Charset
+	s.mu.RUnlock()
+	if profile != "" {
+		return profile
+	}
+	if s.serialChannel != nil {
+		// A serial profile predating the charset field wrote nothing here; the
+		// sniff is what its author would have picked.
+		return serial.CharsetAuto
+	}
+	return ""
+}
+
+// SetCharsetOverride installs the runtime charset ("" clears the override).
+// The caller validates the name; the session only stores it.
+func (s *Session) SetCharsetOverride(cs string) {
+	s.charsetOverride.Store(cs)
+}
+
+// LatchCharset records the charset an auto sniff decided on, so a stream does
+// not change encoding from one window to the next. An explicit override wins
+// over any latch.
+func (s *Session) LatchCharset(cs string) {
+	if cs == "" {
+		return
+	}
+	if v, ok := s.charsetOverride.Load().(string); ok && v != "" {
+		return
+	}
+	s.charsetLatched.Store(cs)
+}
+
+// latchedCharset returns the sticky auto verdict, or "" when none yet.
+func (s *Session) latchedCharset() string {
+	if v, ok := s.charsetLatched.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // Controller returns the serial modem-line controller of this session's device,

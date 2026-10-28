@@ -68,6 +68,10 @@ type Entry struct {
 	RxNormalize *bool         `toml:"rx_normalize,omitempty"`
 	LocalEcho   bool          `toml:"local_echo,omitempty"`
 	Display     string        `toml:"display,omitempty"`
+	// Charset is what the device speaks ("auto" = sniff, or a name the encoding
+	// table maps). Flat like the rest of the serial fields; the decode step the
+	// display choice composes with.
+	Charset string `toml:"charset,omitempty"`
 }
 
 // JumpSpec is a self-contained bastion hop: a DialSpec plus a nested Jump for
@@ -457,6 +461,7 @@ func (e *Entry) serialSpec() serial.Spec {
 		RxNormalize: e.RxNormalize,
 		LocalEcho:   e.LocalEcho,
 		Display:     e.Display,
+		Charset:     e.Charset,
 	}
 }
 
@@ -494,6 +499,7 @@ func (e *Entry) fromSerialSpec(s *serial.Spec) {
 	e.RxNormalize = s.RxNormalize
 	e.LocalEcho = s.LocalEcho
 	e.Display = s.Display
+	e.Charset = s.Charset
 }
 
 // RemoteFromEntry converts an sshconfig Entry into session.RemoteSSH dial settings,

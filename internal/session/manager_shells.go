@@ -1,6 +1,11 @@
 package session
 
-import "github.com/open-mcp-ai/termcp/internal/encoding"
+import (
+	"fmt"
+	"os"
+
+	"github.com/open-mcp-ai/termcp/internal/encoding"
+)
 
 // GetChildShell searches all sessions for a child shell with the given ID.
 // Returns nil if no matching child shell is found.
@@ -53,6 +58,72 @@ func (m *Manager) DisplayEncodingFor(id string) string {
 		return s.DisplayEncoding()
 	}
 	return encoding.Text
+}
+
+// CharsetFor resolves the charset an id's bytes decode from: the session's
+// effective choice (override → profile → default). The id may name a session or
+// a shell; "auto" is a real answer here — the caller that can sniff (the
+// transcript) handles it, the caller that cannot (the streaming decoder) asks
+// for the latch.
+//
+// "" for an unknown id: those callers are about to fail the lookup they care
+// about, and a charset is not what they are validating.
+func (m *Manager) CharsetFor(id string) string {
+	if s := m.Get(id); s != nil {
+		return s.EffectiveCharset()
+	}
+	if s := m.GetSessionByShellID(id); s != nil {
+		return s.EffectiveCharset()
+	}
+	return ""
+}
+
+// LatchCharsetFor records the charset the auto sniff decided on for an id's
+// session, so the live stream does not re-decide from one burst to the next.
+func (m *Manager) LatchCharsetFor(id, cs string) {
+	s := m.Get(id)
+	if s == nil {
+		s = m.GetSessionByShellID(id)
+	}
+	if s == nil {
+		return
+	}
+	s.LatchCharset(cs)
+}
+
+// LatchedCharset returns the charset a previous auto sniff decided on for an
+// id's session, or "" when the sniff has not resolved yet.
+func (m *Manager) LatchedCharset(id string) string {
+	s := m.Get(id)
+	if s == nil {
+		s = m.GetSessionByShellID(id)
+	}
+	if s == nil {
+		return ""
+	}
+	return s.latchedCharset()
+}
+
+// SetCharsetOverride installs the runtime charset for an id's session. "auto"
+// and "" are legal (auto re-arms the sniff; "" returns to the profile's
+// choice); anything else must be a name the encoding table maps, so a typo in
+// a selector cannot silently turn decoding off.
+func (m *Manager) SetCharsetOverride(id, cs string) error {
+	switch {
+	case cs == "" || cs == "auto":
+	case encoding.CharsetValid(cs):
+	default:
+		return fmt.Errorf("charset must be %q, %q or one of: %s", "auto", "utf-8", encoding.SupportedCharsets())
+	}
+	s := m.Get(id)
+	if s == nil {
+		s = m.GetSessionByShellID(id)
+	}
+	if s == nil {
+		return os.ErrNotExist
+	}
+	s.SetCharsetOverride(cs)
+	return nil
 }
 
 func (m *Manager) GetSessionByShellID(shellID string) *Session {

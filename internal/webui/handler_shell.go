@@ -158,10 +158,19 @@ func (h *Handler) writeOutputRange(w http.ResponseWriter, r *http.Request, id st
 		start = total
 	}
 
+	// The session's charset rides the repaint: a GBK device's history is
+	// decoded before the browser paints it, the same way the live frames are.
+	// The caller can override per request (?charset=) — that is the dropdown's
+	// own refresh path — and "auto" sniffs inside the read.
+	charset := h.Sessions.CharsetFor(src.SessID)
+	if q := strings.TrimSpace(r.URL.Query().Get("charset")); q != "" {
+		charset = q
+	}
 	win, rerr := transcript.Read(r.Context(), src, transcript.Params{
 		Offset:    &start,
 		MaxBytes:  max,
 		Stream:    stream,
+		Charset:   charset,
 		StripAnsi: false, // the terminal repaints raw bytes
 	})
 	if rerr != nil {

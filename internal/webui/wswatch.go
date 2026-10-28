@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
@@ -44,17 +45,59 @@ func (c *uiWS) runWatch(ctx context.Context, shell *session.ChildShell, sid stri
 	var batch []byte
 	var inBatch bool
 	var lastFlush time.Time
+	// THE CHARSET DECODES HERE, at the frame boundary, because this is the only
+	// place that knows which session the bytes belong to AND holds them as
+	// bytes. The decoder keeps the trailing incomplete multi-byte character
+	// buffered, so a burst that splits one does not corrupt it; a switch mid-
+	// stream (the window's selector) resets the decoder with the new charset,
+	// and the tail bytes of the old encoding are repainted by the reload the
+	// switch triggers.
+	var dec *encoding.StreamingDecoder
+	decFor := func(cs string) *encoding.StreamingDecoder {
+		if cs == csName(dec) {
+			return dec
+		}
+		// "auto" streams through the latch: the first window with non-ASCII
+		// decides, and the verdict sticks until an override replaces it — a
+		// stream must not change encoding from one burst to the next.
+		if cs == "auto" {
+			if latched := c.h.Sessions.LatchedCharset(sid); latched != "" {
+				cs = latched
+			}
+		}
+		dec = encoding.NewStreamingDecoder(cs)
+		return dec
+	}
 	flush := func() {
 		if len(batch) == 0 {
 			inBatch = false
 			return
 		}
-		// Terminal bytes travel as a plain JSON string; encoding/json escapes
-		// whatever it must. base64 would only add a layer the client undoes.
-		payload, err := json.Marshal(map[string]string{"type": "terminal", "id": sid, "d": string(batch)})
+		cs := c.h.Sessions.CharsetFor(sid)
+	// "auto" streams through the latch: the first window with non-ASCII
+	// decides, and the verdict sticks until an override replaces it — a stream
+	// must not change encoding from one burst to the next.
+	if cs == "auto" {
+		if latched := c.h.Sessions.LatchedCharset(sid); latched != "" {
+			cs = latched
+		} else if len(batch) > 0 {
+			// The first burst is where the sniff has something to look at.
+			if sniffed := encoding.Sniff(batch); sniffed != "" {
+				c.h.Sessions.LatchCharsetFor(sid, sniffed)
+				cs = sniffed
+			}
+		}
+	}
+	out := decFor(cs).Decode(batch)
 		batch = batch[:0]
 		inBatch = false
 		lastFlush = time.Now()
+		if len(out) == 0 {
+			return
+		}
+		// Terminal bytes travel as a plain JSON string; encoding/json escapes
+		// whatever it must. base64 would only add a layer the client undoes.
+		payload, err := json.Marshal(map[string]string{"type": "terminal", "id": sid, "d": string(out)})
 		if err == nil {
 			c.sendTerminalPayload(payload)
 		}
@@ -174,4 +217,14 @@ func (c *uiWS) removeAllWatches() {
 			ent.cancel()
 		}
 	}
+}
+
+// csName names a streaming decoder's charset, "" when there is none (UTF-8
+// passthrough). It exists so the watch loop can tell "no decoder" from "a
+// decoder for the empty name" without a second variable.
+func csName(d *encoding.StreamingDecoder) string {
+	if d == nil {
+		return ""
+	}
+	return d.Name()
 }

@@ -996,3 +996,11 @@
   .shell-file-detail-actions .sf-del { border-color:var(--term-danger-2); color:var(--term-danger-2); }
   .shell-file-detail-actions .sf-del:hover { background:var(--term-danger-deep-2); }
 
+
+/* Per-window charset selector: sits in the header beside the tab strip. The
+   width is fixed so switching to a longer name does not reflow the header. */
+.term-charset-select {
+  font: inherit; font-size: 11px; padding: 1px 4px; margin-left: 6px;
+  border: 1px solid var(--border, #444); border-radius: 4px;
+  background: transparent; color: inherit; max-width: 110px; cursor: pointer;
+}

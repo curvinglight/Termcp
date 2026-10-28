@@ -229,6 +229,42 @@ func TestSetDTRGoesThroughReview(t *testing.T) {
 	}
 }
 
+func TestSerialProfileCharsetDecodesDeviceOutput(t *testing.T) {
+	device, peer, stop := startPTYPair(t)
+	defer stop()
+	s := newTestServer(t)
+	s.ManageSSHConfigs = true
+	res, err := s.call(t.Context(), "ssh_config", map[string]any{
+		"action": "create", "name": "gbkdev", "kind": "serial",
+		"device": device, "baud": float64(115200), "charset": "gbk",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create: %v / %s", err, toolResultText(res))
+	}
+	sres, err := s.call(t.Context(), "session_start", map[string]any{"ssh_config": "gbkdev"})
+	if err != nil || sres.IsError {
+		t.Fatalf("session_start: %v / %s", err, toolResultText(sres))
+	}
+	doc := parseResult(t, sres)
+	handle, _ := doc["shell_id"].(string)
+
+	// The device speaks GBK: "中文" arrives as D6 D0 CE C4, bytes no UTF-8
+	// decoder accepts. The profile's charset is the decode default, so the
+	// model-facing read answers with the characters, not a refusal.
+	p := peerDevice(t, peer)
+	p.Write([]byte{0xD6, 0xD0, 0xCE, 0xC4, '\r', '\n'})
+
+	rres, err := s.call(t.Context(), "shell_output", map[string]any{"shell_id": handle, "timeout": 3.0})
+	if err != nil || rres.IsError {
+		t.Fatalf("shell_output: %v / %s", err, toolResultText(rres))
+	}
+	out := parseResult(t, rres)
+	output, _ := out["output"].(string)
+	if !strings.Contains(output, "中文") {
+		t.Fatalf("GBK output should decode via the profile charset, got %q", output)
+	}
+}
+
 func TestSerialProfileCreateRejectsMixedFields(t *testing.T) {
 	s := newTestServer(t)
 	s.ManageSSHConfigs = true

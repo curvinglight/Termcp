@@ -188,6 +188,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/sessions", h.handleCreateSession)
 	mux.HandleFunc("GET /api/sessions/{id}", h.handleGetSession)
 	mux.HandleFunc("PATCH /api/sessions/{id}", h.handleRenameSession)
+	mux.HandleFunc("PATCH /api/sessions/{id}/charset", h.handleSessionCharset)
 	// DELETE purges the session (terminate + remove its on-disk directory).
 	mux.HandleFunc("DELETE /api/sessions/{id}", h.handlePurgeSession)
 	// Approval mode: per-session gate control, plus the approver worklist and

@@ -514,6 +514,17 @@ func (s *Server) handleReadOutput(ctx context.Context, request mcpgo.CallToolReq
 			p.Display = d
 		}
 	}
+	// THE SESSION'S CHARSET IS THE DECODE DEFAULT, the same precedence display
+	// has: an explicit --encoding wins, then the profile's choice ("auto" is a
+	// real value here — the transcript sniffs), then nothing, which keeps the
+	// UTF-8 refusal an SSH session owes its callers. Injecting "auto" for every
+	// session would turn that refusal into a guess, so the empty case is left
+	// exactly as it was.
+	if p.Charset == "" {
+		if cs := s.sessMgr.CharsetFor(src.SessID); cs != "" {
+			p.Charset = cs
+		}
+	}
 
 	// A CLOSED CHANNEL KEEPS ITS OWN POSITION (#159 C1).
 	//

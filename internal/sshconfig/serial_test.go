@@ -71,6 +71,29 @@ func TestParseAndValidateSerialRefusesShellFields(t *testing.T) {
 	}
 }
 
+func TestParseAndValidateSerialCharset(t *testing.T) {
+	doc := serialTOML + "charset = \"gbk\"\n"
+	e, err := ParseAndValidate([]byte(doc))
+	if err != nil {
+		t.Fatalf("charset gbk refused: %v", err)
+	}
+	if e.Charset != "gbk" {
+		t.Fatalf("charset = %q", e.Charset)
+	}
+	// auto is the default and a legal spelling.
+	e2, err := ParseAndValidate([]byte(serialTOML))
+	if err != nil {
+		t.Fatalf("default refused: %v", err)
+	}
+	if e2.Charset != "auto" {
+		t.Fatalf("charset default = %q, want auto", e2.Charset)
+	}
+	// A typo must be refused, not silently undecoded.
+	if _, err := ParseAndValidate([]byte(serialTOML + "charset = \"gbkrate\"\n")); err == nil {
+		t.Fatal("charset gbkrate should be refused")
+	}
+}
+
 func TestParseAndValidateSerialRefusesFlowControl(t *testing.T) {
 	doc := serialTOML + "flow_control = \"hardware\"\n"
 	_, err := ParseAndValidate([]byte(doc))

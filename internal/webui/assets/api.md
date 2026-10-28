@@ -169,8 +169,15 @@ Response 200:
 A profile with `kind = "serial"` names a local serial device rather than an
 SSH host. `device` and `baud` are required; `tx_eol` (default `cr`) is the
 byte sequence Enter sends; `display` (`auto`, default) is how the device's
-bytes are presented — `hex`/`b64` render the raw stream as ASCII. A serial
-session carries one channel: command, args and mode do not apply, and
+bytes are presented — `hex`/`b64` render the raw stream as ASCII;
+`charset` (`auto`, default) is what the device speaks and is decoded before
+any presentation runs — `auto` sniffs each window (BOM first, then a
+round-trip probe), and any name from the charset table (`gbk`, `gb18030`,
+`big5`, `shift_jis`, `euc-kr`, `utf-16le`, …) decodes explicitly. The Web UI
+terminal window carries the same choice as a per-session selector, which
+overrides the profile at runtime (`PATCH /api/sessions/{id}/charset`); an
+SSH session keeps the UTF-8 default unless a caller names a charset. A
+serial session carries one channel: command, args and mode do not apply, and
 SSH-only operations (forwards, SFTP) answer `serial_unsupported`.
 
 ### `GET /api/serial/ports`

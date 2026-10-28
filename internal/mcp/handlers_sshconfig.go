@@ -187,6 +187,8 @@ func applySerialArgs(e *sshconfig.Entry, args map[string]any, edit bool) {
 	e.TxEOL = strings.ToLower(e.TxEOL)
 	set(&e.Display, "display")
 	e.Display = strings.ToLower(e.Display)
+	set(&e.Charset, "charset")
+	e.Charset = strings.ToLower(e.Charset)
 	set(&e.FlowControl, "flow_control")
 	e.FlowControl = strings.ToLower(e.FlowControl)
 	if _, ok := args["local_echo"]; ok || !edit {
@@ -521,6 +523,9 @@ func (s *Server) handleGetSSHConfig(ctx context.Context, request mcpgo.CallToolR
 		}
 		if ent.Display != "" {
 			out["display"] = ent.Display
+		}
+		if ent.Charset != "" {
+			out["charset"] = ent.Charset
 		}
 		if ent.LocalEcho {
 			out["local_echo"] = true

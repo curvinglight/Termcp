@@ -556,21 +556,28 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		} else if p.Display == encoding.Auto && !utf8.Valid(raw) {
 			out = encoding.EncodeForDisplay(raw, encoding.Auto)
 		}
-		if p.Charset != "" {
-			decoded, derr := encoding.Decode(p.Charset, raw)
+		cs := p.Charset
+		if cs == encoding.CharsetAuto {
+			cs = encoding.Sniff(raw)
+		}
+		autoDecoded := false
+		if cs != "" {
+			decoded, derr := encoding.Decode(cs, raw)
 			if derr != nil {
 				return refuse(errf(ErrInvalid, "%s", derr.Error()))
 			}
 			raw = decoded
 			out = clean(raw, p.StripAnsi)
+			autoDecoded = cs != p.Charset
 		}
 		// THE FIDELITY CHECK READS WHAT THE CALLER WILL SEE. With a display
 		// choice set, that is the converted form — hex/b64/auto are ASCII by
 		// construction, so a binary window is a 200, not the refusal the raw
 		// bytes would have earned (the raw refusal is exactly what display
 		// exists to answer). The windowRaw the reply carries stays the raw
-		// bytes: offsets count the stream either way.
-		if p.RequireUTF8 && p.Display != encoding.Hex && p.Display != encoding.B64 && p.Display != encoding.Auto {
+		// bytes: offsets count the stream either way. A window the sniff
+		// decoded is valid UTF-8 by the same construction.
+		if p.RequireUTF8 && !autoDecoded && p.Display != encoding.Hex && p.Display != encoding.B64 && p.Display != encoding.Auto {
 			if err := RenderCheck(raw); err != nil {
 				return refuse(err)
 			}

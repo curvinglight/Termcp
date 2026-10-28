@@ -947,6 +947,7 @@ func (s *Server) directiveHost(ctx context.Context, stmt directive.Statement, wi
 		[2]string{"stop-bits", "stop_bits"},
 		[2]string{"tx-eol", "tx_eol"},
 		[2]string{"display", "display"},
+		[2]string{"charset", "charset"},
 		[2]string{"flow-control", "flow_control"},
 	); bad {
 		return slot

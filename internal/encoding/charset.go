@@ -199,6 +199,23 @@ var advertised = []string{
 // offers them.
 func SupportedCharsets() string { return strings.Join(advertised, ", ") }
 
+// CharsetAuto asks the reader to sniff each window instead of naming the
+// encoding: BOM first (proof), then the round-trip probe, falling back to
+// UTF-8 when nothing matches.
+const CharsetAuto = "auto"
+
+// CharsetValid reports whether name is a charset a profile may store: "auto"
+// (sniff each window), "utf-8" (no decoding), or a name the table maps. The
+// empty value is valid and means UTF-8, the same reading Decode gives it.
+func CharsetValid(name string) bool {
+	switch name {
+	case "", "auto":
+		return true
+	}
+	_, known := KnownCharset(name)
+	return known
+}
+
 func normaliseCharset(name string) string {
 	return strings.ToLower(strings.TrimSpace(name))
 }
