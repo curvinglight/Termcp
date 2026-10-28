@@ -42,9 +42,13 @@ const (
 // blocking read to mean "no data yet is not an error"; a serial Read returning
 // (0, nil) on an idle device would spin that consumer at full speed.
 type Channel struct {
-	handle  port.Handle
+	handle port.Handle
 	spec   *Spec
-	name    string
+	name   string
+	// releaseClaim hands back the in-process device claim Open made. It is
+	// idempotent, so the several close paths (Close, the session scope) can
+	// each reach it.
+	releaseClaim func()
 
 	// stdout is the reader handed to the session. It is fed by the read loop
 	// rather than being the port itself, so empty reads and normalization happen
@@ -94,18 +98,27 @@ func Open(spec *Spec, profileName string, readPoll time.Duration) (*Channel, err
 		return nil, err
 	}
 
+	// Claim and open are one step. Two profiles can name one physical port
+	// through different paths, so a check-then-open sequence would race; the
+	// claim failing hands nothing back, and the open failing releases it.
+	release, aerr := Acquire(spec.Device, profileName)
+	if aerr != nil {
+		return nil, aerr
+	}
 	handle, err := port.Open(spec.PortConfig(), readPoll)
 	if err != nil {
+		release()
 		return nil, err
 	}
 
 	c := &Channel{
-		handle:      handle,
-		spec:        spec,
-		name:        profileName,
-		stdout:      newPipeReader(),
-		done:        make(chan struct{}),
-		readersDone: make(chan struct{}),
+		handle:       handle,
+		spec:         spec,
+		releaseClaim: release,
+		name:         profileName,
+		stdout:       newPipeReader(),
+		done:         make(chan struct{}),
+		readersDone:  make(chan struct{}),
 	}
 	go c.readLoop()
 	return c, nil
@@ -465,6 +478,11 @@ func (c *Channel) Close() error {
 		// Closing the port is what unblocks a read in progress; the loop then
 		// exits and closes Done.
 		c.stdout.Close()
+		// The claim goes with the port: a closed channel must never hold a
+		// device reserved. Idempotent, like the close itself.
+		if c.releaseClaim != nil {
+			c.releaseClaim()
+		}
 		close(c.done)
 	})
 	return c.closeErr
@@ -505,6 +523,16 @@ func (c *Channel) Device() string { return c.spec.Device }
 
 // Baud returns the configured rate, for session_info.
 func (c *Channel) Baud() int { return c.spec.Baud }
+
+// Spec returns the validated device configuration this channel was opened
+// with. The display choice and line ending ride on it, and the session reads
+// both at shell-construction time — before anything can observe the channel.
+func (c *Channel) Spec() *Spec { return c.spec }
+
+// Release returns the idempotent function that hands back the in-process
+// device claim. A session attaches it to its resource scope, so deleting the
+// session can never leave a port reserved behind it.
+func (c *Channel) Release() func() { return c.releaseClaim }
 
 // ProfileName returns the profile this channel was opened from.
 func (c *Channel) ProfileName() string { return c.name }

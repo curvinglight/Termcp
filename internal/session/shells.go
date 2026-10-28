@@ -95,6 +95,12 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 		}
 	}
 
+	if s.serialChannel != nil {
+		// A serial device carries one stream. The refusal is the seam's own
+		// error rather than a message about SSH, because the caller asked to
+		// open a channel and the answer is about the device.
+		return nil, ErrSerialSingleChannel
+	}
 	sshClient := s.SSHClient()
 	if sshClient == nil {
 		return nil, fmt.Errorf("sub-shell multiplexing requires an SSH connection; internal loopback sessions do not support multiple channels")
@@ -111,6 +117,9 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 	if err != nil {
 		return nil, fmt.Errorf("create child shell: %w", err)
 	}
+	// The SSH channel satisfies the seam the shell works on; the serial path
+	// never reaches here (refused above).
+	var channel shellChannel = execSession
 
 	// Assign the channel number only after the SSH channel exists. Failed opens
 	// do not create a shell and therefore do not consume a locator number; every
@@ -136,7 +145,7 @@ func (s *Session) CreateChildShell(command string, args []string, pty bool, rows
 		ID:          id,
 		Index:       index,
 		Name:        name,
-		execSession: execSession,
+		channel:     channel,
 		buf:         buf,
 		done:        make(chan struct{}),
 		CreatedAt:   clock.Now(),

@@ -14,7 +14,9 @@ import (
 	"github.com/open-mcp-ai/termcp/internal/approval"
 	"github.com/open-mcp-ai/termcp/internal/buffer"
 	"github.com/open-mcp-ai/termcp/internal/clock"
+	"github.com/open-mcp-ai/termcp/internal/encoding"
 	"github.com/open-mcp-ai/termcp/internal/message"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/internal/shell"
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
 	"github.com/open-mcp-ai/termcp/internal/sshserver"
@@ -60,6 +62,12 @@ type Config struct {
 	Rows      int
 	Cols      int
 	Remote    *RemoteSSH
+	// Serial, when set, opens a local serial device instead of an SSH
+	// connection. It is mutually exclusive with Remote: a serial session has no
+	// host to dial and no credentials. NoShell is refused with it — a serial
+	// device carries exactly one stream, and a container without a shell on it
+	// is a connection, not a device.
+	Serial *SerialConfig
 	// DefaultShell is the profile's default_shell, kept so shells opened later on
 	// this connection resolve their shell the same way the first one did: the
 	// caller's command, then this, then the server's own login shell.
@@ -101,6 +109,20 @@ type Config struct {
 	Namespace string
 }
 
+// SerialConfig describes a local serial device to open.
+//
+// It is deliberately not sshconfig-shaped: there is no host, no credential and
+// no shell to resolve. The profile name is carried so the session and its
+// diagnostics can say which profile it came from, and so the device claim can
+// be attributed.
+type SerialConfig struct {
+	// ProfileName is the profile this session was created from.
+	ProfileName string
+	// Spec is the validated device configuration, projected onto a port config
+	// at open time.
+	Spec *serial.Spec
+}
+
 // Session wraps an interactive process session managed over SSH.
 // Session is a connection container; terminal I/O is addressed by shell_id via ChildShell.
 type Session struct {
@@ -112,7 +134,18 @@ type Session struct {
 	terminateOnce sync.Once
 	deadOnce      sync.Once
 	exitOnce      sync.Once
-	execSession   *sshclient.ExecSession
+	// execSession is the SSH transport, and is nil for any session that does not
+	// use SSH (serial). It stays concrete because the SSH-only capabilities
+	// (SSHClient, forwards, SFTP) hang off it.
+	execSession *sshclient.ExecSession
+	// transport is the lifecycle view of the same object for SSH sessions, and
+	// the serial channel for serial ones. Terminate and finalize go through it
+	// so they never need to know which transport they are dealing with.
+	transport transport
+	// serialChannel is the serial transport, and is nil for an SSH session. It
+	// is kept alongside transport because the device-claim release needs the
+	// serial-specific detail that the interfaces deliberately do not carry.
+	serialChannel *serial.Channel
 	buf           *buffer.Buffer
 	readerID      int
 	msgMgr        *message.Manager
@@ -179,24 +212,57 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 
 	usePty := cfg.Mode == api.ModePTY
 
-	execSession, sshEndpointPublic, err := dialTransport(internal, cfg, usePty)
-	if err != nil {
-		return nil, err
-	}
-	// The dial can also finish in the same instant the caller gives up. Dropping
-	// the transport here rather than registering it keeps the promise the cancel
-	// makes: after a cancelled request, no session exists to be listed. Without
-	// this the race is small but real -- a fast host completes the dial just as
-	// the window closes, and the session appears with nobody attached to it.
-	if cfg.Ctx != nil && cfg.Ctx.Err() != nil {
-		_ = execSession.Close()
-		return nil, cfg.Ctx.Err()
+	// Two transports, one container. execSession stays concrete (SSH-only
+	// capabilities hang off it); transport and the shell channel are the seams
+	// every session goes through, whatever carries its bytes.
+	var execSession *sshclient.ExecSession
+	var serialChannel *serial.Channel
+	var transport transport
+	var channel shellChannel
+	var sshEndpointPublic string
+	if cfg.Serial != nil {
+		if cfg.Serial.Spec == nil {
+			return nil, errors.New("serial session requires a device spec")
+		}
+		if isRemote(cfg) {
+			return nil, errors.New("a session cannot be both serial and remote")
+		}
+		// Claim and open are one step inside serial.Open: two profiles can name
+		// one port through different paths, so a check-then-open sequence would
+		// race. The channel owns the claim and hands it back on Close; the
+		// scope attachment below is the second net, idempotent by construction.
+		ch, oerr := serial.Open(cfg.Serial.Spec, cfg.Serial.ProfileName, 0)
+		if oerr != nil {
+			return nil, oerr
+		}
+		serialChannel = ch
+		transport = ch
+		channel = ch
+	} else {
+		var err error
+		execSession, sshEndpointPublic, err = dialTransport(internal, cfg, usePty)
+		if err != nil {
+			return nil, err
+		}
+		// The dial can also finish in the same instant the caller gives up. Dropping
+		// the transport here rather than registering it keeps the promise the cancel
+		// makes: after a cancelled request, no session exists to be listed. Without
+		// this the race is small but real -- a fast host completes the dial just as
+		// the window closes, and the session appears with nobody attached to it.
+		if cfg.Ctx != nil && cfg.Ctx.Err() != nil {
+			_ = execSession.Close()
+			return nil, cfg.Ctx.Err()
+		}
+		transport = execSession
+		channel = execSession
 	}
 
 	// Determine the target shell family so press_enter sends the right line
 	// ending. For internal sessions the target is the local host, so we probe
 	// it via the shell detector. For remote sessions the target OS is unknown
 	// without an extra round-trip; unix (\n) is the safe default for SSH targets.
+	// A serial session decides its line ending from the profile's tx_eol, which
+	// the root shell carries itself — the family probe means nothing to a device.
 	enterCRLF := false
 	if sshEndpointPublic == "internal" {
 		if _, family, _ := shell.NewDetector().Detect(); family != "unix" {
@@ -204,28 +270,56 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		}
 	}
 
+	record := api.Session{
+		ID:          sessionID,
+		Name:        name,
+		SSHConfig:   cfg.SSHConfig,
+		Command:     cfg.Command,
+		Args:        cfg.Args,
+		Status:      api.SessionRunning,
+		CreatedAt:   clock.Now(),
+		UpdatedAt:   clock.Now(),
+		Rows:        cfg.Rows,
+		Cols:        cfg.Cols,
+		SSHEndpoint: sshEndpointPublic,
+		Namespace:   cfg.Namespace,
+	}
+	// A serial session is a local device, not a connection to a host: the
+	// endpoint stays empty and Kind is what tells a client what it is looking
+	// at. Serial and Display land on the record (not just the live object) so a
+	// restart-restored session still knows what it was talking to.
+	if serialChannel != nil {
+		record.Kind = api.KindSerial
+		record.Display = serialChannel.Spec().Display
+		record.Serial = &api.SerialInfo{
+			Profile: cfg.Serial.ProfileName,
+			Device:  serialChannel.Device(),
+			Baud:    serialChannel.Baud(),
+		}
+	} else if sshEndpointPublic == "internal" {
+		record.Kind = api.KindInternal
+	} else {
+		record.Kind = api.KindRemote
+	}
+
 	s := &Session{
-		Session: api.Session{
-			ID:          sessionID,
-			Name:        name,
-			SSHConfig:   cfg.SSHConfig,
-			Command:     cfg.Command,
-			Args:        cfg.Args,
-			Status:      api.SessionRunning,
-			CreatedAt:   clock.Now(),
-			UpdatedAt:   clock.Now(),
-			Rows:        cfg.Rows,
-			Cols:        cfg.Cols,
-			SSHEndpoint: sshEndpointPublic,
-			Namespace:   cfg.Namespace,
-		},
-		enterCRLF:    enterCRLF,
-		defaultShell: cfg.DefaultShell,
-		onExit:       normalizeOnExit(cfg.OnExit),
-		execSession:  execSession,
-		restriction:  cfg.Restriction,
-		msgMgr:       msgMgr,
-		scope:        newResourceScope(),
+		Session:       record,
+		enterCRLF:     enterCRLF,
+		defaultShell:  cfg.DefaultShell,
+		onExit:        normalizeOnExit(cfg.OnExit),
+		execSession:   execSession,
+		transport:     transport,
+		serialChannel: serialChannel,
+		restriction:   cfg.Restriction,
+		msgMgr:        msgMgr,
+		scope:         newResourceScope(),
+	}
+	// The device claim is a session-scoped resource: releasing it goes through
+	// the same LIFO cascade as forwards and notification rules, and a session
+	// that is deleted can never leave a port reserved behind it.
+	if serialChannel != nil {
+		release := serialChannel.Release()
+		s.AttachCleanup(release)
 	}
 
 	// Message-manager session state is a session-scoped resource: release it
@@ -240,6 +334,9 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	// (termcp://#<sid>:1) refers to. Only the transport is watched, which is the
 	// one observer that survives having no shells at all.
 	if cfg.NoShell {
+		if serialChannel != nil {
+			return nil, errors.New("a serial session cannot be shell-less: the device carries exactly one stream")
+		}
 		s.watchTransport(execSession)
 		slog.Debug("session started without a shell", "session_id", sessionID, "ssh_endpoint", sshEndpointPublic)
 		return s, nil
@@ -260,12 +357,15 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 		ID:          shellID,
 		Index:       1,
 		Name:        name,
-		execSession: execSession,
+		channel:     channel,
 		buf:         buf,
 		done:        make(chan struct{}),
 		CreatedAt:   clock.Now(),
 		enterCRLF:   enterCRLF,
 		mode:        cfg.Mode,
+	}
+	if serialChannel != nil {
+		root.markSerial(serialChannel.Spec())
 	}
 	root.setStatus(api.SessionRunning)
 	root.rows.Store(int32(cfg.Rows))
@@ -293,7 +393,11 @@ func New(internal *sshserver.Server, cfg Config, msgMgr *message.Manager) (*Sess
 	// This is the only signal that survives having no shells, and it does not
 	// duplicate the per-shell path: markDead is idempotent, so whichever watcher
 	// notices first wins and the message is recorded once.
-	s.watchTransport(execSession)
+	if serialChannel != nil {
+		s.watchSerialTransport(serialChannel)
+	} else {
+		s.watchTransport(execSession)
+	}
 
 	slog.Debug("session started", "session_id", sessionID, "shell_id", shellID, "command", cfg.Command, "ssh_endpoint", sshEndpointPublic)
 
@@ -350,6 +454,31 @@ func (s *Session) watchTransport(es *sshclient.ExecSession) {
 		// A deliberate close (Terminate, Disconnect, Delete) sets closing before it
 		// touches the transport, so markDeadWithMessage drops this notification
 		// instead of reporting an intentional teardown as a network loss.
+		s.markDeadWithMessage(message)
+	}()
+}
+
+// watchSerialTransport marks the session DEAD when the serial channel ends —
+// a closed port, a failed read loop, or the device disappearing from the bus.
+//
+// It is the serial twin of watchTransport and exists because the two report
+// their cause differently: an SSH connection explains itself through
+// WaitTransport, while a serial channel keeps the last read error, which only
+// means something once the loop has stopped.
+func (s *Session) watchSerialTransport(ch *serial.Channel) {
+	s.watchWG.Add(1)
+	go func() {
+		defer s.watchWG.Done()
+		<-ch.Done()
+		message := transportClosedMessage
+		if err := ch.LastError(); err != nil {
+			slog.Warn("session transport lost", "session_id", s.ID, "err", err)
+			// A device that vanished is not a network problem, and the sentence
+			// in the transcript is the only place a caller looks first.
+			message = "❌ serial device lost: " + err.Error()
+		} else {
+			slog.Info("session transport closed", "session_id", s.ID)
+		}
 		s.markDeadWithMessage(message)
 	}()
 }
@@ -484,7 +613,15 @@ func (s *Session) Terminate(force bool, gracePeriod time.Duration) {
 		s.beginClosing()
 		es := s.execSession
 		if es == nil {
-			// Restored (restart) placeholder with no live transport.
+			if s.transport == nil {
+				// Restored (restart) placeholder with no live transport.
+				s.markDead()
+				return
+			}
+			// A serial device cannot be asked politely to stop: there is no
+			// process to signal, so the grace period would be a wait nobody
+			// asked for. Close directly — the transport is idempotent.
+			_ = s.transport.Close()
 			s.markDead()
 			return
 		}
@@ -655,8 +792,8 @@ func (s *Session) finalize() {
 		if s.buf != nil {
 			s.buf.Close()
 		}
-		if s.execSession != nil {
-			_ = s.execSession.Close()
+		if s.transport != nil {
+			_ = s.transport.Close()
 		}
 		// Wait for exit watchers to finish their post-transport writes (final
 		// system message + persist) before releasing the session, so a caller
@@ -722,8 +859,8 @@ func (s *Session) TerminateShellOnly() {
 // preserving the object, buffers, and history for read-only viewing.
 func (s *Session) Disconnect() {
 	s.beginClosing()
-	if s.execSession != nil {
-		s.execSession.Close()
+	if s.transport != nil {
+		_ = s.transport.Close()
 	}
 	s.markDead()
 }
@@ -803,6 +940,68 @@ func (s *Session) Info() api.Session {
 // HasMoreOutput returns whether the given reader has unread data.
 // SSHClient returns the underlying SSH client. All sessions (including internal/loopback)
 // use SSH transport, so this never returns nil for a running session.
+// SupportsSSH reports whether the SSH-only features (forwards, SFTP) are
+// available on this session.
+//
+// It exists so the callers that used to infer availability from "SSHClient()
+// returned nil" can ask a question with a name. Relying on the nil produced
+// misleading errors: a serial session requesting a forward was told the session
+// "may not be ready" rather than that the transport has no forwards.
+func (s *Session) SupportsSSH() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.execSession != nil
+}
+
+// SerialInfo reports the device details of a serial session, or nil for any
+// other kind. It feeds session info, which otherwise has nothing to say about a
+// connection with no host.
+//
+// The value comes off the session record rather than the live channel: device,
+// baud and profile are fixed when the session starts, so reading them from the
+// record means a restart-restored session answers the same question the live
+// one did.
+func (s *Session) SerialInfo() *api.SerialInfo {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Session.Serial
+}
+
+// DisplayEncoding reports how this session's output bytes are presented: the
+// serial profile's display choice, or "text" for everything else.
+//
+// The empty value is never returned. A session without a profile chose no
+// display, and the readers have to be told *something*, so the normalisation
+// happens here rather than at each of the outlets — several call sites each
+// inventing their own answer for "" is how they drift apart.
+func (s *Session) DisplayEncoding() string {
+	if s == nil {
+		return encoding.Text
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Session.Display != "" {
+		return s.Session.Display
+	}
+	return encoding.Text
+}
+
+// Controller returns the serial modem-line controller of this session's device,
+// or nil when the session is not serial. The MCP layer probes it rather than
+// assuming: an SSH session has no lines to drive.
+func (s *Session) Controller() serialController {
+	if s == nil || s.serialChannel == nil {
+		return nil
+	}
+	return s.serialChannel
+}
+
 func (s *Session) SSHClient() *ssh.Client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

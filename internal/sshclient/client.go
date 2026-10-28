@@ -276,6 +276,14 @@ func (es *ExecSession) WaitTransport() error {
 	return es.client.Wait()
 }
 
+// StdoutReader returns the session's stdout stream. Exposed so a second
+// transport (serial) can satisfy the same channel interface without the caller
+// reading the exported struct field directly.
+func (es *ExecSession) StdoutReader() io.Reader { return es.Stdout }
+
+// StderrReader returns the session's stderr stream. See StdoutReader.
+func (es *ExecSession) StderrReader() io.Reader { return es.Stderr }
+
 // ExitCode returns the process exit code after Done is closed.
 func (es *ExecSession) ExitCode() int {
 	return es.exitCode

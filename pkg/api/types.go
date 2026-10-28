@@ -33,6 +33,38 @@ const (
 	ModePipe SessionMode = "pipe"
 )
 
+// SessionKind names what carries a session's bytes.
+//
+// It is a container-level property, like SSHEndpoint, and is set only on the
+// session record: a shell channel is a shell channel whatever the transport
+// underneath, so ChildShell.Info() leaves it empty rather than claiming the
+// channel is "a serial".
+type SessionKind string
+
+const (
+	// KindInternal is the built-in loopback SSH server.
+	KindInternal SessionKind = "internal"
+	// KindRemote is an outbound SSH connection.
+	KindRemote SessionKind = "remote"
+	// KindSerial is a local serial device.
+	KindSerial SessionKind = "serial"
+)
+
+// SerialInfo describes the device a serial session is attached to, for display.
+//
+// It lives here rather than beside the session implementation because it is
+// session metadata that clients read: the Web UI prints "device @baud" on the
+// session card, and session info reports it. It carries no credentials — a
+// serial profile has none — which is why it is safe to put on a record that is
+// listed, persisted and restored.
+type SerialInfo struct {
+	// Profile is the serial profile the session was started from, empty when
+	// the profile was deleted after the session started.
+	Profile string `json:"profile,omitempty"`
+	Device  string `json:"device"`
+	Baud    int    `json:"baud"`
+}
+
 // Session holds metadata for an interactive process session.
 //
 // Timestamps are Unix milliseconds, the one time representation this project
@@ -74,7 +106,25 @@ type Session struct {
 	// It is separate from Name because callers may rename a session after it starts.
 	SSHConfig string `json:"ssh_config,omitempty"`
 	// SSHEndpoint is a coarse hint for clients: "internal" (built-in loopback SSH) or "remote" (no host/user/port exposed).
+	//
+	// It is SSH-specific and empty for a serial session; prefer Kind, which is
+	// meaningful for every transport. SSHEndpoint is kept because existing
+	// clients read it, and because "internal" versus "remote" still says
+	// something Kind does not.
 	SSHEndpoint string `json:"ssh_endpoint,omitempty"`
+	// Kind says what carries this session's bytes: "internal", "remote" or
+	// "serial". It is omitted on shell records (see SessionKind).
+	Kind SessionKind `json:"kind,omitempty"`
+	// Display is how this session's output bytes are presented for display:
+	// "auto", "text", "hex" or "b64", taken from the serial profile when the
+	// session started. Empty means "text": bytes out, unaltered, the behaviour
+	// every session had before the field existed. Like Kind it is omitted on
+	// shell records.
+	Display string `json:"display,omitempty"`
+	// Serial names the device a serial session is attached to. Nil for every
+	// other kind, which is what keeps the absence of a host unambiguous: a
+	// session with no SSHEndpoint is serial only if Serial says so.
+	Serial *SerialInfo `json:"serial,omitempty"`
 	// ApprovalMode reports whether this session gates input behind N-person
 	// approval. It is a session-level policy, not a per-shell one: turning it on
 	// covers every shell channel in the session. The Web UI reads it to show that

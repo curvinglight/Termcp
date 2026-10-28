@@ -374,8 +374,8 @@ func (cs *ChildShell) drainPipes() {
 	case <-time.After(pipeDrainGrace):
 	}
 	slog.Debug("output pipe still open after process exit; closing readers", "child_shell_id", cs.ID)
-	if cs.execSession != nil {
-		cs.execSession.CloseReaders()
+	if cs.channel != nil {
+		cs.channel.CloseReaders()
 	}
 	select {
 	case <-drained:
@@ -402,8 +402,8 @@ func (cs *ChildShell) retainHistory(p *Session) {
 
 // startChildReaders starts the stdout/stderr pipe goroutines and exit watcher for a child shell.
 func (cs *ChildShell) startReaders() {
-	cs.pipeToBuffer(cs.execSession.Stdout, false)
-	cs.pipeToBuffer(cs.execSession.Stderr, true)
+	cs.pipeToBuffer(cs.channel.StdoutReader(), false)
+	cs.pipeToBuffer(cs.channel.StderrReader(), true)
 
 	if p := cs.parent.Load(); p != nil {
 		p.watchWG.Add(1)
@@ -412,7 +412,7 @@ func (cs *ChildShell) startReaders() {
 		if p := cs.parent.Load(); p != nil {
 			defer p.watchWG.Done()
 		}
-		<-cs.execSession.Done()
+		<-cs.channel.Done()
 		// Drain the output still buffered in the transport (exit-status can
 		// arrive ahead of the last stdout bytes) and seal the buffer BEFORE
 		// publishing the exit. "exited" is the caller's signal that the stream
@@ -420,7 +420,7 @@ func (cs *ChildShell) startReaders() {
 		// tail of a command that ended as fast as it started.
 		cs.drainPipes()
 		cs.buf.Close()
-		code := cs.execSession.ExitCode()
+		code := cs.channel.ExitCode()
 		// Exit code first: a reader that observes "exited" must also observe the
 		// code, so the two stores cannot be seen in the wrong order.
 		cs.setExitCode(code)
@@ -459,7 +459,7 @@ func (cs *ChildShell) startReaders() {
 		// The session-level transport watcher reports the same loss from the
 		// connection's own point of view; markDead is idempotent, so both firing is
 		// harmless and the one that sees it first records the message.
-		if reparent != nil && !deliberate && cs.execSession.Aborted() {
+		if reparent != nil && !deliberate && cs.channel.Aborted() {
 			slog.Debug("session DEAD via transport abort", "session_id", reparent.ID, "child_shell_id", cs.ID)
 			reparent.markDeadWithMessage(transportLostMessage)
 		}

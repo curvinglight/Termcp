@@ -10,7 +10,7 @@ import (
 
 	"github.com/open-mcp-ai/termcp/internal/buffer"
 	"github.com/open-mcp-ai/termcp/internal/clock"
-	"github.com/open-mcp-ai/termcp/internal/sshclient"
+	"github.com/open-mcp-ai/termcp/internal/serial"
 	"github.com/open-mcp-ai/termcp/pkg/api"
 )
 
@@ -53,8 +53,12 @@ type ChildShell struct {
 	// test, or one restored from a manifest written before Index existed).
 	Index       int
 	Name        string
-	parent      atomic.Pointer[Session] // nil if not yet attached to a session
-	execSession *sshclient.ExecSession
+	parent atomic.Pointer[Session] // nil if not yet attached to a session
+	// channel is the byte-stream seam this shell reads and writes. For an SSH
+	// session it is the sshclient.ExecSession of the channel; for a serial
+	// session it is the serial device's channel. Everything below works on the
+	// seam, so a shell never needs to know which transport carries it.
+	channel shellChannel
 	buf         *buffer.Buffer
 	done        chan struct{}
 	closeOnce   sync.Once
@@ -99,6 +103,77 @@ type ChildShell struct {
 	// so a live session's view still filters it out while the archive — which
 	// reads the snapshot — can show it). DELETE remains what it was: the erase.
 	archived atomic.Bool
+
+	// serial marks a shell backed by a serial device rather than an SSH channel.
+	// It drives the differences that cannot be inferred from the transport:
+	// there is only ever one shell, enter goes through tx_eol, and a resize has
+	// no terminal to act on.
+	serial bool
+	// txEOL is the serial profile's Enter byte sequence. Empty for SSH shells,
+	// which decide their ending from the target shell family instead.
+	txEOL string
+	// displayEnc is this shell's presentation encoding, inherited from the
+	// session at creation and never empty (the session normalises it first).
+	// Read by the output outlet, so it is a plain field rather than a parent
+	// lookup: the reader runs under the buffer and must not take the session
+	// lock to find out how to print what it already holds.
+	displayEnc string
+	// lineOpen reports that input has been written to this shell since the
+	// last write that ended a line. It is the input side's own bookkeeping, and
+	// it exists because the byte stream cannot answer the question: two input
+	// calls with no enter between them land on the target as one line, and
+	// nothing in the output distinguishes that from one deliberate command.
+	// Callers that can act on the difference (the MCP input reply) read it
+	// through LineOpen. Atomic rather than under cs.mu so a reader never blocks
+	// behind a writer's stdinMu.
+	lineOpen atomic.Bool
+}
+
+// markSerial turns a freshly built shell into a serial one: the profile's line
+// ending and display choice ride on the shell from here on. It must run before
+// the shell is published (startReaders), so no reader can observe a half-marked
+// shell.
+func (cs *ChildShell) markSerial(spec *serial.Spec) {
+	cs.serial = true
+	cs.txEOL = spec.TxEOL
+	cs.displayEnc = spec.Display
+}
+
+// LineOpen reports whether input has been written without a line-ending write
+// since. See the lineOpen field.
+func (cs *ChildShell) LineOpen() bool {
+	return cs.lineOpen.Load()
+}
+
+// setLineOpen records the line state this write leaves behind: a write that
+// submits closes the line, everything else opens it. Set before the write so a
+// reader that races the call cannot see "no line open" for input already on the
+// wire.
+func (cs *ChildShell) setLineOpen(submit bool) {
+	cs.lineOpen.Store(!submit)
+}
+
+// applyTxEOL converts the Enter bytes a serial shell is about to send into the
+// profile's line ending. Called only when pressEnter is set: input without
+// Enter sends text exactly as given, and only the Enter key is a line-ending
+// decision.
+func (cs *ChildShell) applyTxEOL(data []byte, pressEnter bool) []byte {
+	if !pressEnter {
+		return data
+	}
+	return serial.ReplaceEnter(data, cs.txEOL)
+}
+
+// Controller returns the serial modem-line controller, or nil for an SSH
+// shell. The MCP layer probes it rather than assuming.
+func (cs *ChildShell) Controller() serialController {
+	if cs == nil || !cs.serial {
+		return nil
+	}
+	if c, ok := cs.channel.(serialController); ok {
+		return c
+	}
+	return nil
 }
 
 // statusValue reads the lifecycle status. The zero ChildShell reports "", the
@@ -166,9 +241,9 @@ func (cs *ChildShell) Info() api.Session {
 // to the finalization channel for a shell that has no exec session (a deserialized
 // record, a transport-less shell).
 func (cs *ChildShell) processGone() bool {
-	if cs.execSession != nil {
+	if cs.channel != nil {
 		select {
-		case <-cs.execSession.Done():
+		case <-cs.channel.Done():
 			return true
 		default:
 			return false
@@ -225,9 +300,9 @@ func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src In
 	// sealed the transcript. The gap between them is exactly the window this check
 	// exists for, and only the earlier one covers it — querying cs.done alone left the
 	// bare `EOF` in place, because the write happened before the watcher finished.
-	if cs.execSession != nil {
+	if cs.channel != nil {
 		select {
-		case <-cs.execSession.Done():
+		case <-cs.channel.Done():
 			return &processGoneError{status: "exited"}
 		default:
 		}
@@ -243,19 +318,31 @@ func (cs *ChildShell) SendTerminalBytesFrom(data []byte, pressEnter bool, src In
 	} else {
 		toWrite = data
 	}
+	// A serial device has no shell family, so the line ending is the profile's
+	// decision rather than the one appendEnter inferred. Replacing here (rather
+	// than converting the result) is what keeps it a single conversion.
+	if cs.serial {
+		toWrite = cs.applyTxEOL(toWrite, pressEnter)
+	}
 	// Whether this input submits the line. Reported rather than inferred from the
 	// output: the terminal's byte stream does not delimit lines (a redraw emits a
 	// line break and a cursor-move sequence without ending anything), so a
 	// consumer watching newlines sees a line end when the terminal only repainted.
 	// The input side knows the truth — the user pressed enter.
 	submit := submitsLine(toWrite)
+	// Track the open line alongside the submit signal, from the same bytes and
+	// the same rule: this write either closed the line or left it open, and the
+	// answer is only correct if both agree. Set before the write so a reader
+	// that races the call cannot see "no line open" for input already on the
+	// wire.
+	cs.setLineOpen(submit)
 	// Record the input *before* the bytes go out, and only when it submits the
 	// line: the status display is live feedback that must not wait on the write,
 	// and a keystroke that leaves the line open is not a span of the transcript.
 	// See logInput for why a partial line writes nothing.
 	cs.logInput(src, submit)
 	cs.stdinMu.Lock()
-	_, err := cs.execSession.WriteStdin(toWrite)
+	_, err := cs.channel.WriteStdin(toWrite)
 	cs.stdinMu.Unlock()
 	if err != nil {
 		return err
@@ -286,14 +373,21 @@ func (cs *ChildShell) PressKeyFrom(key string, repeat int, src InputSource) erro
 		return &processGoneError{status: string(status)}
 	}
 	payload := bytes.Repeat(seq, repeat)
+	// The second Enter path. input with press_enter and key("enter") both end up
+	// here with a line ending in hand, and both must send the same bytes, so the
+	// serial substitution is applied to both.
+	if cs.serial && key == "enter" {
+		payload = cs.applyTxEOL(payload, true)
+	}
 	// A named key submits a line too (enter, and the ctrl sequences a line editor
 	// treats as one), so the signal comes from the bytes actually sent rather than
 	// from the key's name: the name is a label, the sequence is what the terminal
 	// receives.
 	submit := submitsLine(payload)
+	cs.setLineOpen(submit)
 	cs.logInput(src, submit)
 	cs.stdinMu.Lock()
-	_, err = cs.execSession.WriteStdin(payload)
+	_, err = cs.channel.WriteStdin(payload)
 	cs.stdinMu.Unlock()
 	if err != nil {
 		return err
@@ -311,7 +405,14 @@ func (cs *ChildShell) ResizePty(rows, cols int) error {
 	if cs.statusValue() != api.SessionRunning {
 		return fmt.Errorf("process not running")
 	}
-	if err := cs.execSession.ResizePty(rows, cols); err != nil {
+	resizer, ok := cs.channel.(ptyResizer)
+	if !ok {
+		// A serial device has no terminal to size. The refusal names why rather
+		// than reporting a failed resize: the caller asked a question the
+		// transport cannot mean.
+		return fmt.Errorf("%w: a serial device has no terminal size", ErrUnsupported)
+	}
+	if err := resizer.ResizePty(rows, cols); err != nil {
 		return err
 	}
 	cs.rows.Store(int32(rows))
@@ -327,9 +428,9 @@ func (cs *ChildShell) TerminateShell() {
 	}
 	cs.deliberateClose.Store(true)
 
-	cs.execSession.CloseSessionOnly()
+	cs.channel.CloseSessionOnly()
 	select {
-	case <-cs.execSession.Done():
+	case <-cs.channel.Done():
 	case <-time.After(2 * time.Second):
 	}
 	// Flush output already handed to the process before sealing the buffer,

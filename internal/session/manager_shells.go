@@ -1,5 +1,7 @@
 package session
 
+import "github.com/open-mcp-ai/termcp/internal/encoding"
+
 // GetChildShell searches all sessions for a child shell with the given ID.
 // Returns nil if no matching child shell is found.
 func (m *Manager) GetChildShell(id string) *ChildShell {
@@ -32,6 +34,27 @@ func (m *Manager) GetByShellID(shellID string) *Session {
 // live in-memory shells and retained DEAD/restored shell snapshots. This keeps
 // output-range resolvable for read-only DEAD views after a transport teardown
 // or restart when no live ChildShell object exists for the id.
+// DisplayEncodingFor resolves the presentation encoding for an id that may name
+// a session or one of its shells, including a shell whose session is DEAD or
+// restored (no live ChildShell, only the retained snapshot).
+//
+// The outlets that convert raw bytes — the range endpoints, the scrollback
+// rail, the MCP tail and offset reads — hold an id, not a session, and they
+// must all land on the same answer as the live path or a replayed transcript
+// would render differently from the live one it came from.
+//
+// "text" for an unknown id: those callers are about to fail the lookup they
+// care about, and an encoding is not what they are validating.
+func (m *Manager) DisplayEncodingFor(id string) string {
+	if s := m.Get(id); s != nil {
+		return s.DisplayEncoding()
+	}
+	if s := m.GetSessionByShellID(id); s != nil {
+		return s.DisplayEncoding()
+	}
+	return encoding.Text
+}
+
 func (m *Manager) GetSessionByShellID(shellID string) *Session {
 	var found *Session
 	m.sessions.Range(func(_, v any) bool {
