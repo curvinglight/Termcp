@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/open-mcp-ai/termcp/internal/serial"
+	"github.com/open-mcp-ai/termcp/internal/serial/port"
 	"github.com/open-mcp-ai/termcp/internal/session"
 	"github.com/open-mcp-ai/termcp/internal/sshclient"
 )
@@ -14,6 +16,7 @@ const maxConfigFileSize = 256 * 1024
 
 const KindInternal = "internal"
 const KindRemote = "remote"
+const KindSerial = "serial"
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 
@@ -46,6 +49,25 @@ type Entry struct {
 	DefaultApproval bool `toml:"default_approval,omitempty"`
 	DialSpec        `toml:",squash"`
 	Jump            *JumpSpec `toml:"jump,omitempty"` // optional bastion chain (ProxyJump)
+
+	// Serial device fields, flat like DialSpec's. They are only meaningful when
+	// Kind is "serial"; their zero value is what an internal or remote profile
+	// carries because its document never named a device, which is how a serial
+	// field on the wrong kind is detected. The TOML key is "display", not
+	// "encoding": encoding on the read path means a character-set decoder, and
+	// the two axes must not share a name.
+	Device      string        `toml:"device,omitempty"`
+	Baud        int           `toml:"baud,omitempty"`
+	DataBits    int           `toml:"data_bits,omitempty"`
+	StopBits    port.StopBits `toml:"stop_bits,omitempty"`
+	Parity      string        `toml:"parity,omitempty"`
+	DTR         string        `toml:"dtr,omitempty"`
+	RTS         string        `toml:"rts,omitempty"`
+	FlowControl string        `toml:"flow_control,omitempty"`
+	TxEOL       string        `toml:"tx_eol,omitempty"`
+	RxNormalize *bool         `toml:"rx_normalize,omitempty"`
+	LocalEcho   bool          `toml:"local_echo,omitempty"`
+	Display     string        `toml:"display,omitempty"`
 }
 
 // JumpSpec is a self-contained bastion hop: a DialSpec plus a nested Jump for
@@ -81,10 +103,22 @@ func ParseAndValidate(data []byte) (*Entry, error) {
 		// document being incomplete, and answering it with operation_failed (500)
 		// reads like an outage — a caller that retries on 5xx retries a config that
 		// will never work.
-		return nil, fmt.Errorf("config must set \"kind\" to %q or %q: %w", KindInternal, KindRemote, ErrInvalid)
+		return nil, fmt.Errorf("config must set \"kind\" to %q, %q or %q: %w", KindInternal, KindRemote, KindSerial, ErrInvalid)
 	}
 	e.Kind = k
 	switch k {
+	case KindSerial:
+		if err := refuseDialFieldsOnSerial(&e); err != nil {
+			return nil, err
+		}
+		if err := refuseShellFieldsOnSerial(&e); err != nil {
+			return nil, err
+		}
+		e.applySerialDefaults()
+		if err := e.validateSerial(); err != nil {
+			return nil, err
+		}
+		return &e, nil
 	case KindInternal:
 		// A DIAL FIELD ON AN INTERNAL PROFILE DOES NOTHING, AND SAYING SO IS THE FIX.
 		// `kind = "internal"` means the built-in loopback connection; host/user/port
@@ -95,11 +129,17 @@ func ParseAndValidate(data []byte) (*Entry, error) {
 		if err := refuseDialFieldsOnInternal(&e); err != nil {
 			return nil, err
 		}
+		if err := refuseSerialFieldsOnNonSerial(&e, KindInternal); err != nil {
+			return nil, err
+		}
 		if err := validateDefaultMode(&e); err != nil {
 			return nil, err
 		}
 		return &e, nil
 	case KindRemote:
+		if err := refuseSerialFieldsOnNonSerial(&e, KindRemote); err != nil {
+			return nil, err
+		}
 		if err := validateDialSpec(&e.DialSpec, "remote config"); err != nil {
 			return nil, err
 		}
@@ -111,7 +151,7 @@ func ParseAndValidate(data []byte) (*Entry, error) {
 		}
 		return &e, nil
 	default:
-		return nil, fmt.Errorf("unknown kind %q (use %q or %q): %w", e.Kind, KindInternal, KindRemote, ErrInvalid)
+		return nil, fmt.Errorf("unknown kind %q (use %q, %q or %q): %w", e.Kind, KindInternal, KindRemote, KindSerial, ErrInvalid)
 	}
 }
 
@@ -144,6 +184,79 @@ func refuseDialFieldsOnInternal(e *Entry) error {
 	}
 	return fmt.Errorf("kind = %q is the built-in loopback connection, so %s would be accepted and ignored; remove it or use kind = %q: %w",
 		KindInternal, strings.Join(found, ", "), KindRemote, ErrInvalid)
+}
+
+// refuseDialFieldsOnSerial rejects a serial profile that carries SSH dial
+// settings. The message names the fields rather than saying "unexpected": the
+// caller has to delete them, and the list is the edit.
+func refuseDialFieldsOnSerial(e *Entry) error {
+	var found []string
+	add := func(name, v string) {
+		if strings.TrimSpace(v) != "" {
+			found = append(found, name)
+		}
+	}
+	add("host", e.Host)
+	add("user", e.User)
+	if e.Port != 0 {
+		found = append(found, "port")
+	}
+	add("password", e.Password)
+	add("private_key", e.PrivateKey)
+	add("key_passphrase", e.KeyPassphrase)
+	add("proxy", e.Proxy)
+	add("known_hosts", e.KnownHosts)
+	if e.TrustUnknownHost != nil {
+		found = append(found, "trust_unknown_host")
+	}
+	if e.DialTimeoutSeconds != 0 {
+		found = append(found, "dial_timeout_seconds")
+	}
+	if e.Jump != nil {
+		found = append(found, "jump")
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("kind = %q names a device on this machine, so %s would be accepted and ignored; remove it: %w",
+		KindSerial, strings.Join(found, ", "), ErrInvalid)
+}
+
+// refuseShellFieldsOnSerial rejects a serial profile that names a shell or a
+// shell mode: a serial device has no process to run and no terminal to size,
+// so both fields would be read by callers that can never honour them.
+func refuseShellFieldsOnSerial(e *Entry) error {
+	var found []string
+	if strings.TrimSpace(e.DefaultShell) != "" {
+		found = append(found, "default_shell")
+	}
+	if strings.TrimSpace(e.DefaultMode) != "" {
+		found = append(found, "default_mode")
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("kind = %q has no shell, so %s would be accepted and ignored; remove it: %w",
+		KindSerial, strings.Join(found, ", "), ErrInvalid)
+}
+
+// refuseSerialFieldsOnNonSerial rejects internal/remote profiles that carry
+// serial device fields: the fields would be accepted and ignored, and a profile
+// that silently dials a host while naming a device is the internal/remote
+// mirror of the mistake refuseDialFieldsOnSerial catches.
+func refuseSerialFieldsOnNonSerial(e *Entry, kind string) error {
+	if strings.TrimSpace(e.Device) == "" && e.Baud == 0 {
+		return nil
+	}
+	var found []string
+	if strings.TrimSpace(e.Device) != "" {
+		found = append(found, "device")
+	}
+	if e.Baud != 0 {
+		found = append(found, "baud")
+	}
+	return fmt.Errorf("kind = %q dials a host, so serial fields (%s) would be accepted and ignored; remove them or use kind = %q: %w",
+		kind, strings.Join(found, ", "), KindSerial, ErrInvalid)
 }
 
 func validateDefaultMode(e *Entry) error {
@@ -311,6 +424,76 @@ func ParseInternalOverride(data []byte, base *Entry) (*Entry, error) {
 		return nil, err
 	}
 	return &e, nil
+}
+
+// SerialFromEntry returns the device spec of a serial host profile. The caller
+// has already validated the entry (ParseAndValidate dispatched on kind), so the
+// error here covers only the wrong-kind call — the equivalent of handing a
+// remote profile to a serial dialler.
+func SerialFromEntry(e *Entry) (*serial.Spec, error) {
+	if e == nil || e.Kind != KindSerial {
+		return nil, fmt.Errorf("profile is not kind = %q: %w", KindSerial, ErrInvalid)
+	}
+	s := e.serialSpec()
+	s.ApplyDefaults()
+	return &s, nil
+}
+
+// serialSpec projects the flat profile fields onto the device vocabulary the
+// serial package speaks. The projection is total: every field moves, so a field
+// added to one side without the other fails the round-trip test rather than
+// being silently dropped.
+func (e *Entry) serialSpec() serial.Spec {
+	return serial.Spec{
+		Device:      e.Device,
+		Baud:        e.Baud,
+		DataBits:    e.DataBits,
+		StopBits:    e.StopBits,
+		Parity:      e.Parity,
+		DTR:         e.DTR,
+		RTS:         e.RTS,
+		FlowControl: e.FlowControl,
+		TxEOL:       e.TxEOL,
+		RxNormalize: e.RxNormalize,
+		LocalEcho:   e.LocalEcho,
+		Display:     e.Display,
+	}
+}
+
+// applySerialDefaults writes the spec's defaults back onto the flat fields, so
+// a parsed serial profile is complete as stored, not only as validated.
+func (e *Entry) applySerialDefaults() {
+	s := e.serialSpec()
+	s.ApplyDefaults()
+	e.fromSerialSpec(&s)
+}
+
+// validateSerial validates the serial fields in place. A device-side refusal is
+// the caller's document being incomplete, so it is surfaced as ErrInvalid (400)
+// rather than as the raw port error the transport layer would answer 500 with.
+func (e *Entry) validateSerial() error {
+	s := e.serialSpec()
+	if err := s.Validate(); err != nil {
+		return fmt.Errorf("invalid serial config: %w (%w)", ErrInvalid, err)
+	}
+	return nil
+}
+
+// fromSerialSpec copies a spec back onto the flat fields (the inverse of
+// serialSpec, used after defaults were applied).
+func (e *Entry) fromSerialSpec(s *serial.Spec) {
+	e.Device = s.Device
+	e.Baud = s.Baud
+	e.DataBits = s.DataBits
+	e.StopBits = s.StopBits
+	e.Parity = s.Parity
+	e.DTR = s.DTR
+	e.RTS = s.RTS
+	e.FlowControl = s.FlowControl
+	e.TxEOL = s.TxEOL
+	e.RxNormalize = s.RxNormalize
+	e.LocalEcho = s.LocalEcho
+	e.Display = s.Display
 }
 
 // RemoteFromEntry converts an sshconfig Entry into session.RemoteSSH dial settings,
