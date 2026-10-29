@@ -168,8 +168,12 @@ function charsetControlHTML() {
 // One popup at a time, page-wide: two windows cannot both be showing it, and a
 // menu left behind by a closed window would float over someone else's session.
 var _charsetMenu = null;
+// Bumped by every open and every close, so a fetch that lands after the user has
+// moved on cannot paint a list over the wrong window.
+var _charsetSeq = 0;
 
 function closeCharsetMenu() {
+  _charsetSeq++;
   if (!_charsetMenu) return;
   var m = _charsetMenu;
   _charsetMenu = null;
@@ -184,7 +188,14 @@ function closeCharsetMenu() {
   window.removeEventListener('scroll', m.onDoc, true);
 }
 
-function applyCharset(win, sessionId, cs) {
+function fetchSessionCharset(sessionId) {
+  return fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId)).then(function (r) {
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+  }).then(function (j) { return j && j.charset ? j.charset : 'auto'; });
+}
+
+function applyCharset(win, sessionId, cs, state) {
   closeCharsetMenu();
   fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId) + '/charset', {
     method: 'PATCH',
@@ -192,6 +203,11 @@ function applyCharset(win, sessionId, cs) {
     body: JSON.stringify({ charset: cs })
   }).then(function (r) {
     if (!r.ok) return r.text().then(function (txt) { throw new Error(txt || r.status); });
+    return r.json();
+  }).then(function (j) {
+    // The reply carries the charset now in force (the server answers with the
+    // effective one, so "auto" comes back as itself and an override as its name).
+    if (state && j && j.charset) state.cur = j.charset;
     // The switch is server-side session state: every later frame and every
     // history fetch decodes under it. What is already painted was decoded
     // under the old one, so the window starts over.
@@ -201,8 +217,8 @@ function applyCharset(win, sessionId, cs) {
   });
 }
 
-function openCharsetMenu(win, btn, sessionId, cur) {
-  closeCharsetMenu();
+// buildCharsetMenu draws the list for the charset the SERVER says is in force.
+function buildCharsetMenu(win, btn, sessionId, state) {
   var el = document.createElement('div');
   el.className = 'term-charset-menu';
   el.setAttribute('role', 'listbox');
@@ -210,12 +226,19 @@ function openCharsetMenu(win, btn, sessionId, cur) {
     var code = CHARSET_OPTIONS[i][0], label = CHARSET_OPTIONS[i][1];
     var item = document.createElement('button');
     item.type = 'button';
-    item.className = 'term-charset-item' + (code === cur ? ' is-current' : '');
+    item.className = 'term-charset-item' + (code === state.cur ? ' is-current' : '');
     item.setAttribute('role', 'option');
-    item.setAttribute('aria-selected', code === cur ? 'true' : 'false');
+    item.setAttribute('aria-selected', code === state.cur ? 'true' : 'false');
     item.textContent = label;
+    if (code === state.cur) {
+      var tick = document.createElement('span');
+      tick.className = 'term-charset-tick';
+      tick.setAttribute('aria-hidden', 'true');
+      tick.textContent = '✓';
+      item.appendChild(tick);
+    }
     item.addEventListener('click', function (c) {
-      return function () { applyCharset(win, sessionId, c); };
+      return function () { applyCharset(win, sessionId, c, state); };
     }(code));
     el.appendChild(item);
   }
@@ -229,6 +252,12 @@ function openCharsetMenu(win, btn, sessionId, cur) {
   if (over > 0) el.style.left = Math.round(Math.max(8, r.left - over)) + 'px';
   btn.classList.add('is-open');
   btn.setAttribute('aria-expanded', 'true');
+  // The icon says, without opening anything, whether this session is decoding
+  // under an explicit choice or still sniffing.
+  btn.classList.toggle('is-set', !!state.cur && state.cur !== 'auto');
+  btn.title = state.cur && state.cur !== 'auto'
+    ? t('win.charset.tip') + ' — ' + state.cur
+    : t('win.charset.tip');
   var onDoc = function (e) {
     if (e.target === btn || el.contains(e.target)) return;
     closeCharsetMenu();
@@ -241,6 +270,22 @@ function openCharsetMenu(win, btn, sessionId, cur) {
   _charsetMenu = { el: el, btn: btn, onDoc: onDoc, onKey: onKey };
 }
 
+// openCharsetMenu asks the server what is in force, then draws the list.
+//
+// It asks EVERY time. The value remembered at wire time is what the window saw
+// when it opened, and a switch moves it — the list marked "Auto" forever after a
+// switch because nothing ever updated it, which is exactly what a user reads as
+// "my choice did not take".
+function openCharsetMenu(win, btn, sessionId, state) {
+  closeCharsetMenu();
+  var seq = ++_charsetSeq;
+  fetchSessionCharset(sessionId).catch(function () { return state.cur; }).then(function (cs) {
+    if (seq !== _charsetSeq) return; // closed, or reopened, while asking
+    state.cur = cs || state.cur;
+    buildCharsetMenu(win, btn, sessionId, state);
+  });
+}
+
 // wireCharsetSelect wires one window's control: the current value comes from
 // the session info (the effective charset, override included), and the popup
 // marks it so a user can see what "auto" actually resolved to.
@@ -248,18 +293,17 @@ function wireCharsetSelect(win, sessionId) {
   var btn = win.querySelector('.term-charset-btn');
   if (!btn || !sessionId || btn._csBound) return;
   btn._csBound = true;
-  var cur = 'auto';
-  fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId)).then(function (r) {
-    if (!r.ok) throw new Error(r.statusText);
-    return r.json();
-  }).then(function (j) {
-    cur = j && j.charset ? j.charset : 'auto';
+  var state = { cur: 'auto' };
+  fetchSessionCharset(sessionId).then(function (cs) {
+    state.cur = cs;
+    btn.classList.toggle('is-set', cs !== 'auto');
+    if (cs !== 'auto') btn.title = t('win.charset.tip') + ' — ' + cs;
   }).catch(function () {});
   btn.addEventListener('click', function (e) {
     e.preventDefault();
     e.stopPropagation();
     if (_charsetMenu && _charsetMenu.btn === btn) { closeCharsetMenu(); return; }
-    openCharsetMenu(win, btn, sessionId, cur);
+    openCharsetMenu(win, btn, sessionId, state);
   });
 }
 
