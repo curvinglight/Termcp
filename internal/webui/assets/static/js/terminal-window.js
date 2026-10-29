@@ -53,7 +53,7 @@ function openPendingShellWindow(connName, pos, abortCtl) {
         '<button type="button" class="shell-tab-btn" data-stab="fw" title="Forwardings" data-i18n-title="win.fw.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3.5" y="3.5" width="7" height="7" rx="1"/><path d="M1 7h3.5M9.5 7h3.5M7 1v3.5M7 9.5v3.5" stroke-linecap="round"/></svg></button>' +
         '<button type="button" class="shell-tab-btn" data-stab="file" title="Files" data-i18n-title="win.files.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 3v9a1 1 0 001 1h10a1 1 0 001-1V4.5a1 1 0 00-1-1h-5L5.5 2H2a1 1 0 00-1 1z"/></svg></button>' +
         '</div>' +
-      '<select class="term-charset-select" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip"><option value="auto">Auto</option><option value="utf-8">UTF-8</option><option value="gbk">GBK</option><option value="gb18030">GB18030</option><option value="big5">Big5</option><option value="shift_jis">Shift JIS</option><option value="euc-kr">EUC-KR</option><option value="utf-16le">UTF-16LE</option><option value="utf-16be">UTF-16BE</option><option value="windows-1252">Windows-1252</option><option value="latin-1">Latin-1</option></select>' +
+      charsetControlHTML() +
       '<div class="shell-window-header-btns">' +
         SHELL_WINDOW_MAX_HTML + '<button type="button" class="shell-window-collapse-btn" title="Collapse" data-i18n-title="win.collapse">' +
           '<svg class="ic-d" viewBox="0 0 12 8" width="12" height="8"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1 2l5 4 5-4"/></svg>' +
@@ -149,45 +149,117 @@ var CHARSET_OPTIONS = [
   ['latin-1', 'Latin-1']
 ];
 
-function charsetSelectHTML() {
-  var opts = '';
-  for (var i = 0; i < CHARSET_OPTIONS.length; i++) {
-    opts += '<option value="' + CHARSET_OPTIONS[i][0] + '">' + CHARSET_OPTIONS[i][1] + '</option>';
-  }
-  return '<select class="term-charset-select" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip">' + opts + '</select>';
+// The control is an ICON, not a dropdown: the header is the most crowded row on
+// the window, and a permanent select box there was both wide and — worse — dead.
+// The header's drag handler cancels mousedown unless the target is a <button>,
+// so clicking the select started a window drag and the native popup never
+// opened. A button is exempt by that same rule, and the choices go in a popup
+// the page owns.
+//
+// The options are the charsets the server's table maps (see
+// internal/encoding/charset.go) plus the sniff ("auto") — changing one PATCHes
+// the session and repaints the window from the transcript.
+function charsetControlHTML() {
+  return '<button type="button" class="term-charset-btn" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip" aria-haspopup="listbox" aria-expanded="false">' +
+    '<span class="term-charset-glyph" aria-hidden="true">文</span>' +
+    '</button>';
 }
 
-// wireCharsetSelect wires one window's selector: the current value comes from
-// the session info (the effective charset, override included), a change
-// PATCHes the session and repaints the window, because the bytes already on
-// screen were decoded under the old choice and leaving them there would show
-// two encodings in one terminal.
+// One popup at a time, page-wide: two windows cannot both be showing it, and a
+// menu left behind by a closed window would float over someone else's session.
+var _charsetMenu = null;
+
+function closeCharsetMenu() {
+  if (!_charsetMenu) return;
+  var m = _charsetMenu;
+  _charsetMenu = null;
+  if (m.btn) {
+    m.btn.classList.remove('is-open');
+    m.btn.setAttribute('aria-expanded', 'false');
+  }
+  if (m.el && m.el.parentNode) m.el.parentNode.removeChild(m.el);
+  document.removeEventListener('mousedown', m.onDoc, true);
+  document.removeEventListener('keydown', m.onKey, true);
+  window.removeEventListener('resize', m.onDoc);
+  window.removeEventListener('scroll', m.onDoc, true);
+}
+
+function applyCharset(win, sessionId, cs) {
+  closeCharsetMenu();
+  fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId) + '/charset', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ charset: cs })
+  }).then(function (r) {
+    if (!r.ok) return r.text().then(function (txt) { throw new Error(txt || r.status); });
+    // The switch is server-side session state: every later frame and every
+    // history fetch decodes under it. What is already painted was decoded
+    // under the old one, so the window starts over.
+    repaintShellWithCharset(win, sessionId);
+  }).catch(function (e) {
+    console.error('charset switch failed', e);
+  });
+}
+
+function openCharsetMenu(win, btn, sessionId, cur) {
+  closeCharsetMenu();
+  var el = document.createElement('div');
+  el.className = 'term-charset-menu';
+  el.setAttribute('role', 'listbox');
+  for (var i = 0; i < CHARSET_OPTIONS.length; i++) {
+    var code = CHARSET_OPTIONS[i][0], label = CHARSET_OPTIONS[i][1];
+    var item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'term-charset-item' + (code === cur ? ' is-current' : '');
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', code === cur ? 'true' : 'false');
+    item.textContent = label;
+    item.addEventListener('click', function (c) {
+      return function () { applyCharset(win, sessionId, c); };
+    }(code));
+    el.appendChild(item);
+  }
+  document.body.appendChild(el);
+  var r = btn.getBoundingClientRect();
+  el.style.top = Math.round(r.bottom + 4) + 'px';
+  el.style.left = Math.round(r.left) + 'px';
+  // A menu opened near the right edge would hang off the viewport.
+  var er = el.getBoundingClientRect();
+  var over = er.right - window.innerWidth + 8;
+  if (over > 0) el.style.left = Math.round(Math.max(8, r.left - over)) + 'px';
+  btn.classList.add('is-open');
+  btn.setAttribute('aria-expanded', 'true');
+  var onDoc = function (e) {
+    if (e.target === btn || el.contains(e.target)) return;
+    closeCharsetMenu();
+  };
+  var onKey = function (e) { if (e.key === 'Escape') closeCharsetMenu(); };
+  document.addEventListener('mousedown', onDoc, true);
+  document.addEventListener('keydown', onKey, true);
+  window.addEventListener('resize', onDoc);
+  window.addEventListener('scroll', onDoc, true);
+  _charsetMenu = { el: el, btn: btn, onDoc: onDoc, onKey: onKey };
+}
+
+// wireCharsetSelect wires one window's control: the current value comes from
+// the session info (the effective charset, override included), and the popup
+// marks it so a user can see what "auto" actually resolved to.
 function wireCharsetSelect(win, sessionId) {
-  var sel = win.querySelector('.term-charset-select');
-  if (!sel || !sessionId) return;
+  var btn = win.querySelector('.term-charset-btn');
+  if (!btn || !sessionId || btn._csBound) return;
+  btn._csBound = true;
+  var cur = 'auto';
   fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId)).then(function (r) {
     if (!r.ok) throw new Error(r.statusText);
     return r.json();
   }).then(function (j) {
-    var cs = j && j.charset ? j.charset : 'utf-8';
-    sel.value = cs;
-    if (sel.value !== cs) { sel.value = 'utf-8'; } // an unknown name falls back visibly
-  }).catch(function () { sel.value = 'utf-8'; });
-  sel.addEventListener('change', function () {
-    var cs = sel.value;
-    fetch(apiPath('/api/sessions/') + encodeURIComponent(sessionId) + '/charset', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ charset: cs })
-    }).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.status); });
-      // The switch is server-side session state: every later frame and every
-      // history fetch decodes under it. What is already painted was decoded
-      // under the old one, so the window starts over.
-      repaintShellWithCharset(win, sessionId);
-    }).catch(function (e) {
-      console.error('charset switch failed', e);
-    });
+    cur = j && j.charset ? j.charset : 'auto';
+  }).catch(function () {});
+  btn.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (_charsetMenu && _charsetMenu.btn === btn) { closeCharsetMenu(); return; }
+    openCharsetMenu(win, btn, sessionId, cur);
   });
 }
 
@@ -381,7 +453,7 @@ function openShellWindow(connLabel, sessionId, pos, opts) {
         '<button type="button" class="shell-tab-btn" data-stab="fw" title="Forwardings" data-i18n-title="win.fw.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3.5" y="3.5" width="7" height="7" rx="1"/><path d="M1 7h3.5M9.5 7h3.5M7 1v3.5M7 9.5v3.5" stroke-linecap="round"/></svg></button>' +
         '<button type="button" class="shell-tab-btn" data-stab="file" title="Files" data-i18n-title="win.files.tab"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1 3v9a1 1 0 001 1h10a1 1 0 001-1V4.5a1 1 0 00-1-1h-5L5.5 2H2a1 1 0 00-1 1z"/></svg></button>' +
         '</div>' +
-      '<select class="term-charset-select" title="Character set" data-i18n-title="win.charset.tip" aria-label="Character set" data-i18n-aria="win.charset.tip"><option value="auto">Auto</option><option value="utf-8">UTF-8</option><option value="gbk">GBK</option><option value="gb18030">GB18030</option><option value="big5">Big5</option><option value="shift_jis">Shift JIS</option><option value="euc-kr">EUC-KR</option><option value="utf-16le">UTF-16LE</option><option value="utf-16be">UTF-16BE</option><option value="windows-1252">Windows-1252</option><option value="latin-1">Latin-1</option></select>' +
+      charsetControlHTML() +
       '<div class="shell-window-header-btns">' +
         SHELL_WINDOW_MAX_HTML + '<button type="button" class="shell-window-collapse-btn" title="Collapse" data-i18n-title="win.collapse">' +
           '<svg class="ic-d" viewBox="0 0 12 8" width="12" height="8"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M1 2l5 4 5-4"/></svg>' +
