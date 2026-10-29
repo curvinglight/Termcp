@@ -384,3 +384,33 @@ func (p *ptyPeer) Write(b []byte) (int, error) { return p.f.Write(b) }
 
 var _ = json.Marshal
 var _ = mcpgo.CallToolRequest{}
+
+// TestLSHostNamesASerialProfileAsSerial pins the listing's kind column.
+//
+// Every non-internal profile used to be labelled "ssh", so a serial profile sat in
+// the same column as a remote box with a dash where user@host:port goes: the one
+// row a caller reads to decide "can I connect to this" answered with a transport
+// that profile does not use. The device and its line speed are what `where` means
+// for this kind.
+func TestLSHostNamesASerialProfileAsSerial(t *testing.T) {
+	device, _, stop := startPTYPair(t)
+	defer stop()
+	s := serialTestServer(t, device)
+
+	out := termText(t, s, map[string]any{"cmd": "ls host"})
+	row := ""
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "tty0") {
+			row = line
+		}
+	}
+	if row == "" {
+		t.Fatalf("the serial profile is not listed:\n%s", out)
+	}
+	if !strings.Contains(row, "\tserial\t") {
+		t.Errorf("the kind column should say serial, not ssh: %q", row)
+	}
+	if !strings.Contains(row, device) {
+		t.Errorf("the where column should name the device: %q", row)
+	}
+}

@@ -370,6 +370,13 @@ func (s *Server) handleListSSHConfigs(ctx context.Context, request mcpgo.CallToo
 			if ent.Kind == sshconfig.KindInternal {
 				item["kind"] = "local"
 				item["where"] = localWhere(ent)
+			} else if ent.Kind == sshconfig.KindSerial {
+				// A SERIAL PROFILE IS NOT AN SSH TARGET, and saying "ssh" in that
+				// column sent a reader looking for a host and a credential that do
+				// not exist. The device and its line speed answer `where` the same
+				// way user@host:port does for a remote entry.
+				item["kind"] = "serial"
+				item["where"] = serialWhere(ent)
 			} else {
 				item["kind"] = "ssh"
 				item["where"] = targetOf(ent.DialSpec)
@@ -407,6 +414,22 @@ func localWhere(ent *sshconfig.Entry) string {
 		where += " " + filepath.Base(prog)
 	}
 	return where
+}
+
+// serialWhere renders `device @ baud` for a listing column: the two facts that
+// decide whether this profile opens the device the caller means. Empty fields are
+// left out rather than filled with a default — the listing names what the profile
+// says, and validation is what guarantees the rest.
+func serialWhere(ent *sshconfig.Entry) string {
+	device := strings.TrimSpace(ent.Device)
+	baud := ent.Baud
+	if device == "" {
+		return ""
+	}
+	if baud <= 0 {
+		return device
+	}
+	return fmt.Sprintf("%s @ %d", device, baud)
 }
 
 // targetOf renders the `user@host:port` a remote entry dials, for a listing column.
