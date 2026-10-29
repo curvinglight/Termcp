@@ -235,6 +235,8 @@ vm.createContext(sandbox);
 vm.runInContext('var editingConnName = \'\'; var connEntries = null;\n' +
   'var _connDirty = false; var _connTemplateRemote = \'\';\n' +
   'function _connTOMLToForm() {} function _connTemplateFor() { return \'\'; }\n' +
+  // The kind picker belongs to the form, not to name pinning.
+  'function ensureKindField() {} function applyConnKindView() {}\n' +
   'function _connShowView() {} function loadConnections() {}\n' +
   'function resetConnPasswordVisibility() {} function showModal() {}\n' +
   modal, sandbox);

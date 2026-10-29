@@ -81,6 +81,9 @@ vm.createContext(sandbox);
 vm.runInContext('var editingConnName = \'\'; var connEntries = null;\n' +
   'var _connTemplateRemote = \'\';\n' +
   'function _connTOMLToForm() {} function _connShowView() {}\n' +
+  // The kind picker (which half of the form this profile is) is not what this
+  // probe measures; it is stubbed like the rest of the field plumbing.
+  'function ensureKindField() {} function applyConnKindView() {}\n' +
   'function loadConnections() {} function resetConnPasswordVisibility() {}\n' +
   'function showModal() {}\n' +
   modal, sandbox);
