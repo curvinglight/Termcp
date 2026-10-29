@@ -822,6 +822,9 @@
   /* Touch targets: the 26px header buttons are below the ~32px comfortable
      minimum and sit next to the drag area, so they get a little more room. */
   .shell-window.win-fullscreen .shell-window-header-btns button { width: 34px; height: 34px; }
+  /* The charset icon is one of those keys and grows with them. */
+  .shell-window.win-fullscreen .term-charset-btn { width: 34px; height: 34px; }
+  .shell-window.win-fullscreen .term-charset-glyph { font-size: 15px; }
 
   /* Mobile: the shell-window title bar already carries per-window controls, and
      the dock competes with the terminal for the bottom of a phone screen.
