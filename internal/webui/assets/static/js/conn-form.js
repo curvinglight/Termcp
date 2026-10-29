@@ -259,8 +259,11 @@ function ensureSerialFields() {
     '<label for="conn-f-charset">' + _hesc(t('modal.conn.field.charset')) + '</label>' +
     '<select id="conn-f-charset">' + _charsetOptionsHTML() + '</select>' +
     '</div>' +
-    '<div class="conn-field">' +
-    '<label><input type="checkbox" id="conn-f-localecho"> ' + _hesc(t('modal.conn.field.localecho')) + '</label>' +
+    '<div class="conn-field conn-field-check">' +
+    '<label class="conn-check" for="conn-f-localecho">' +
+    '<input type="checkbox" id="conn-f-localecho">' +
+    '<span>' + _hesc(t('modal.conn.field.localecho')) + '</span>' +
+    '</label>' +
     '</div>';
   shellRow.parentNode.insertBefore(wrap, shellRow);
 }
@@ -1009,7 +1012,7 @@ function openStartModal(connName) {
   // and the launch options a host dialog shows would be refused by the server.
   // Hiding them is the honest form — the same fields, greyed, would invite an
   // edit that cannot be honoured.
-  var isSerial = !!(window._lastConnections || []).find(function (c) { return c.name === connName && c.kind === 'serial'; });
+  var isSerial = isSerialProfile(connName);
   var cmdEl = document.getElementById('start-cmd');
   var modeEl = document.getElementById('start-mode');
   if (cmdEl) cmdEl.parentElement.style.display = isSerial ? 'none' : '';
@@ -1027,7 +1030,7 @@ document.getElementById('start-run').onclick = function () {
   // error so inputs stay editable for a retry.
   hideModal('modal-start');
   var launchTarget = document.getElementById('start-ssh-config').value;
-  var launchIsSerial = !!(window._lastConnections || []).find(function (c) { return c.name === launchTarget && c.kind === 'serial'; });
+  var launchIsSerial = isSerialProfile(launchTarget);
   var launchOpt = {
     command: cmd,
     mode: document.getElementById('start-mode').value,

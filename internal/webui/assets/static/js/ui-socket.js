@@ -445,6 +445,11 @@ function shellStatusOnBytes(win, sid, text) {
 function shellStatusOnIdle(win, sid) {
   var ch = win && win._channels && win._channels[sid];
   if (!ch || ch.statusState === 'ended' || ch.statusState === 'done') return;
+  /* A serial channel never "finishes": the wire is open until the session is
+     closed, and a quiet device is quiet, not done. Painting the idle chip here
+     made a perfectly healthy console read as an ended connection — the chip is
+     the first thing a user reads after the window opens blank. */
+  if (win._serial) return;
   /* The chip is "done" even for a line that was never submitted: it has stopped
      changing, and a later keystroke repaints its kind. Leaving it on "typing"
      would make a channel someone walked away from read as one being typed on. */

@@ -156,6 +156,25 @@ function copyTextFallback(text) {
 }
 
 var _copyToastTimer;
+/** connProfileKind answers "what kind is this saved profile" from the list the
+ * connection panel already holds.
+ *
+ * It exists because the profile's kind decides what a session request may even
+ * carry: a serial profile has no process to run, no shell mode and no terminal to
+ * size, and the server refuses those fields rather than ignoring them. Both
+ * callers here (the card's one-click connect and the launch-options dialog) used
+ * to guess — the card sent a 24x80 pty for everything, so clicking a serial card
+ * was refused for fields the user never saw. An unknown name answers "" and the
+ * caller keeps its old behaviour. */
+function connProfileKind(name) {
+  var list = window._lastConnections || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && list[i].name === name) return list[i].kind || '';
+  }
+  return '';
+}
+function isSerialProfile(name) { return connProfileKind(name) === 'serial'; }
+
 /** Split a typed command line into argv.
  *
  * The shell APIs take an executable plus an argv array, but a human types a line

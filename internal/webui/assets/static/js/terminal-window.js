@@ -233,6 +233,7 @@ function finalizePendingShellWindow(win, connLabel, sessionId, shellId, pos, opt
 
   win._sid = sessionId;
   win._parentSid = sessionId;
+  win._serial = opt.kind === 'serial';
   win._primaryShellId = shellId || sessionId;
   win._connName = connLabel || '';
   var sidEl = win.querySelector('.shell-sid-copy .sid');
@@ -482,6 +483,30 @@ SHELL_WINDOW_PANELS_HTML +
     });
 }
 
+/** sessionStartBody is the POST body for starting a session on one profile.
+ *
+ *  A serial device has no process to run, no shell mode and no terminal to size,
+ *  and the server REFUSES those fields rather than discarding them. The card's
+ *  one-click connect passes no options at all, so a body that always carried
+ *  24x80 sent every serial card click into "a serial device has no terminal to
+ *  size" — a refusal naming fields the user never chose. */
+function sessionStartBody(connName, opt) {
+  opt = opt || {};
+  var body = {
+    command: opt.command != null ? opt.command : '',
+    args: opt.args || [],
+    mode: opt.mode != null ? opt.mode : '',
+    ssh_config: connName
+  };
+  if (!isSerialProfile(connName)) {
+    body.rows = 24;
+    body.cols = 80;
+  }
+  if (opt.name) body.name = opt.name;
+  else if (connName) body.name = connName;
+  return body;
+}
+
 /** POST /api/sessions/start then open shell window. command/mode may be '' to use server defaults (login shell, profile default_mode).
  *
  *  pos is the window's placement: a {x, y} client position, or null for the
@@ -500,16 +525,7 @@ function startSessionAndOpenShell(connName, pos, opt) {
   if (!pendingWin) {
     return Promise.reject(new Error('Could not open terminal window'));
   }
-  var body = {
-    command: opt.command != null ? opt.command : '',
-    args: opt.args || [],
-    mode: opt.mode != null ? opt.mode : '',
-    ssh_config: connName,
-    rows: 24,
-    cols: 80
-  };
-  if (opt.name) body.name = opt.name;
-  else if (connName) body.name = connName;
+  var body = sessionStartBody(connName, opt);
   return fetch(apiPath('/api/sessions'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal })
     .then(function (r) {
       if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.status); });
@@ -522,9 +538,17 @@ function startSessionAndOpenShell(connName, pos, opt) {
       if (!shellId) throw new Error('No shell_id in response');
       pendingWin._connectAbort = null;
       if (pendingWin.parentNode) {
-        finalizePendingShellWindow(pendingWin, connName || 'session', sid, shellId, pos, { index: j.index || 0 });
+        finalizePendingShellWindow(pendingWin, connName || 'session', sid, shellId, pos, { index: j.index || 0, kind: j.kind });
       } else {
         openShellWindow(connName || 'session', sid, pos);
+      }
+      // A SERIAL WINDOW OPENS BLANK, and that is what the device is doing, not a
+      // failure: the wire sends nothing until the device is spoken to, so the
+      // window sits empty with the chip settled on "done" — which reads as "the
+      // connection ended". Say what happened once, in the toast the app already
+      // uses for one-line answers, and let the first byte take over.
+      if (j.kind === 'serial' && typeof showCopyToast === 'function') {
+        showCopyToast(t('toast.serial.hint', { device: j.device || connName, baud: j.baud || 0 }));
       }
       return j;
     })
