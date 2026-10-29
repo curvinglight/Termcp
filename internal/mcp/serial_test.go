@@ -7,9 +7,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
-
 )
 
 // The serial surface, driven the way an agent drives it: through `term` and the
@@ -264,6 +264,56 @@ func TestSerialProfileCharsetDecodesDeviceOutput(t *testing.T) {
 		t.Fatalf("GBK output should decode via the profile charset, got %q", output)
 	}
 }
+
+func TestSerialCharsetOffsetReadProbe(t *testing.T) {
+	device, peer, stop := startPTYPair(t)
+	defer stop()
+	s := newTestServer(t)
+	s.ManageSSHConfigs = true
+	res, err := s.call(t.Context(), "ssh_config", map[string]any{
+		"action": "create", "name": "gbkdev", "kind": "serial",
+		"device": device, "baud": float64(115200), "charset": "gbk",
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("create: %v / %s", err, toolResultText(res))
+	}
+	sres, err := s.call(t.Context(), "session_start", map[string]any{"ssh_config": "gbkdev"})
+	if err != nil || sres.IsError {
+		t.Fatalf("session_start: %v / %s", err, toolResultText(sres))
+	}
+	doc := parseResult(t, sres)
+	handle, _ := doc["shell_id"].(string)
+	p := peerDevice(t, peer)
+	p.Write([]byte{0xD6, 0xD0, 0xCE, 0xC4, '\r', '\n'})
+	// EXACTLY what `read <channel> --offset 0` sends: positional read with the
+	// tool's own maxima and the default strip. The output pipes flush on their
+	// own goroutine, so the read polls until the device's bytes have landed —
+	// the same wait-for-output rule the run tests follow.
+	deadline := time.Now().Add(5 * time.Second)
+	var out map[string]any
+	for {
+		rres, err := s.call(t.Context(), "shell_output", map[string]any{
+			"shell_id": handle, "offset": float64(0), "max_bytes": float64(8192),
+			"max_lines": float64(200), "timeout": 3.0,
+		})
+		if err != nil || rres.IsError {
+			t.Fatalf("shell_output: %v / %s", err, toolResultText(rres))
+		}
+		out = parseResult(t, rres)
+		if n, _ := out["total_bytes"].(float64); n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("device bytes never reached the transcript: %v", out)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(output_(out), "中文") {
+		t.Fatalf("positional read lost the GBK text: %q", out)
+	}
+}
+
+func output_(m map[string]any) string { s, _ := m["output"].(string); return s }
 
 func TestSerialProfileCreateRejectsMixedFields(t *testing.T) {
 	s := newTestServer(t)

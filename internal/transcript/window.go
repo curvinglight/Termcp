@@ -107,26 +107,35 @@ func (p Params) render(raw []byte) (string, error) {
 	// so there is nothing for the UTF-8 refusal or the ANSI stripper to do, and
 	// running the window through them would only risk mangling what the caller
 	// asked to see verbatim.
-	if p.Display == encoding.Hex || p.Display == encoding.B64 {
-		return encoding.EncodeForDisplay(raw, p.Display), nil
+	// DECODE FIRST, THEN PRESENT. "Auto" resolves here, on the window in hand:
+	// a BOM is proof, and a round-trip match is a decode. Nothing matched means
+	// the bytes are shown as they arrived — UTF-8 rendering, the same answer an
+	// unmatched sniff has always fallen back to. Every downstream step — the
+	// display escape, the UTF-8 refusal, ANSI stripping, the caller's `--grep` —
+	// sees characters, and a display choice composes with the charset instead of
+	// racing it: escaping the raw bytes first would hex the GBK lead and leave
+	// the decoder nothing to decode, which is exactly the mixed-language output
+	// the ordering once produced.
+	cs := p.Charset
+	if cs == encoding.CharsetAuto {
+		cs = encoding.Sniff(raw)
 	}
-	if p.Display == encoding.Auto {
-		// Auto escapes bytes no UTF-8 decoder accepts, then the ordinary rules
-		// run: the escape keeps the line structure readable, and a caller that
-		// asked for auto asked to see \xHH rather than a refusal.
-		if !utf8.Valid(raw) {
-			raw = []byte(encoding.EncodeForDisplay(raw, encoding.Auto))
-		}
-	}
-	if p.Charset != "" {
-		// DECODE FIRST, THEN RENDER, so everything downstream — the UTF-8 refusal,
-		// ANSI stripping, the caller's `--grep` — sees characters. The escape rule is
-		// the same either way; only the meaning of a byte changes.
-		decoded, err := encoding.Decode(p.Charset, raw)
+	if cs != "" {
+		decoded, err := encoding.Decode(cs, raw)
 		if err != nil {
 			return "", errf(ErrInvalid, "%s", err.Error())
 		}
 		raw = decoded
+	}
+	if p.Display == encoding.Hex || p.Display == encoding.B64 {
+		return encoding.EncodeForDisplay(raw, p.Display), nil
+	}
+	if p.Display == encoding.Auto {
+		// Auto escapes bytes no UTF-8 decoder accepts: a caller that asked for
+		// auto asked to see \xHH rather than a refusal.
+		if !utf8.Valid(raw) {
+			raw = []byte(encoding.EncodeForDisplay(raw, encoding.Auto))
+		}
 	}
 	if p.RequireUTF8 {
 		return Render(raw, p.StripAnsi)
@@ -551,11 +560,9 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 		// runs BEFORE the fidelity check — the whole point of hex/b64/auto is
 		// that the rendered form is JSON-safe, so a byte-exact window is a 200,
 		// not the refusal the raw bytes would have earned.
-		if p.Display == encoding.Hex || p.Display == encoding.B64 {
-			out = encoding.EncodeForDisplay(raw, p.Display)
-		} else if p.Display == encoding.Auto && !utf8.Valid(raw) {
-			out = encoding.EncodeForDisplay(raw, encoding.Auto)
-		}
+		// SAME ORDER AS render(): decode first, then present. The display
+		// escape before the charset decode would hex the GBK lead and leave the
+		// decoder nothing to decode.
 		cs := p.Charset
 		if cs == encoding.CharsetAuto {
 			cs = encoding.Sniff(raw)
@@ -567,8 +574,14 @@ func Read(ctx context.Context, src *Source, p Params) (Window, error) {
 				return refuse(errf(ErrInvalid, "%s", derr.Error()))
 			}
 			raw = decoded
-			out = clean(raw, p.StripAnsi)
 			autoDecoded = cs != p.Charset
+		}
+		if p.Display == encoding.Hex || p.Display == encoding.B64 {
+			out = encoding.EncodeForDisplay(raw, p.Display)
+		} else if p.Display == encoding.Auto && !utf8.Valid(raw) {
+			out = encoding.EncodeForDisplay(raw, encoding.Auto)
+		} else {
+			out = clean(raw, p.StripAnsi)
 		}
 		// THE FIDELITY CHECK READS WHAT THE CALLER WILL SEE. With a display
 		// choice set, that is the converted form — hex/b64/auto are ASCII by

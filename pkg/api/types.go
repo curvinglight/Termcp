@@ -121,6 +121,13 @@ type Session struct {
 	// every session had before the field existed. Like Kind it is omitted on
 	// shell records.
 	Display string `json:"display,omitempty"`
+	// Charset is the character set the session's bytes are decoded from before
+	// any presentation: "auto" (sniff each window), "utf-8", or a name the
+	// encoding table maps (gbk, big5, …). It comes from the serial profile and
+	// is empty for every other kind — an SSH session decodes as UTF-8 unless a
+	// caller names a charset explicitly, which is the contract the UTF-8
+	// refusal owes its callers.
+	Charset string `json:"charset,omitempty"`
 	// Serial names the device a serial session is attached to. Nil for every
 	// other kind, which is what keeps the absence of a host unambiguous: a
 	// session with no SSHEndpoint is serial only if Serial says so.
