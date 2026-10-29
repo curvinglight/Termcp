@@ -966,6 +966,24 @@ get task <id> returns the moment the transfer finishes, and answers with its
 progress when the window expires instead of failing. ls task lists them,
 close task <id> cancels one.
 
+--local-path IS A FILE ON THE DAEMON'S DISK, NOT ON YOURS. The path is opened by
+the process answering this call -- the machine Termcp runs on -- and not by the
+machine the command was typed on. An agent driving a REMOTE instance that asks for
+/tmp/report.csv gets the daemon's /tmp, and a Windows daemon reads that request as
+D:\tmp\report.csv: the transfer fails with "The system cannot find the path
+specified", quoting a path the caller never wrote. The receipt names the resolved
+path (D:\tmp\report.csv -> /tmp/report.csv); read that line before believing the
+file was the one you meant.
+
+To send a file that lives on the CALLER's machine, upload it over HTTP:
+
+  curl -T report.csv 'http://<instance>/api/sessions/<id>/files/upload?path=/tmp/r.csv'
+
+The same URL is already in file_stat and file_urls as upload_url, built from the
+address you reached this instance on. --local-path remains right when the bytes
+are already beside the daemon -- a staging file from an earlier download, a file a
+pipeline wrote -- where sending them through the caller would be a wasted hop.
+
 IT CAN ALSO BE THE DESTINATION OF A PIPELINE. read a1f3:1 | write b2c4 file /tmp/x
 copies bytes between two nodes without them passing through the caller's context;
 the content comes from the left side, so --data and --local-path are refused there

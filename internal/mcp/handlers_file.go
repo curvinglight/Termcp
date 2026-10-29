@@ -276,9 +276,17 @@ func (s *Server) handleFileStat(ctx context.Context, request mcpgo.CallToolReque
 	// argument: a locator here would produce
 	// /api/sessions/termcp://#<sid>/files/download, a URL containing '#' and '://'
 	// that addresses nothing.
+	//
+	// AND THE HOST IS THE CALLER'S, NOT THE BIND ADDRESS (originFor): an instance
+	// listening on 0.0.0.0 has no useful address of its own, and the fallback --
+	// 127.0.0.1 -- names a machine the caller is not on. A remote deployment then
+	// handed out URLs that only worked from the daemon's own console, failing as
+	// "connection refused", which reads as "the server is down" rather than "this
+	// URL is addressed to someone else".
 	sessID := sess.ID
-	m["download_url"] = s.baseURL + "/api/sessions/" + sessID + "/files/download?path=" + url.QueryEscape(remotePath)
-	m["upload_url"] = s.baseURL + "/api/sessions/" + sessID + "/files/upload"
+	base := s.originFor(ctx)
+	m["download_url"] = base + "/api/sessions/" + sessID + "/files/download?path=" + url.QueryEscape(remotePath)
+	m["upload_url"] = base + "/api/sessions/" + sessID + "/files/upload"
 	m["session_id"] = sessID
 	return jsonResult(m), nil
 }
@@ -347,7 +355,7 @@ func (s *Server) handleFileMakeDir(ctx context.Context, request mcpgo.CallToolRe
 	return successResult(), nil
 }
 
-func (s *Server) handleGetFileURLs(_ context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+func (s *Server) handleGetFileURLs(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	args := request.GetArguments()
 	sessionID := strings.TrimSpace(getString(args, "session_id", ""))
 	remotePath := getString(args, "remote_path", "")
@@ -379,9 +387,12 @@ func (s *Server) handleGetFileURLs(_ context.Context, request mcpgo.CallToolRequ
 	if err := api.AppendResponseHeaders(q, headers); err != nil {
 		return toolError(CodeInvalidArgument, "%s", err.Error()), nil
 	}
+	// The same rule as file_stat: the caller's origin, so the URLs address the
+	// instance where the caller found it (a LAN IP, a proxy name, a tunnel).
+	base := s.originFor(ctx)
 	return jsonResult(map[string]any{
-		"download_url": s.baseURL + "/api/sessions/" + sess.ID + "/files/download?" + q.Encode(),
-		"upload_url":   s.baseURL + "/api/sessions/" + sess.ID + "/files/upload",
+		"download_url": base + "/api/sessions/" + sess.ID + "/files/download?" + q.Encode(),
+		"upload_url":   base + "/api/sessions/" + sess.ID + "/files/upload",
 		"session_id":   sess.ID,
 		"remote_path":  remotePath,
 	}), nil
