@@ -996,6 +996,16 @@ function deleteSelectedNodes(names) {
    window it starts is centred like the card's own click — see dialogs.js. The
    dialog outlives the click that opened it, so a pointer position captured here
    would only ever be a stale coordinate from behind a modal backdrop. */
+
+// hideStartField hides one labelled control in the launch dialog. The label is
+// a sibling element (`<label for=…>`), not a wrapper, so both are toggled: a
+// field whose label stays behind reads as an empty prompt.
+function hideStartField(el, hide) {
+  if (!el) return;
+  el.style.display = hide ? 'none' : '';
+  var lab = document.querySelector('label[for="' + el.id + '"]');
+  if (lab) lab.style.display = hide ? 'none' : '';
+}
 function openStartModal(connName) {
   document.getElementById('modal-start-err').style.display = 'none';
   /* The dialog outlives the click that opened it and carries its target in a
@@ -1013,10 +1023,13 @@ function openStartModal(connName) {
   // Hiding them is the honest form — the same fields, greyed, would invite an
   // edit that cannot be honoured.
   var isSerial = isSerialProfile(connName);
-  var cmdEl = document.getElementById('start-cmd');
-  var modeEl = document.getElementById('start-mode');
-  if (cmdEl) cmdEl.parentElement.style.display = isSerial ? 'none' : '';
-  if (modeEl) modeEl.parentElement.style.display = isSerial ? 'none' : '';
+  // Each field here is a bare input/select beside its own label, all direct
+  // children of the dialog body — so hiding `parentElement` hid the body itself:
+  // the dialog the user got was a title, a Close button and nothing else, with
+  // no way to start anything. Hide the control and its label, one field at a
+  // time.
+  hideStartField(document.getElementById('start-cmd'), isSerial);
+  hideStartField(document.getElementById('start-mode'), isSerial);
   showModal('modal-start');
 }
 document.getElementById('modal-start-close').onclick = function () { hideModal('modal-start'); };
