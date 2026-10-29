@@ -149,6 +149,26 @@ func Sniff(data []byte) string {
 			return "utf-16be"
 		}
 	}
+	// VALID UTF-8 IS THE ANSWER, AND ITS SPELLING IS "". The loop below is a round
+	// trip, and UTF-8 Chinese round-trips through shift_jis often enough to matter:
+	// "[    0.3] 系统启动中" decodes and re-encodes as shift_jis byte for byte, so
+	// the loop named a legacy charset for text this build reads perfectly as-is —
+	// and the live latch then decoded the rest of the session the same wrong way.
+	// A byte string that was already UTF-8 needs no conversion, and "no conversion"
+	// is what "" means everywhere in this package. It is also the honest answer for
+	// plain ASCII, which carries no evidence about a charset at all; the old answer
+	// there was "gbk", which latched a session's encoding on its boot banner.
+	//
+	// The incomplete tail is excluded first: a frame can end in the middle of a
+	// character, and that fragment alone is not evidence of anything.
+	//
+	// KNOWN LIMIT: GBK text whose pairs happen to form valid UTF-8 (0xC2-0xDF
+	// followed by 0x80-0xBF) reads as UTF-8 here. The collision is rare across a
+	// sentence and cannot be settled from bytes alone; the per-window charset
+	// control is the override, and the opposite default mangled every modern device.
+	if cut := IncompleteTail("utf-8", data); utf8.Valid(data[:len(data)-cut]) {
+		return ""
+	}
 	for _, name := range []string{"gbk", "gb18030", "big5", "shift_jis", "euc-kr"} {
 		enc := charsets[name]
 		if enc == nil {

@@ -77,6 +77,30 @@ func TestSniffIdentifiesGBKAndFallsBackToUTF8(t *testing.T) {
 	if cs := Sniff(utf8zh); cs != "" {
 		t.Fatalf("Sniff(UTF-8 中文) = %q, want \"\" (stay UTF-8)", cs)
 	}
+	// A ROUND TRIP THROUGH A LEGACY TABLE IS NOT EVIDENCE. This is a kernel log
+	// line in UTF-8; every byte of it also decodes and re-encodes as shift_jis, so
+	// the legacy loop used to name shift_jis for text this build reads as-is — and
+	// the session's charset latched to it, garbling everything after.
+	for _, utf8Text := range []string{
+		"[    0.3] 系统启动中\r\n",
+		"设备版本 v1.2\r\n",
+		"重启完成。\r\n",
+	} {
+		if cs := Sniff([]byte(utf8Text)); cs != "" {
+			t.Fatalf("Sniff(%q) = %q, want \"\" (already UTF-8)", utf8Text, cs)
+		}
+	}
+	// Plain ASCII says nothing about a charset. "gbk" was a latch on the boot
+	// banner: an ASCII-only first frame decided the session's encoding before any
+	// Chinese had arrived.
+	if cs := Sniff([]byte("[    0.000000] Booting Linux on physical CPU 0x0\r\n")); cs != "" {
+		t.Fatalf("Sniff(ASCII) = %q, want \"\" (no evidence)", cs)
+	}
+	// A frame that ends inside a character is still a UTF-8 frame.
+	split := []byte{'[', 0xE7, 0xB3} // 系 cut after two of its three bytes
+	if cs := Sniff(split); cs != "" {
+		t.Fatalf("Sniff(split UTF-8 tail) = %q, want \"\"", cs)
+	}
 	// A BOM is proof, not a guess.
 	bom := append([]byte{0xFF, 0xFE}, []byte("a\x00b\x00")...)
 	if cs := Sniff(bom); cs != "utf-16le" {
