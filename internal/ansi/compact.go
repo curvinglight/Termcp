@@ -40,6 +40,15 @@ func Compact(text string) string {
 	lines := strings.Split(cleaned, "\n")
 	result := make([]string, 0, len(lines))
 	for _, line := range lines {
+		// A TRAILING CR OVERWRITES NOTHING. The collapse below keeps what was
+		// written after the last CR — a progress bar's last frame. When the CR is
+		// the last thing on the line, "after it" is the empty string, and taking
+		// that erased the line: a device that ends its lines with CR and then a
+		// CRLF (every serial console sending "\r" then "\r\n" — what a doubled CR
+		// looks like once CRLF is normalised) had its whole output deleted. Nothing
+		// is on screen after that CR but what was already there, which is exactly
+		// what the cursor returning home left visible.
+		line = strings.TrimRight(line, "\r")
 		if idx := strings.LastIndex(line, "\r"); idx >= 0 {
 			line = line[idx+1:]
 		}

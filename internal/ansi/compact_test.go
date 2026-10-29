@@ -52,6 +52,17 @@ func TestCompact_CarriageReturnOverwrite(t *testing.T) {
 		{"final line no newline", "progress...\rdone", "done"},
 		{"no overwrite", "plain line\n", "plain line\n"},
 		{"mixed overwrite and plain", "overwrite_a\roverwrite_b\nnormal line\n", "overwrite_b\nnormal line\n"},
+		// A CR that is the last thing on its line overwrites nothing, so the line
+		// keeps what it already showed. This is the shape a serial console sends:
+		// tx_eol=cr writes "\r" and the device answers "\r\n", so the stream holds
+		// "\r\r\n" and CRLF normalisation leaves the line ending in a lone CR.
+		// Reading "after the last CR" there means "nothing", which deleted the line
+		// — the model-facing read of a working console came back empty while the
+		// Web UI, which does not compact, showed it.
+		{"cr before crlf keeps the line", "设备版本 v1.2\r\r\n", "设备版本 v1.2\n"},
+		{"cr before crlf, ascii", "hello\r\r\n", "hello\n"},
+		{"trailing cr after an overwrite", "a\rb\r", "b"},
+		{"only a cr", "\r\n", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
