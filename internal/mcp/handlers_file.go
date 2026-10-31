@@ -286,7 +286,9 @@ func (s *Server) handleFileStat(ctx context.Context, request mcpgo.CallToolReque
 	sessID := sess.ID
 	base := s.originFor(ctx)
 	m["download_url"] = base + "/api/sessions/" + sessID + "/files/download?path=" + url.QueryEscape(remotePath)
-	m["upload_url"] = base + "/api/sessions/" + sessID + "/files/upload"
+	// The upload takes its path from the query (handleUploadFile), so a URL without
+	// one is a URL the caller cannot use as it stands.
+	m["upload_url"] = base + "/api/sessions/" + sessID + "/files/upload?path=" + url.QueryEscape(remotePath)
 	m["session_id"] = sessID
 	return jsonResult(m), nil
 }
@@ -390,9 +392,12 @@ func (s *Server) handleGetFileURLs(ctx context.Context, request mcpgo.CallToolRe
 	// The same rule as file_stat: the caller's origin, so the URLs address the
 	// instance where the caller found it (a LAN IP, a proxy name, a tunnel).
 	base := s.originFor(ctx)
+	// The upload URL carries the path but not the response headers: those frame the
+	// download's body, and an upload has no response body to describe.
+	upload := url.Values{"path": {remotePath}}
 	return jsonResult(map[string]any{
 		"download_url": base + "/api/sessions/" + sess.ID + "/files/download?" + q.Encode(),
-		"upload_url":   base + "/api/sessions/" + sess.ID + "/files/upload",
+		"upload_url":   base + "/api/sessions/" + sess.ID + "/files/upload?" + upload.Encode(),
 		"session_id":   sess.ID,
 		"remote_path":  remotePath,
 	}), nil

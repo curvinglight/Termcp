@@ -979,8 +979,8 @@ To send a file that lives on the CALLER's machine, upload it over HTTP:
 
   curl -T report.csv 'http://<instance>/api/sessions/<id>/files/upload?path=/tmp/r.csv'
 
-The same URL is already in file_stat and file_urls as upload_url, built from the
-address you reached this instance on. --local-path remains right when the bytes
+The same URL is already in file_stat and file_urls as upload_url -- path included,
+built from the address you reached this instance on. --local-path remains right when the bytes
 are already beside the daemon -- a staging file from an earlier download, a file a
 pipeline wrote -- where sending them through the caller would be a wasted hop.
 
