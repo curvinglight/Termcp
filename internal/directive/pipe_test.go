@@ -109,6 +109,31 @@ func TestAPipeOnASubstitutedTargetWaitsForTheValue(t *testing.T) {
 	}
 }
 
+// TestAPipeFillsTheRightSidesHoles: both halves are parsed against the same
+// sentinel table, so the destination's session and path come from args exactly as
+// the source's do. Missing them here sent the copy to a session literally named
+// `__hole_2__` and reported it as "session not found".
+func TestAPipeFillsTheRightSidesHoles(t *testing.T) {
+	f, err := ParseWithSubst(`read $1 file $2 | write $3 file $4`,
+		Subst{Pos: []string{"a1f3:1", `D:\src.bin`, "b2c4", "/tmp/dst.bin"}})
+	if err != nil {
+		t.Fatalf("a pipeline whose values all come from args must parse: %v", err)
+	}
+	left := f.Statements[0]
+	if left.Target != "a1f3:1" || left.Key != `D:\src.bin` {
+		t.Fatalf("left side = %q %q", left.Target, left.Key)
+	}
+	if left.Pipe == nil {
+		t.Fatal("the pipeline was lost")
+	}
+	if left.Pipe.Target != "b2c4" {
+		t.Fatalf("the destination session is a sentinel, not the value: %q", left.Pipe.Target)
+	}
+	if left.Pipe.Key != "/tmp/dst.bin" {
+		t.Fatalf("the destination path is a sentinel, not the value: %q", left.Pipe.Key)
+	}
+}
+
 // TestAnUnspacedPipeIsTheOperatorToo. There is no lexical exception: every `|` between
 // two verbs is the pipeline operator, spaced or not. The usage lines' `a|b`
 // alternatives are documentation, and the test that parses those lines reduces them

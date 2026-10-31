@@ -665,6 +665,16 @@ func (t *sentinelTable) expandStatement(st Statement) Statement {
 		filled := t.expand(*v)
 		st.Flags[k] = &filled
 	}
+	// THE RIGHT SIDE OF `|` CARRIES VALUES TOO. Both halves are parsed against the
+	// same table, so `read $1 file $2 | write $3 file $4` names the destination
+	// session and path through holes exactly as the source does. Leaving them as
+	// sentinels sent the copy to a session literally named `__hole_2__` — a
+	// not-found that reads as "the session is gone" while every value it needed was
+	// in the caller's hands the whole time. A pipeline has exactly two ends (see
+	// parsePipeline), so one level of recursion is the whole shape.
+	if st.Pipe != nil {
+		*st.Pipe = t.expandStatement(*st.Pipe)
+	}
 	return st
 }
 
